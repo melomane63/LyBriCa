@@ -75,8 +75,8 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
                           |        |       |
                           v        v       v
               +-----------+--+ +---+------+ +------+-------+
-              | Relay Auto   | | TM1637   | | Relay Power  |
-              |              | | display  | | Amp          |
+              |  HID remote  | | TM1637   | |  Relay       |
+              |              | | display  | |  Power Amp   |
               +--------------+ +----------+ +--------------+
 ```
 

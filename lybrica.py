@@ -143,60 +143,32 @@ LMS_SYNC_DEBUG = False                   # Log every volume/mute change and the 
 # ====================== VOLUME CURVE ======================
 # Volume curve: level 0..100 (LMS scale) <-> dB (CamillaDSP).
 #
-# Base: gain sent by LMS to Squeezelite (dB = 20 * log10(gain / 65536)),
-# rounded to a 0.5 dB grid:
-#     2 ..  25 : ~1.5 dB / level  (-71 .. -37.5 dB)
-#    25 .. 100 :  0.5 dB / level  (-37.5 .. 0 dB), exactly
-# 0 equals -100 dB (the real mute is handled separately).
+# Based on the gain sent by LMS to Squeezelite (dB = 20 * log10(gain / 65536)),
+# on a 0.5 dB grid:
+#     25 .. 100 : 0.5 dB / level  (-37.5 .. 0 dB)
+#      2 ..  24 : 1.5 dB / level  (-71 .. -38 dB)
+#      1 : -75 dB, 0 : -100 dB (the real mute is handled separately)
 # The curve is strictly increasing, which makes the inverse conversion exact.
-# Deviation from the original measurement: < 0.5 dB (0.7 dB worst case, level 44).
-
-CURVE_POINTS = [
-    (0, -100.0), (1, -75.0), (2, -71.0), (3, -69.5), (4, -68.0),
-    (5, -66.5), (6, -65.0), (7, -63.5), (8, -62.0), (9, -60.5),
-    (10, -59.0), (11, -57.5), (12, -56.0), (13, -55.0), (14, -53.5),
-    (15, -52.0), (16, -50.5), (17, -49.0), (18, -47.5), (19, -46.0),
-    (20, -44.5), (21, -43.0), (22, -41.5), (23, -40.0), (24, -38.5),
-    (25, -37.5), (26, -37.0), (27, -36.5), (28, -36.0), (29, -35.5),
-    (30, -35.0), (31, -34.5), (32, -34.0), (33, -33.5), (34, -33.0),
-    (35, -32.5), (36, -32.0), (37, -31.5), (38, -31.0), (39, -30.5),
-    (40, -30.0), (41, -29.5), (42, -29.0), (43, -28.5), (44, -28.0),
-    (45, -27.5), (46, -27.0), (47, -26.5), (48, -26.0), (49, -25.5),
-    (50, -25.0), (51, -24.5), (52, -24.0), (53, -23.5), (54, -23.0),
-    (55, -22.5), (56, -22.0), (57, -21.5), (58, -21.0), (59, -20.5),
-    (60, -20.0), (61, -19.5), (62, -19.0), (63, -18.5), (64, -18.0),
-    (65, -17.5), (66, -17.0), (67, -16.5), (68, -16.0), (69, -15.5),
-    (70, -15.0), (71, -14.5), (72, -14.0), (73, -13.5), (74, -13.0),
-    (75, -12.5), (76, -12.0), (77, -11.5), (78, -11.0), (79, -10.5),
-    (80, -10.0), (81, -9.5), (82, -9.0), (83, -8.5), (84, -8.0),
-    (85, -7.5), (86, -7.0), (87, -6.5), (88, -6.0), (89, -5.5),
-    (90, -5.0), (91, -4.5), (92, -4.0), (93, -3.5), (94, -3.0),
-    (95, -2.5), (96, -2.0), (97, -1.5), (98, -1.0), (99, -0.5),
-    (100, 0.0),
-]
-
-
-def _interp(x, pts):
-    if x <= pts[0][0]:
-        return pts[0][1]
-    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
-        if x <= x1:
-            return y0 + (x - x0) / (x1 - x0) * (y1 - y0)
-    return pts[-1][1]
-
-
-_INV = [(d, p) for p, d in CURVE_POINTS]
 
 
 def pct_to_db(p):
-    """Niveau 0..100 -> dB."""
-    return _interp(p, CURVE_POINTS)
+    """Level 0..100 -> dB."""
+    p = clamp(p, 0, 100)
+    if p >= 25:
+        return (p - 100) * 0.5          # 0.5 dB / level, up to 0 dB
+    if p >= 2:
+        return -71.0 + (p - 2) * 1.5    # 1.5 dB / level
+    return -75.0 if p == 1 else -100.0  # levels 1 and 0: special cases
 
 
 def db_to_pct(d):
-    """dB -> niveau 0..100 (entier le plus proche)."""
-    return round(_interp(d, _INV))
-
+    """dB -> level 0..100 (nearest integer)."""
+    if d >= -37.5:
+        return clamp(round(100 + d * 2), 25, 100)
+    if d >= -71.0:
+        return clamp(round((d + 71.0) / 1.5) + 2, 2, 24)
+    # Below -71 dB: levels 0, 1 or 2, whichever is nearest
+    return min((0, 1, 2), key=lambda i: abs(pct_to_db(i) - d))
 
 # ====================== GLOBAL VARIABLES ======================
 

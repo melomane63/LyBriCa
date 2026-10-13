@@ -3,8 +3,6 @@
 # Exit on error
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 # =============================================================================
 # Function to update and upgrade the system
 # =============================================================================
@@ -15,11 +13,14 @@ upgrade_system() {
 }
 
 # =============================================================================
-# Function to install Bluetooth Remote Script & LED Display module
-# (includes boot config for GPIO/UART/power + venv + systemd service)
+# Function to install Lybrica
+# (Remote, Display, Trigger, Autoconfig for CamillaDSP <-> LMS volume sync)
+#  - rewrites /boot/firmware/config.txt
+#  - sets up venv + dependencies
+#  - installs and starts systemd service
 # =============================================================================
-install_bluetooth_remote() {
-    echo "🎮 Installing Remote Control & LED module (with boot configuration)..."
+install_lybrica() {
+    echo "🎮 Installing Lybrica (Remote, Display, Trigger, Autoconfig for CamillaDSP <-> LMS volume sync)..."
 
     # -------------------------------------------------------------------------
     # 1. Configure /boot/firmware/config.txt and cmdline.txt
@@ -30,7 +31,7 @@ install_bluetooth_remote() {
 
     # Check if already installed by lybrica
     if sudo grep -q "^#installed-by-lybrica" "$CONFIG_FILE" 2>/dev/null; then
-        echo "ℹ️  config.txt already modified by lybrica (found #installed-by-lybrica). Skipping config.txt rewrite."
+        echo "ℹ️  Lybrica already installed (found #installed-by-lybrica in config.txt). Skipping config.txt rewrite."
     else
         # Backup before modifying
         sudo cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
@@ -126,9 +127,9 @@ EOL
     # -------------------------------------------------------------------------
     # 4. Download scripts
     # -------------------------------------------------------------------------
-    echo "📥 Downloading remote.py and tm1637_lgpio.py from GitHub..."
+    echo "📥 Downloading lybrica.py and tm1637_lgpio.py from GitHub..."
     mkdir -p "$HOME/scripts"
-    wget -q https://raw.githubusercontent.com/melomane63/Remote-and-Display-Camilladsp/main/remote.py -O "$HOME/scripts/remote.py"
+    wget -q https://raw.githubusercontent.com/melomane63/LyBriCa/main/lybrica.py -O "$HOME/scripts/lybrica.py"
 
     PYVER=$(/opt/venv/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     wget -q https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py -O /tmp/tm1637_lgpio.py
@@ -138,16 +139,16 @@ EOL
     # -------------------------------------------------------------------------
     # 5. systemd service
     # -------------------------------------------------------------------------
-    sudo tee /etc/systemd/system/remote.service > /dev/null <<EOL
+    sudo tee /etc/systemd/system/lybrica.service > /dev/null <<EOL
 [Unit]
-Description=CamillaDSP Remote control, led display & power trigger
+Description=Lybrica (Remote, Display, Trigger, Autoconfig for CamillaDSP <-> LMS volume sync)
 After=default.target
 
 [Service]
 User=$USER
 Type=simple
 WorkingDirectory=$HOME/scripts
-ExecStart=/opt/venv/bin/python3 $HOME/scripts/remote.py
+ExecStart=/opt/venv/bin/python3 $HOME/scripts/lybrica.py
 Restart=on-failure
 RestartSec=5
 KillMode=control-group
@@ -155,16 +156,16 @@ KillSignal=SIGTERM
 TimeoutStopSec=10
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=remote
+SyslogIdentifier=lybrica
 
 [Install]
 WantedBy=default.target
 EOL
 
     sudo systemctl daemon-reload
-    sudo systemctl enable remote.service
-    sudo systemctl start remote.service
-    echo "✅ Remote service configured and started with /opt/venv/bin/python3 !"
+    sudo systemctl enable lybrica.service
+    sudo systemctl start lybrica.service
+    echo "✅ Lybrica service configured and started with /opt/venv/bin/python3 !"
 }
 
 # =============================================================================
@@ -326,7 +327,7 @@ set_sound_card() {
 # Function to pair Bluetooth Remote using bluetuith
 # =============================================================================
 pair_bluetooth_remote() {
-    REMOTE_SCRIPT="${REMOTE_SCRIPT:-$HOME/scripts/remote.py}"
+    LYBRICA_SCRIPT="${LYBRICA_SCRIPT:-$HOME/scripts/lybrica.py}"
     VENV_PYTHON="${VENV_PYTHON:-/opt/venv/bin/python3}"
 
     echo "🔗 Preparing Bluetooth Remote pairing interface..."
@@ -415,13 +416,13 @@ EOF
         echo "⚠️  This device supports few of the remote keys: check that it is really the remote."
     fi
 
-    if [ ! -f "$REMOTE_SCRIPT" ]; then
-        echo "⚠️  $REMOTE_SCRIPT not found. Set this line manually in remote.py:"
+    if [ ! -f "$LYBRICA_SCRIPT" ]; then
+        echo "⚠️  $LYBRICA_SCRIPT not found. Set this line manually in lybrica.py:"
         echo "   REMOTE_NAME = \"$dev_name\""
         return 1
     fi
 
-    if "$VENV_PYTHON" - "$REMOTE_SCRIPT" "$dev_name" <<'EOF'
+    if "$VENV_PYTHON" - "$LYBRICA_SCRIPT" "$dev_name" <<'EOF'
 import json
 import re
 import sys
@@ -444,13 +445,13 @@ with open(script, "w", encoding="utf-8") as f:
     f.write(new_text)
 EOF
     then
-        echo "✅ REMOTE_NAME set to \"$dev_name\" in $REMOTE_SCRIPT"
-        echo "🔄 Restarting remote service..."
-        sudo systemctl restart remote
-        echo "✅ Remote service restarted successfully."
+        echo "✅ REMOTE_NAME set to \"$dev_name\" in $LYBRICA_SCRIPT"
+        echo "🔄 Restarting Lybrica service..."
+        sudo systemctl restart lybrica
+        echo "✅ Lybrica service restarted successfully."
     else
-        echo "⚠️  Could not update $REMOTE_SCRIPT (no 'REMOTE_NAME = \"...\"' line, or no write permission)."
-        echo "    Set this line manually in remote.py:"
+        echo "⚠️  Could not update $LYBRICA_SCRIPT (no 'REMOTE_NAME = \"...\"' line, or no write permission)."
+        echo "    Set this line manually in lybrica.py:"
         echo "    REMOTE_NAME = \"$dev_name\""
         return 1
     fi
@@ -475,7 +476,7 @@ install_everything() {
     install_lyrion_and_squeezelite
     mount_usb_drive
     set_sound_card
-    install_bluetooth_remote
+    install_lybrica
     pair_bluetooth_remote
     shutdown_now
     echo "✅ All installations completed!"
@@ -494,7 +495,7 @@ while true; do
     echo "4) Install Lyrion Media Server & Squeezelite"
     echo "5) Mount USB Drive"
     echo "6) Configure Sound Levels (alsamixer)"
-    echo "7) Install Remote Script (GPIO/UART config + venv + service)"
+    echo "7) Install Lybrica (Remote, Display, Trigger, Autoconfig...)"
     echo "8) Pair Bluetooth Remote"
     echo "9) Shutdown System"
     echo "10) Exit"
@@ -508,7 +509,7 @@ while true; do
         4) install_lyrion_and_squeezelite ;;
         5) mount_usb_drive ;;
         6) set_sound_card ;;
-        7) install_bluetooth_remote ;;
+        7) install_lybrica ;;
         8) pair_bluetooth_remote ;;
         9) shutdown_now ;;
         10) echo "Exiting..."; exit 0 ;;

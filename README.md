@@ -52,35 +52,32 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 ## Architecture
 
 ```
-                 +----------------------+
-                 |  Lyrion Music Server |
-                 |      (ex-LMS)        |
-                 +----------+-----------+
-                            | CLI (port 9090)
-                            |
-                 +----------v-----------+
-                 |       LyBriCa        |
-                 |  (Python, asyncio)   |
-                 +----------+-----------+
-                            | WebSocket (port 1234)
-                            |
-                 +----------v-----------+
-                 |      CamillaDSP      |
-                 +----------------------+
-                            ^
-                            | GPIO / I2C / Serial / evdev
-                            |
-   +------------------------+------------------------+
-   |                        |                        |
-+--v---+              +-----v-----+           +------^------+
-| HID  |              |  TM1637   |           |   esp32     |
-|remote|              |  display  |           |        |
-+------+              +-----------+           +------+------+
-                                                     |
-                                              +------v------+
-                                              |    Power    |
-                                              |  relay Pi   |
-                                              +-------------+
+                        +----------+
+                        | Capteurs |
+                        | Light    |
+                        | Button   |
+                        +----+-----+
+                             |
+                             | ADC / GPIO
+                             v
++----------------+     +---------+     +-------------+
+|  Power supply  |---->|  ESP32  |---->| Power relay |
++----------------+     +----+----+     +------+------+
+                           |                 |
+                           | GPIO            | 5V
+                           | Serial          |
+                           v                 v
+                      +----+-----------------+----+
+                      |      Raspberry Pi        |
+                      |  (LyBriCa + CamillaDSP   |
+                      |       + Lyrion)          |
+                      +---+--------+-------+-----+
+                          |        |       |
+                          v        v       v
+              +-----------+--+ +---+------+ +------+-------+
+              | Relay Auto   | | TM1637   | | Relay Power  |
+              |              | | display  | | Amp          |
+              +--------------+ +----------+ +--------------+
 ```
 
 The **ESP32** is the physical power manager: it cuts the power completely

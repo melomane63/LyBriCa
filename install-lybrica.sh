@@ -28,35 +28,83 @@ install_bluetooth_remote() {
 
     CONFIG_FILE="/boot/firmware/config.txt"
 
-    # Backup before modifying
-    sudo cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+    # Check if already installed by lybrica
+    if sudo grep -q "^#installed-by-lybrica" "$CONFIG_FILE" 2>/dev/null; then
+        echo "ℹ️  config.txt already modified by lybrica (found #installed-by-lybrica). Skipping config.txt rewrite."
+    else
+        # Backup before modifying
+        sudo cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
 
-    # Clean up potential duplicates or old configuration lines
-    sudo sed -i '/dtparam=audio=/d'            "$CONFIG_FILE"
-    sudo sed -i '/dtoverlay=gpio-poweroff/d'   "$CONFIG_FILE"
-    sudo sed -i '/dtoverlay=gpio-shutdown/d'   "$CONFIG_FILE"
-    sudo sed -i '/enable_uart=/d'              "$CONFIG_FILE"
-    sudo sed -i '/gpio=12=ip,pu/d'             "$CONFIG_FILE"
-    sudo sed -i 's/^camera_auto_detect=/#camera_auto_detect=/'     "$CONFIG_FILE"
-    sudo sed -i 's/^display_auto_detect=/#display_auto_detect=/'   "$CONFIG_FILE"
-    sudo sed -i 's/^dtoverlay=vc4-kms-v3d/#dtoverlay=vc4-kms-v3d/' "$CONFIG_FILE"
+        # Overwrite config.txt with new content
+        sudo tee "$CONFIG_FILE" > /dev/null <<'EOL'
+# For more options and information see
+# http://rptl.io/configtxt
+# Some settings may impact device functionality. See link above for details
 
-    # Ensure there is a clean [all] section
-    if ! sudo grep -q "^\[all\]" "$CONFIG_FILE"; then
-        echo -e "\n[all]" | sudo tee -a "$CONFIG_FILE" > /dev/null
+# Uncomment some or all of these to enable the optional hardware interfaces
+
+# Enable audio (loads snd_bcm2835)
+
+# Additional overlays and parameters are documented
+# /boot/firmware/overlays/README
+
+# Automatically load overlays for detected cameras
+#camera_auto_detect=1
+
+# Automatically load overlays for detected DSI displays
+#display_auto_detect=1
+
+# Automatically load initramfs files, if found
+auto_initramfs=1
+
+# Enable DRM VC4 V3D driver
+max_framebuffers=2
+
+# Don't have the firmware create an initial video= setting in cmdline.txt.
+# Use the kernel's default instead.
+disable_fw_kms_setup=1
+
+# Run in 64-bit mode
+arm_64bit=1
+
+# Disable compensation for displays with overscan
+disable_overscan=1
+
+# Run as fast as firmware / board allows
+arm_boost=1
+
+[cm4]
+# Enable host mode on the 2711 built-in XHCI USB controller.
+# This line should be removed if the legacy DWC2 controller is required
+# (e.g. for USB device mode) or if USB support is not required.
+otg_mode=1
+
+[cm5]
+
+[all]
+dtparam=audio=off
+dtoverlay=gpio-poweroff,gpiopin=21,active_low=1
+dtoverlay=gpio-shutdown,gpio_pin=20,active_low=0,gpio_pull=down
+enable_uart=1
+dtoverlay=disable-wifi
+
+#installed-by-lybrica
+EOL
+
+        echo "✅ /boot/firmware/config.txt rewritten!"
     fi
 
-    # Inject parameters after the FIRST [all] section ONLY (idempotent)
-    sudo sed -i '0,/^\[all\]/a dtparam=audio=off\ndtoverlay=gpio-poweroff,gpiopin=21,active_low=1\ndtoverlay=gpio-shutdown,gpio_pin=20,active_low=0,gpio_pull=down\nenable_uart=1\ngpio=12=ip,pu' "$CONFIG_FILE"
-
-    # Clean serial console in cmdline.txt
+    # Clean serial console in cmdline.txt (always applied if needed)
     CMDLINE_FILE="/boot/firmware/cmdline.txt"
     if [ -f "$CMDLINE_FILE" ]; then
-        sudo cp "$CMDLINE_FILE" "${CMDLINE_FILE}.bak"
-        sudo sed -i 's/console=serial0,[0-9]* //' "$CMDLINE_FILE"
+        if ! sudo grep -q "console=serial0" "$CMDLINE_FILE"; then
+            echo "ℹ️  cmdline.txt already clean (no serial console)."
+        else
+            sudo cp "$CMDLINE_FILE" "${CMDLINE_FILE}.bak"
+            sudo sed -i 's/console=serial0,[0-9]* //' "$CMDLINE_FILE"
+            echo "✅ cmdline.txt cleaned (serial console removed)."
+        fi
     fi
-
-    echo "✅ /boot/firmware/config.txt and /boot/firmware/cmdline.txt updated!"
 
     # -------------------------------------------------------------------------
     # 2. User groups & venv

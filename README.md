@@ -513,6 +513,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 - [lgpio](https://github.com/joan2937/lg)
 - [tm1637_lgpio](https://github.com/melomane63/tm1637_lgpio)
 - [bluetuith](https://github.com/bluetuith-org/bluetuith)
+- [RPi-CamillaDSP](https://github.com/mdsimon2/RPi-CamillaDSP) by mdsimon2 (CamillaDSP setup guidance on Raspberry Pi)
 - Original LMS volume sync idea by [mbrennwa](https://github.com/mbrennwa/camilla_LMS_volume_sync)
 
 ---

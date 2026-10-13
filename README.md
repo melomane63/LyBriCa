@@ -6,7 +6,7 @@ A bidirectional bridge between **Lyrion Music Server** and **CamillaDSP** for
 Raspberry Pi, with HID remote control, TM1637 display, ambient light sensor,
 power relay control and automatic power management.
 
-The ESP32 companion firmware handles the physical power on/off of the Pi,
+The ESP32 companion handles the physical power on/off of the Pi,
 receives the remote control signals and reports the ambient light level.
 
 ---
@@ -25,7 +25,7 @@ receives the remote control signals and reports the ambient light level.
 - [Display](#display)
 - [Volume curve](#volume-curve)
 - [Settings file](#settings-file)
-- [ESP32 firmware](#esp32-firmware)
+- [ESP32 companion](#esp32-companion)
 - [Systemd service](#systemd-service)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
@@ -44,7 +44,7 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 - **TM1637 display** with ambient light sensor for automatic brightness
 - **Power relay control**: switch off after silence, back on with sound,
   halt the Pi after a long silence
-- **Physical power on/off** handled by an ESP32 companion firmware
+- **Physical power on/off** handled by an ESP32 companion
 - **Per-config tone settings** saved in `settings.json`
 
 ---
@@ -79,7 +79,7 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
                                                      |
                                               +------v------+
                                               |    ESP32    |
-                                              |  firmware   |
+                                              |  companion  |
                                               +-------------+
 ```
 
@@ -110,7 +110,7 @@ to the Pi over serial.
 | Component | Language | Role |
 |---|---|---|
 | **LyBriCa** | Python 3 | Main bridge, asyncio event loop |
-| **ESP32 firmware** | C++ / Arduino | Power management, remote, light sensor |
+| **ESP32 companion** | C++ / Arduino | Power management, remote, light sensor |
 | **CamillaDSP** | Rust | Audio DSP engine |
 | **Lyrion Music Server** | Perl | Music server |
 
@@ -125,8 +125,8 @@ Bluetooth remote pairing.
 ```bash
 git clone https://github.com/melomane63/LyBriCa.git
 cd LyBriCa
-chmod +x install.sh
-./install.sh
+chmod +x install-lybrica.sh
+./install-lybrica.sh
 ```
 
 The script opens an interactive menu:
@@ -178,7 +178,7 @@ The installer uses the following fixed values:
 | Lyrion version | `9.1.1` |
 | Python venv | `/opt/venv` |
 
-To change any of these, edit `install.sh` directly.
+To change any of these, edit `install-lybrica.sh` directly.
 
 ---
 
@@ -377,9 +377,9 @@ The file is written **atomically** (no half-written file on power loss).
 
 ---
 
-## ESP32 firmware
+## ESP32 companion
 
-The ESP32 companion firmware handles:
+The ESP32 companion handles:
 
 - **Physical power on/off** of the Raspberry Pi (relay / MOSFET)
 - **Remote control reception** (IR or RF) and forwarding to the Pi

@@ -11,104 +11,52 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 upgrade_system() {
     echo "🔄 Updating and upgrading system..."
     sudo apt update && sudo apt upgrade -y
-    sudo apt install -y git wget curl python3-pip python3-venv systemd
+    sudo apt install -y git wget curl python3-pip systemd
 }
 
 # =============================================================================
-# Function to install LyBriCa (Remote Control, Display & Power Management)
-# Includes: boot config, venv, dependencies, script, systemd service
+# Function to install Bluetooth Remote Script & LED Display module
+# (includes boot config for GPIO/UART/power + venv + systemd service)
 # =============================================================================
-install_lybrica() {
-    echo "🎮 Installing LyBriCa (Remote Control, Display & Power Management)..."
+install_bluetooth_remote() {
+    echo "🎮 Installing Remote Control & LED module (with boot configuration)..."
 
     # -------------------------------------------------------------------------
-    # 1. Configure /boot/firmware/config.txt
+    # 1. Configure /boot/firmware/config.txt and cmdline.txt
     # -------------------------------------------------------------------------
-    echo "⚙️ Configuring /boot/firmware/config.txt..."
+    echo "⚙️  Configuring /boot/firmware/config.txt..."
 
     CONFIG_FILE="/boot/firmware/config.txt"
-    MARKER="#created by install-lybrica"
 
-    if sudo grep -q "^${MARKER}$" "$CONFIG_FILE"; then
-        echo "✅ /boot/firmware/config.txt already configured by install-lybrica, skipping."
-    else
-        # Backup the original
-        sudo cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
-        echo "📦 Backup saved to ${CONFIG_FILE}.bak"
+    # Backup before modifying
+    sudo cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
 
-        # Recreate a clean config.txt
-        sudo tee "$CONFIG_FILE" > /dev/null <<'EOF'
-# For more options and information see
-# http://rptl.io/configtxt
-# Some settings may impact device functionality. See link above for details
+    # Clean up potential duplicates or old configuration lines
+    sudo sed -i '/dtparam=audio=/d'            "$CONFIG_FILE"
+    sudo sed -i '/dtoverlay=gpio-poweroff/d'   "$CONFIG_FILE"
+    sudo sed -i '/dtoverlay=gpio-shutdown/d'   "$CONFIG_FILE"
+    sudo sed -i '/enable_uart=/d'              "$CONFIG_FILE"
+    sudo sed -i '/gpio=12=ip,pu/d'             "$CONFIG_FILE"
+    sudo sed -i 's/^camera_auto_detect=/#camera_auto_detect=/'     "$CONFIG_FILE"
+    sudo sed -i 's/^display_auto_detect=/#display_auto_detect=/'   "$CONFIG_FILE"
+    sudo sed -i 's/^dtoverlay=vc4-kms-v3d/#dtoverlay=vc4-kms-v3d/' "$CONFIG_FILE"
 
-# Uncomment some or all of these to enable the optional hardware interfaces
-#dtparam=i2c_arm=on
-#dtparam=i2s=on
-#dtparam=spi=on
-
-# Enable audio (loads snd_bcm2835)
-
-# Additional overlays and parameters are documented
-# /boot/firmware/overlays/README
-
-# Automatically load overlays for detected cameras
-#camera_auto_detect=1
-
-# Automatically load overlays for detected DSI displays
-#display_auto_detect=1
-
-# Automatically load initramfs files, if found
-auto_initramfs=1
-
-# Enable DRM VC4 V3D driver
-#dtoverlay=vc4-kms-v3d
-max_framebuffers=2
-
-# Don't have the firmware create an initial video= setting in cmdline.txt.
-# Use the kernel's default instead.
-disable_fw_kms_setup=1
-
-# Run in 64-bit mode
-arm_64bit=1
-
-# Disable compensation for displays with overscan
-disable_overscan=1
-
-# Run as fast as firmware / board allows
-arm_boost=1
-
-[cm4]
-# Enable host mode on the 2711 built-in XHCI USB controller.
-# This line should be removed if the legacy DWC2 controller is required
-# (e.g. for USB device mode) or if USB support is not required.
-otg_mode=1
-
-[cm5]
-dtoverlay=dwc2,dr_mode=host
-
-[pi5]
-dtoverlay=nospi10
-
-[all]
-dtparam=audio=off
-dtoverlay=gpio-poweroff,gpiopin=21,active_low=1
-dtoverlay=gpio-shutdown,gpio_pin=20,active_low=0,gpio_pull=down
-enable_uart=1
-gpio=12=ip,pu
-
-#created by install-lybrica
-EOF
-
-        # Clean serial console in cmdline.txt
-        CMDLINE_FILE="/boot/firmware/cmdline.txt"
-        if [ -f "$CMDLINE_FILE" ]; then
-            sudo cp "$CMDLINE_FILE" "${CMDLINE_FILE}.bak"
-            sudo sed -i 's/console=serial0,[0-9]* //' "$CMDLINE_FILE"
-        fi
-
-        echo "✅ /boot/firmware/config.txt and /boot/firmware/cmdline.txt updated!"
+    # Ensure there is a clean [all] section
+    if ! sudo grep -q "^\[all\]" "$CONFIG_FILE"; then
+        echo -e "\n[all]" | sudo tee -a "$CONFIG_FILE" > /dev/null
     fi
+
+    # Inject parameters after the FIRST [all] section ONLY (idempotent)
+    sudo sed -i '0,/^\[all\]/a dtparam=audio=off\ndtoverlay=gpio-poweroff,gpiopin=21,active_low=1\ndtoverlay=gpio-shutdown,gpio_pin=20,active_low=0,gpio_pull=down\nenable_uart=1\ngpio=12=ip,pu' "$CONFIG_FILE"
+
+    # Clean serial console in cmdline.txt
+    CMDLINE_FILE="/boot/firmware/cmdline.txt"
+    if [ -f "$CMDLINE_FILE" ]; then
+        sudo cp "$CMDLINE_FILE" "${CMDLINE_FILE}.bak"
+        sudo sed -i 's/console=serial0,[0-9]* //' "$CMDLINE_FILE"
+    fi
+
+    echo "✅ /boot/firmware/config.txt and /boot/firmware/cmdline.txt updated!"
 
     # -------------------------------------------------------------------------
     # 2. User groups & venv
@@ -125,14 +73,14 @@ EOF
     # 3. Dependencies
     # -------------------------------------------------------------------------
     sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5
-    sudo /opt/venv/bin/pip install "git+https://github.com/HEnquist/pycamilladsp.git@v4.0.0"
+    sudo /opt/venv/bin/pip install "git+https://github.com/HEnquist/pycamilladsp.git@15d9b7c434b8e795bcad25783b75d5354acdb840"
 
     # -------------------------------------------------------------------------
-    # 4. Download script
+    # 4. Download scripts
     # -------------------------------------------------------------------------
-    echo "📥 Downloading lybrica.py and tm1637_lgpio.py from GitHub..."
+    echo "📥 Downloading remote.py and tm1637_lgpio.py from GitHub..."
     mkdir -p "$HOME/scripts"
-    wget -q https://raw.githubusercontent.com/melomane63/LyBriCa/main/lybrica.py -O "$HOME/scripts/lybrica.py"
+    wget -q https://raw.githubusercontent.com/melomane63/Remote-and-Display-Camilladsp/main/remote.py -O "$HOME/scripts/remote.py"
 
     PYVER=$(/opt/venv/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     wget -q https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py -O /tmp/tm1637_lgpio.py
@@ -142,16 +90,16 @@ EOF
     # -------------------------------------------------------------------------
     # 5. systemd service
     # -------------------------------------------------------------------------
-    sudo tee /etc/systemd/system/lybrica.service > /dev/null <<EOL
+    sudo tee /etc/systemd/system/remote.service > /dev/null <<EOL
 [Unit]
-Description=LyBriCa — Lyrion ⇄ CamillaDSP bridge
+Description=CamillaDSP Remote control, led display & power trigger
 After=default.target
 
 [Service]
 User=$USER
 Type=simple
 WorkingDirectory=$HOME/scripts
-ExecStart=/opt/venv/bin/python3 $HOME/scripts/lybrica.py
+ExecStart=/opt/venv/bin/python3 $HOME/scripts/remote.py
 Restart=on-failure
 RestartSec=5
 KillMode=control-group
@@ -159,27 +107,28 @@ KillSignal=SIGTERM
 TimeoutStopSec=10
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=lybrica
+SyslogIdentifier=remote
 
 [Install]
 WantedBy=default.target
 EOL
 
     sudo systemctl daemon-reload
-    sudo systemctl enable lybrica.service
-    sudo systemctl start lybrica.service
-    echo "✅ LyBriCa service configured and started!"
+    sudo systemctl enable remote.service
+    sudo systemctl start remote.service
+    echo "✅ Remote service configured and started with /opt/venv/bin/python3 !"
 }
 
 # =============================================================================
-# Function to install CamillaDSP & CamillaGUI (v4)
+# Function to install CamillaDSP & CamillaGUI
 # =============================================================================
 install_camilladsp() {
-    echo "🎛️ Installing CamillaDSP v4.1.3..."
+    echo "🎛️ Installing CamillaDSP..."
     mkdir -p ~/camilladsp ~/camilladsp/coeffs ~/camilladsp/configs
-    wget https://github.com/HEnquist/camilladsp/releases/download/v4.1.3/camilladsp-linux-aarch64.tar.gz -O ~/camilladsp/camilladsp-linux-aarch64.tar.gz
+    wget https://github.com/HEnquist/camilladsp/releases/download/v3.0.1/camilladsp-linux-aarch64.tar.gz -O ~/camilladsp/camilladsp-linux-aarch64.tar.gz
     sudo tar -xvf ~/camilladsp/camilladsp-linux-aarch64.tar.gz -C /usr/local/bin/
 
+    # Set up the systemd service for CamillaDSP
     cat > ~/camilladsp.service <<EOL
 [Unit]
 Description=CamillaDSP
@@ -208,10 +157,12 @@ EOL
     sudo systemctl enable camilladsp
     sudo systemctl start camilladsp
 
-    echo "🖥️ Installing CamillaGUI v4.1.0..."
-    wget https://github.com/HEnquist/camillagui-backend/releases/download/v4.1.0/bundle_linux_aarch64.tar.gz -O ~/camilladsp/bundle_linux_aarch64.tar.gz
+    # Install CamillaGUI
+    echo "🖥️ Installing CamillaGUI..."
+    wget https://github.com/HEnquist/camillagui-backend/releases/download/v3.0.3/bundle_linux_aarch64.tar.gz -O ~/camilladsp/bundle_linux_aarch64.tar.gz
     tar -xvf ~/camilladsp/bundle_linux_aarch64.tar.gz -C ~/camilladsp/
 
+    # Set up CamillaGUI systemd service
     cat > ~/camillagui.service <<EOL
 [Unit]
 Description=CamillaDSP Backend and GUI
@@ -231,30 +182,33 @@ EOL
     sudo systemctl enable camillagui
     sudo systemctl start camillagui
 
+    # Create CamillaDSP state file
     cat > ~/camilladsp/statefile.yml <<EOL
 config_path: "/home/$USER/camilladsp/configs/_Setup.yml"
 mute: 0
 volume: 0.0
 EOL
 
+    # Create default config
     cat > ~/camilladsp/configs/_Setup.yml <<EOL
 devices:
   samplerate: 48000
-  chunksize: 1024
+  chunksize: 512
   queuelimit: 4
   capture:
     type: Alsa
     channels: 2
-    device: "hw:Loopback,1,0"
+    device: "plughw:Loopback,1,0"
     format: S32LE
   playback:
     type: Alsa
     channels: 2
-    device: "hw:0,0"
-    format: S32LE
-title: Streamer
+    device: "default"
+    format: S16LE
+title: Setup
 EOL
 
+    # Load ALSA loopback module
     if ! grep -q "^snd-aloop" /etc/modules-load.d/snd-aloop.conf 2>/dev/null; then
         echo "snd-aloop" | sudo tee -a /etc/modules-load.d/snd-aloop.conf
     fi
@@ -272,20 +226,59 @@ install_lyrion_and_squeezelite() {
     echo "🔊 Installing Squeezelite..."
     sudo apt install -y squeezelite
 
-    if grep -q "^SL_OPTIONS=" /etc/default/squeezelite; then
-        sudo sed -i 's/^SL_OPTIONS=.*/SL_OPTIONS="-o hw:Loopback,0,0"/' /etc/default/squeezelite
-    else
-        echo 'SL_OPTIONS="-o hw:Loopback,0,0"' | sudo tee -a /etc/default/squeezelite
-    fi
+    # Safely update Squeezelite output device
+    sudo sed -i '/^SL_OPTIONS=/d;/^SL_SOUNDCARD=/d;/^SB_EXTRA_ARGS=/d' /etc/default/squeezelite
+    echo -e 'SL_SOUNDCARD="hw:Loopback,0"\nSB_EXTRA_ARGS="-W -C 5 -r 48000-48000 -R hLE"' | sudo tee -a /etc/default/squeezelite > /dev/null
 
     sudo systemctl restart squeezelite
+}
+
+# =============================================================================
+# Function to mount USB drive
+# =============================================================================
+mount_usb_drive() {
+    echo "💾 Setting up USB Drive auto-mount..."
+    sudo mkdir -p /mnt/usb
+
+    USB_UUID=$(sudo blkid -s UUID -o value /dev/sda1 2>/dev/null || true)
+
+    if [ -z "$USB_UUID" ]; then
+        echo "⚠️  No USB drive automatically detected on /dev/sda1."
+        read -p "Enter your USB drive UUID manually: " USB_UUID
+    else
+        echo "✅ USB drive automatically detected with UUID: $USB_UUID"
+    fi
+
+    if [ -n "$USB_UUID" ]; then
+        sudo sed -i 's|.* /mnt/usb .*||g' /etc/fstab
+        sudo sed -i '/^$/d' /etc/fstab
+
+        echo "UUID=$USB_UUID /mnt/usb auto defaults,nofail,x-systemd.device-timeout=1,noatime 0 0" | sudo tee -a /etc/fstab
+
+        sudo mount -a
+        echo "✅ USB Drive mounted at /mnt/usb with UUID $USB_UUID!"
+    else
+        echo "❌ Error: No valid UUID could be configured."
+    fi
+}
+
+# =============================================================================
+# Function to set sound card output
+# =============================================================================
+set_sound_card() {
+    echo "🔊 Launching alsamixer to configure the sound card..."
+    echo "   (Press Esc or 'q' to exit once settings are done)"
+    alsamixer
+    echo "💾 Saving ALSA settings..."
+    sudo alsactl store
+    echo "✅ ALSA settings saved!"
 }
 
 # =============================================================================
 # Function to pair Bluetooth Remote using bluetuith
 # =============================================================================
 pair_bluetooth_remote() {
-    REMOTE_SCRIPT="${REMOTE_SCRIPT:-$HOME/scripts/lybrica.py}"
+    REMOTE_SCRIPT="${REMOTE_SCRIPT:-$HOME/scripts/remote.py}"
     VENV_PYTHON="${VENV_PYTHON:-/opt/venv/bin/python3}"
 
     echo "🔗 Preparing Bluetooth Remote pairing interface..."
@@ -375,7 +368,7 @@ EOF
     fi
 
     if [ ! -f "$REMOTE_SCRIPT" ]; then
-        echo "⚠️  $REMOTE_SCRIPT not found. Set this line manually in lybrica.py:"
+        echo "⚠️  $REMOTE_SCRIPT not found. Set this line manually in remote.py:"
         echo "   REMOTE_NAME = \"$dev_name\""
         return 1
     fi
@@ -404,65 +397,24 @@ with open(script, "w", encoding="utf-8") as f:
 EOF
     then
         echo "✅ REMOTE_NAME set to \"$dev_name\" in $REMOTE_SCRIPT"
-        echo "🔄 Restarting lybrica service..."
-        sudo systemctl restart lybrica
-        echo "✅ LyBriCa service restarted successfully."
+        echo "🔄 Restarting remote service..."
+        sudo systemctl restart remote
+        echo "✅ Remote service restarted successfully."
     else
         echo "⚠️  Could not update $REMOTE_SCRIPT (no 'REMOTE_NAME = \"...\"' line, or no write permission)."
-        echo "    Set this line manually in lybrica.py:"
+        echo "    Set this line manually in remote.py:"
         echo "    REMOTE_NAME = \"$dev_name\""
         return 1
     fi
 }
 
 # =============================================================================
-# Function to mount USB drive
+# Function to shutdown
 # =============================================================================
-mount_usb_drive() {
-    echo "💾 Setting up USB Drive auto-mount..."
-    sudo mkdir -p /mnt/usb
-
-    USB_UUID=$(sudo blkid -s UUID -o value /dev/sda1 2>/dev/null || true)
-
-    if [ -z "$USB_UUID" ]; then
-        echo "⚠️ Aucune clé USB détectée automatiquement sur /dev/sda1."
-        read -p "Entrez manuellement l'UUID de votre clé USB : " USB_UUID
-    else
-        echo "✅ Clé USB détectée automatiquement avec l'UUID : $USB_UUID"
-    fi
-
-    if [ -n "$USB_UUID" ]; then
-        sudo sed -i 's|.* /mnt/usb .*||g' /etc/fstab
-        sudo sed -i '/^$/d' /etc/fstab
-
-        echo "UUID=$USB_UUID /mnt/usb auto defaults,nofail,x-systemd.device-timeout=1,noatime 0 0" | sudo tee -a /etc/fstab
-
-        sudo mount -a
-        echo "✅ USB Drive mounted at /mnt/usb with UUID $USB_UUID!"
-    else
-        echo "❌ Erreur : Aucun UUID valide n'a pu être configuré."
-    fi
-}
-
-# =============================================================================
-# Function to set sound card output
-# =============================================================================
-set_sound_card() {
-    echo "🔊 Lancement d'alsamixer pour configurer la carte son..."
-    echo "   (Echap ou 'q' pour quitter une fois les réglages faits)"
-    alsamixer
-    echo "💾 Sauvegarde des réglages ALSA..."
-    sudo alsactl store
-    echo "✅ Réglages ALSA sauvegardés !"
-}
-
-# =============================================================================
-# Function to reboot
-# =============================================================================
-reboot_now() {
-    read -p "Reboot now? (y/n): " choice
+shutdown_now() {
+    read -p "Shutdown now? (y/n): " choice
     if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
-        sudo reboot
+        sudo shutdown -h now
     fi
 }
 
@@ -475,9 +427,9 @@ install_everything() {
     install_lyrion_and_squeezelite
     mount_usb_drive
     set_sound_card
-    install_lybrica
+    install_bluetooth_remote
     pair_bluetooth_remote
-    reboot_now
+    shutdown_now
     echo "✅ All installations completed!"
 }
 
@@ -488,15 +440,15 @@ while true; do
     echo "=================================="
     echo "  Raspberry Pi Audio Setup Menu   "
     echo "=================================="
-    echo "1) Install Everything (Automated)"
+    echo "1) Install Everything"
     echo "2) Upgrade System"
     echo "3) Install CamillaDSP & GUI"
     echo "4) Install Lyrion Media Server & Squeezelite"
     echo "5) Mount USB Drive"
     echo "6) Configure Sound Levels (alsamixer)"
-    echo "7) Install LyBriCa (Config + Script + Service)"
+    echo "7) Install Remote Script (GPIO/UART config + venv + service)"
     echo "8) Pair Bluetooth Remote"
-    echo "9) Reboot System"
+    echo "9) Shutdown System"
     echo "10) Exit"
     echo "=================================="
     read -p "Choose an option [1-10]: " option
@@ -508,9 +460,9 @@ while true; do
         4) install_lyrion_and_squeezelite ;;
         5) mount_usb_drive ;;
         6) set_sound_card ;;
-        7) install_lybrica ;;
+        7) install_bluetooth_remote ;;
         8) pair_bluetooth_remote ;;
-        9) reboot_now ;;
+        9) shutdown_now ;;
         10) echo "Exiting..."; exit 0 ;;
         *) echo "Invalid option. Please try again." ;;
     esac

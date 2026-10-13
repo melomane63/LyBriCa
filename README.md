@@ -17,7 +17,8 @@ receives the remote control signals and reports the ambient light level.
 - [Architecture](#architecture)
 - [Hardware](#hardware)
 - [Software components](#software-components)
-- [Installation](#installation)
+- [Quick install](#quick-install)
+- [Manual installation](#manual-installation)
 - [Configuration](#configuration)
 - [Feature switches](#feature-switches)
 - [Remote control keys](#remote-control-keys)
@@ -115,7 +116,70 @@ to the Pi over serial.
 
 ---
 
-## Installation
+## Quick install
+
+A single script installs everything: CamillaDSP, Lyrion Music Server,
+Squeezelite, LyBriCa, the ALSA loopback, the USB drive mount, and the
+Bluetooth remote pairing.
+
+```bash
+git clone https://github.com/melomane63/LyBriCa.git
+cd LyBriCa
+chmod +x install.sh
+./install.sh
+```
+
+The script opens an interactive menu:
+
+```
+==================================
+  Raspberry Pi Audio Setup Menu
+==================================
+1) Install Everything
+2) Upgrade System
+3) Install CamillaDSP & GUI
+4) Install Lyrion Media Server & Squeezelite
+5) Mount USB Drive
+6) Configure Sound Levels (alsamixer)
+7) Install LyBriCa (GPIO/UART config + venv + service)
+8) Pair Bluetooth Remote
+9) Shutdown System
+10) Exit
+==================================
+```
+
+Choose **1) Install Everything** for a full installation, or pick individual
+steps.
+
+### What the installer does
+
+| Step | Action |
+|---|---|
+| **1. System** | `apt update`, `apt upgrade`, installs `git`, `wget`, `curl`, `python3-pip`, `systemd` |
+| **2. CamillaDSP** | Downloads and installs CamillaDSP + CamillaGUI, creates the systemd services, sets up the ALSA loopback |
+| **3. Lyrion** | Downloads and installs Lyrion Music Server 9.1.1 + Squeezelite, configures the output device |
+| **4. USB drive** | Detects the USB drive UUID and adds it to `/etc/fstab` |
+| **5. Sound card** | Launches `alsamixer` for manual level adjustment |
+| **6. LyBriCa** | Configures `/boot/firmware/config.txt`, creates the venv, installs dependencies, downloads `lybrica.py`, creates the systemd service |
+| **7. Bluetooth remote** | Launches `bluetuith` for pairing, detects the remote, updates `REMOTE_NAME` in `lybrica.py` |
+| **8. Shutdown** | Optional shutdown at the end |
+
+### Installer variables
+
+At the top of `install.sh`, you can adjust:
+
+```bash
+LYBRICA_DIR="$HOME/scripts"                                              # LyBriCa install directory
+LYBRICA_REPO="https://raw.githubusercontent.com/melomane63/LyBriCa/main" # Repo URL
+CAMILLADSP_VERSION="v3.0.1"                                              # CamillaDSP version
+LYRION_VERSION="9.1.1"                                                   # Lyrion version
+```
+
+---
+
+## Manual installation
+
+If you prefer to install step by step:
 
 ### Prerequisites
 
@@ -137,23 +201,27 @@ sudo apt install -y python3-pip python3-dev python3-venv \
 ### Python dependencies
 
 ```bash
-pip install camilladsp evdev pyserial lgpio
+pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5
+pip install camilladsp
 ```
 
 Or, if you use a virtual environment:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install camilladsp evdev pyserial lgpio
+python3 -m venv --system-site-packages /opt/venv
+source /opt/venv/bin/activate
+pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5
+pip install camilladsp
 ```
 
 ### Install LyBriCa
 
 ```bash
-git clone https://github.com/<user>/lybrica.git
-cd lybrica
-cp settings.example.json settings.json
+git clone https://github.com/melomane63/LyBriCa.git
+mkdir -p "$HOME/scripts"
+cp LyBriCa/lybrica.py "$HOME/scripts/lybrica.py"
+cp LyBriCa/tm1637_lgpio.py "/opt/venv/lib/python3.X/site-packages/"
+cp LyBriCa/settings.example.json "$HOME/scripts/settings.json"
 ```
 
 ### Permissions
@@ -164,9 +232,11 @@ The user running LyBriCa needs access to:
 - Serial: add to the `dialout` group
 - Input devices: add to the `input` group
 - Audio: add to the `audio` group
+- SPI: add to the `spi` group
+- I2C: add to the `i2c` group
 
 ```bash
-sudo usermod -aG gpio,dialout,input,audio $USER
+sudo usermod -aG dialout,gpio,input,spi,i2c,audio $USER
 ```
 
 And for the shutdown command:
@@ -327,35 +397,38 @@ The ESP32 and LyBriCa communicate over **serial** (`/dev/serial0`,
 
 ## Systemd service
 
-Copy `lybrica.service` to `/etc/systemd/system/` and enable it:
-
-```bash
-sudo cp lybrica.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now lybrica
-```
-
-`lybrica.service`:
+The installer creates `/etc/systemd/system/lybrica.service`:
 
 ```ini
 [Unit]
 Description=LyBriCa — Lyrion ⇄ CamillaDSP bridge
-After=network-online.target camilladsp.service
-Wants=network-online.target
-Requires=camilladsp.service
+After=default.target
 
 [Service]
-Type=simple
 User=<user>
-Group=<user>
-WorkingDirectory=/home/<user>/lybrica
-ExecStart=/usr/bin/python3 /home/<user>/lybrica/lybrica.py
+Type=simple
+WorkingDirectory=/home/<user>/scripts
+ExecStart=/opt/venv/bin/python3 /home/<user>/scripts/lybrica.py
 Restart=on-failure
 RestartSec=5
-SupplementaryGroups=gpio dialout input audio
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lybrica
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
+```
+
+Manage the service:
+
+```bash
+sudo systemctl status lybrica
+sudo systemctl restart lybrica
+sudo systemctl stop lybrica
+journalctl -u lybrica -f
 ```
 
 ---
@@ -365,7 +438,7 @@ WantedBy=multi-user.target
 ### Remote not detected
 
 ```bash
-python3 -m evdev.evtest
+/opt/venv/bin/python3 -m evdev.evtest
 ```
 
 Check that the remote name matches `REMOTE_NAME` in `lybrica.py`.
@@ -398,10 +471,25 @@ Check `LMS_ADDR` and that Lyrion is running.
 - Check the baud rate: `115200`
 - Check the ESP32 logs (if available)
 
+### ALSA loopback not loaded
+
+```bash
+sudo modprobe snd-aloop
+lsmod | grep snd_aloop
+```
+
+To load it automatically at boot:
+
+```bash
+echo "snd-aloop" | sudo tee -a /etc/modules-load.d/snd-aloop.conf
+```
+
 ### Logs
 
 ```bash
 journalctl -u lybrica -f
+journalctl -u camilladsp -f
+journalctl -u camillagui -f
 ```
 
 ---
@@ -418,7 +506,8 @@ MIT License — see [LICENSE](LICENSE) for details.
 - [Lyrion Music Server](https://lyrion.org/) (ex-Logitech Media Server)
 - [python-evdev](https://github.com/gvalkov/python-evdev)
 - [lgpio](https://github.com/joan2937/lg)
-- [tm1637_lgpio](https://github.com/<user>/tm1637_lgpio)
+- [tm1637_lgpio](https://github.com/melomane63/tm1637_lgpio)
+- [bluetuith](https://github.com/bluetuith-org/bluetuith)
 - Original LMS volume sync idea by [mbrennwa](https://github.com/mbrennwa/camilla_LMS_volume_sync)
 
 ---

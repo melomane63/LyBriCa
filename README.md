@@ -370,3 +370,67 @@ Logitech or any of their respective owners.
 text
 
 ---
+
+## 🥈 Méthode 2 : depuis ton navigateur
+
+1. **Sélectionne tout le bloc ci-dessus** (le bloc ```markdown … ```)
+2. **Copie** (Ctrl+C / Cmd+C)
+3. **Ouvre un éditeur de texte** (VS Code, nano, gedit, Notepad++)
+4. **Colle** (Ctrl+V / Cmd+V)
+5. **Enregistre** sous `README.md`
+
+> ⚠️ Attention : la plupart des interfaces ne copient **qu'un seul bloc à la fois**. Si tu copies tout le message, tu récupéreras aussi les explications autour. C'est pourquoi je te donne le README dans **un seul bloc** ci-dessus.
+
+---
+
+## 🥉 Méthode 3 : depuis le terminal (la plus fiable)
+
+Si tu es sur le Raspberry Pi ou en SSH, tu peux créer le fichier directement :
+
+```bash
+nano README.md
+Puis :
+
+Colle le contenu (Ctrl+Shift+V dans la plupart des terminaux)
+
+Enregistre : Ctrl+O, Entrée
+
+Quitte : Ctrl+X
+
+Ou avec cat :
+
+bash
+cat > README.md << 'EOF'
+# LyBriCa
+...
+EOF
+Mais le heredoc est fragile avec les backticks et les caractères spéciaux du Markdown. Préfère nano ou VS Code.
+
+✅ Ma recommandation
+Copie le bloc ```markdown ci-dessus (méthode 1)
+
+Colle-le dans un fichier README.md sur ton dépôt GitHub :
+
+soit en local avec VS Code / nano
+
+soit directement sur GitHub : bouton Add file → Create new file, nomme-le README.md, colle, commit
+
+Vérifie le rendu : GitHub affiche automatiquement l'aperçu Markdown
+
+🎯 Astuce pour GitHub directement
+Si tu veux tout faire depuis l'interface GitHub :
+
+Va sur ton dépôt
+
+Clique sur Add file → Create new file
+
+Nomme-le README.md
+
+Colle le contenu dans l'éditeur
+
+Clique sur Commit new file
+
+C'est la méthode la plus simple si tu ne veux pas toucher au terminal.
+
+Tu veux que je te génère aussi le settings.example.json, le lybrica.service ou le LICENSE ?
+

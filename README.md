@@ -52,35 +52,35 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 ## Architecture
 
 ```
-                 ┌──────────────────────┐
-                 │  Lyrion Music Server │
-                 │      (ex-LMS)        │
-                 └──────────┬───────────┘
-                            │ CLI (port 9090)
-                            │
-                 ┌──────────▼───────────┐
-                 │       LyBriCa        │
-                 │  (Python, asyncio)   │
-                 └──────────┬───────────┘
-                            │ WebSocket (port 1234)
-                            │
-                 ┌──────────▼───────────┐
-                 │      CamillaDSP      │
-                 └──────────────────────┘
-                            ▲
-                            │ GPIO / I2C / Serial / evdev
-                            │
-   ┌────────────────────────┼────────────────────────┐
-   │                        │                        │
-┌──▼───┐              ┌─────▼─────┐           ┌──────▼──────┐
-│ HID  │              │  TM1637   │           │   Power     │
-│remote│              │  display  │           │   relay     │
-└──────┘              └───────────┘           └──────┬──────┘
-                                                     │
-                                              ┌──────▼──────┐
-                                              │    ESP32    │
-                                              │  firmware   │
-                                              └─────────────┘
+                 +----------------------+
+                 |  Lyrion Music Server |
+                 |      (ex-LMS)        |
+                 +----------+-----------+
+                            | CLI (port 9090)
+                            |
+                 +----------v-----------+
+                 |       LyBriCa        |
+                 |  (Python, asyncio)   |
+                 +----------+-----------+
+                            | WebSocket (port 1234)
+                            |
+                 +----------v-----------+
+                 |      CamillaDSP      |
+                 +----------------------+
+                            ^
+                            | GPIO / I2C / Serial / evdev
+                            |
+   +------------------------+------------------------+
+   |                        |                        |
++--v---+              +-----v-----+           +------v------+
+| HID  |              |  TM1637   |           |   Power     |
+|remote|              |  display  |           |   relay     |
++------+              +-----------+           +------+------+
+                                                     |
+                                              +------v------+
+                                              |    ESP32    |
+                                              |  firmware   |
+                                              +-------------+
 ```
 
 The **ESP32** is the physical power manager: it cuts the power completely
@@ -94,7 +94,7 @@ to the Pi over serial.
 
 | Component | Role | Connection |
 |---|---|---|
-| Raspberry Pi | Runs LyBriCa | — |
+| Raspberry Pi | Runs LyBriCa | - |
 | ESP32 | Power on/off, remote receiver, light sensor | Serial (`/dev/serial0`) |
 | HID remote | User input | USB / Bluetooth (evdev) |
 | TM1637 display | 6-digit display | GPIO 23 (CLK), GPIO 24 (DIO) |
@@ -135,45 +135,50 @@ The script opens an interactive menu:
 ==================================
   Raspberry Pi Audio Setup Menu
 ==================================
-1) Install Everything
+1) Install Everything (Automated)
 2) Upgrade System
 3) Install CamillaDSP & GUI
 4) Install Lyrion Media Server & Squeezelite
 5) Mount USB Drive
 6) Configure Sound Levels (alsamixer)
-7) Install LyBriCa (GPIO/UART config + venv + service)
+7) Install LyBriCa (Config + Script + Service)
 8) Pair Bluetooth Remote
-9) Shutdown System
+9) Reboot System
 10) Exit
 ==================================
 ```
 
-Choose **1) Install Everything** for a full installation, or pick individual
-steps.
+Choose **1) Install Everything (Automated)** for a full installation, or pick
+individual steps.
 
 ### What the installer does
 
 | Step | Action |
 |---|---|
-| **1. System** | `apt update`, `apt upgrade`, installs `git`, `wget`, `curl`, `python3-pip`, `systemd` |
-| **2. CamillaDSP** | Downloads and installs CamillaDSP + CamillaGUI, creates the systemd services, sets up the ALSA loopback |
+| **1. System** | `apt update`, `apt upgrade`, installs `git`, `wget`, `curl`, `python3-pip`, `python3-venv`, `systemd` |
+| **2. CamillaDSP** | Downloads and installs CamillaDSP v4.1.3 + CamillaGUI v4.1.0, creates the systemd services, sets up the ALSA loopback |
 | **3. Lyrion** | Downloads and installs Lyrion Music Server 9.1.1 + Squeezelite, configures the output device |
 | **4. USB drive** | Detects the USB drive UUID and adds it to `/etc/fstab` |
 | **5. Sound card** | Launches `alsamixer` for manual level adjustment |
 | **6. LyBriCa** | Configures `/boot/firmware/config.txt`, creates the venv, installs dependencies, downloads `lybrica.py`, creates the systemd service |
 | **7. Bluetooth remote** | Launches `bluetuith` for pairing, detects the remote, updates `REMOTE_NAME` in `lybrica.py` |
-| **8. Shutdown** | Optional shutdown at the end |
+| **8. Reboot** | Optional reboot at the end |
 
-### Installer variables
+### Installer defaults
 
-At the top of `install.sh`, you can adjust:
+The installer uses the following fixed values:
 
-```bash
-LYBRICA_DIR="$HOME/scripts"                                              # LyBriCa install directory
-LYBRICA_REPO="https://raw.githubusercontent.com/melomane63/LyBriCa/main" # Repo URL
-CAMILLADSP_VERSION="v3.0.1"                                              # CamillaDSP version
-LYRION_VERSION="9.1.1"                                                   # Lyrion version
-```
+| Setting | Value |
+|---|---|
+| LyBriCa directory | `$HOME/scripts` |
+| LyBriCa repository | `https://raw.githubusercontent.com/melomane63/LyBriCa/main` |
+| CamillaDSP version | `v4.1.3` |
+| CamillaGUI version | `v4.1.0` |
+| pycamilladsp version | `v4.0.0` |
+| Lyrion version | `9.1.1` |
+| Python venv | `/opt/venv` |
+
+To change any of these, edit `install.sh` directly.
 
 ---
 
@@ -202,7 +207,7 @@ sudo apt install -y python3-pip python3-dev python3-venv \
 
 ```bash
 pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5
-pip install camilladsp
+pip install "git+https://github.com/HEnquist/pycamilladsp.git@v4.0.0"
 ```
 
 Or, if you use a virtual environment:
@@ -211,7 +216,7 @@ Or, if you use a virtual environment:
 python3 -m venv --system-site-packages /opt/venv
 source /opt/venv/bin/activate
 pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5
-pip install camilladsp
+pip install "git+https://github.com/HEnquist/pycamilladsp.git@v4.0.0"
 ```
 
 ### Install LyBriCa
@@ -220,7 +225,10 @@ pip install camilladsp
 git clone https://github.com/melomane63/LyBriCa.git
 mkdir -p "$HOME/scripts"
 cp LyBriCa/lybrica.py "$HOME/scripts/lybrica.py"
-cp LyBriCa/tm1637_lgpio.py "/opt/venv/lib/python3.X/site-packages/"
+
+PYVER=$(/opt/venv/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+cp LyBriCa/tm1637_lgpio.py "/opt/venv/lib/python${PYVER}/site-packages/tm1637_lgpio.py"
+
 cp LyBriCa/settings.example.json "$HOME/scripts/settings.json"
 ```
 
@@ -293,7 +301,7 @@ hardware library is **not imported** and **not required**.
 
 | Switch | Default | Effect |
 |---|---|---|
-| `ENABLE_LMS_SYNC` | `True` | Lyrion ⇄ CamillaDSP volume/mute sync |
+| `ENABLE_LMS_SYNC` | `True` | Lyrion <-> CamillaDSP volume/mute sync |
 | `ENABLE_AUTO_POWEROFF` | `True` | Power relay: off after silence, on with sound |
 | `ENABLE_REMOTE` | `True` | HID remote control |
 | `ENABLE_DISPLAY` | `True` | TM1637 display + ambient light sensor |
@@ -305,17 +313,17 @@ hardware library is **not imported** and **not required**.
 
 | Key | Short press | Long press |
 |---|---|---|
-| `VOLUMEUP` / `VOLUMEDOWN` | Volume ±1 step | Continuous volume |
-| `MUTE` | Mute / unmute | — |
+| `VOLUMEUP` / `VOLUMEDOWN` | Volume +/-1 step | Continuous volume |
+| `MUTE` | Mute / unmute | - |
 | `PLAYPAUSE` | Pause | Stop (LMS) |
 | `PREVIOUSSONG` | Previous track | Rewind (10 s steps) |
 | `NEXTSONG` | Next track | Fast-forward (10 s steps) |
-| `UP` / `DOWN` | Presence gain ± / treble ± | — |
-| `LEFT` / `RIGHT` | Tilt gain ± / bass ± | — |
+| `UP` / `DOWN` | Presence gain +/- / treble +/- | - |
+| `LEFT` / `RIGHT` | Tilt gain +/- / bass +/- | - |
 | `ENTER` | Reset / restore tone values | Switch tone / tilt screen |
-| `BACK` | Next `_*` config (stereo) | — |
-| `HOMEPAGE` | Next `\|*` config (TV) | — |
-| `POWER` | — | Toggle relay / shutdown |
+| `BACK` | Next `_*` config (stereo) | - |
+| `HOMEPAGE` | Next `\|*` config (TV) | - |
+| `POWER` | - | Toggle relay / shutdown |
 
 ---
 
@@ -323,7 +331,7 @@ hardware library is **not imported** and **not required**.
 
 The TM1637 display shows:
 
-- **Volume screen**: config label (3 chars) + volume (0–100)
+- **Volume screen**: config label (3 chars) + volume (0-100)
 - **Tone screen**: bass / treble (` 3B 2T`)
 - **Tilt screen**: tilt / presence (` 2T 1P`)
 - **Loudness screen**: reference level (`-30 Ld`)
@@ -342,14 +350,14 @@ Brightness is adjusted automatically from the ambient light sensor
 
 ## Volume curve
 
-The volume is mapped from the Lyrion 0–100 scale to CamillaDSP dB:
+The volume is mapped from the Lyrion 0-100 scale to CamillaDSP dB:
 
 | Level | dB | Step |
 |---|---|---|
-| 0 | −100 (mute) | — |
-| 1 | −75 | — |
-| 2–25 | −71 to −37.5 | ~1.5 dB/step |
-| 25–100 | −37.5 to 0 | 0.5 dB/step |
+| 0 | -100 (mute) | - |
+| 1 | -75 | - |
+| 2-25 | -71 to -37.5 | ~1.5 dB/step |
+| 25-100 | -37.5 to 0 | 0.5 dB/step |
 
 The curve is strictly increasing, so the inverse conversion is exact.
 Maximum deviation from the original Squeezelite curve: < 0.5 dB.
@@ -385,10 +393,10 @@ The ESP32 and LyBriCa communicate over **serial** (`/dev/serial0`,
 
 | Direction | Message | Meaning |
 |---|---|---|
-| ESP32 → Pi | `<int>\n` | Ambient light ADC value |
-| ESP32 → Pi | `POWER\n` | Power key pressed |
-| Pi → ESP32 | `OFF\n` | Cut power |
-| Pi → ESP32 | `ON\n` | Power on |
+| ESP32 -> Pi | `<int>\n` | Ambient light ADC value |
+| ESP32 -> Pi | `POWER\n` | Power key pressed |
+| Pi -> ESP32 | `OFF\n` | Cut power |
+| Pi -> ESP32 | `ON\n` | Power on |
 
 > The firmware source, wiring diagram and flashing instructions are in the
 > [`firmware/`](firmware/) directory of this repository.
@@ -401,7 +409,7 @@ The installer creates `/etc/systemd/system/lybrica.service`:
 
 ```ini
 [Unit]
-Description=LyBriCa — Lyrion ⇄ CamillaDSP bridge
+Description=LyBriCa - Lyrion <-> CamillaDSP bridge
 After=default.target
 
 [Service]
@@ -496,7 +504,7 @@ journalctl -u camillagui -f
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 

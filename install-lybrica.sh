@@ -239,7 +239,7 @@ EOL
 
     cat > ~/camilladsp/configs/_Setup.yml <<EOL
 devices:
-  samplerate: 44100
+  samplerate: 48000
   chunksize: 1024
   queuelimit: 4
   capture:
@@ -252,6 +252,7 @@ devices:
     channels: 2
     device: "hw:0,0"
     format: S32LE
+title: Streamer
 EOL
 
     if ! grep -q "^snd-aloop" /etc/modules-load.d/snd-aloop.conf 2>/dev/null; then

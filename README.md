@@ -120,10 +120,10 @@ Squeezelite, LyBriCa, the ALSA loopback, the USB drive mount, and the
 Bluetooth remote pairing.
 
 ```bash
-git clone https://github.com/melomane63/LyBriCa.git
-cd LyBriCa
-chmod +x install-lybrica.sh
-./install-lybrica.sh
+
+wget https://raw.githubusercontent.com/melomane63/LyBriCa/main/install-lybrica.sh -O /tmp/install-lybrica.sh
+chmod +x /tmp/install-lybrica.sh
+bash /tmp/install-lybrica.sh
 ```
 
 The script opens an interactive menu:

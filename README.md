@@ -39,7 +39,7 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 - **Bidirectional volume / mute sync** between Lyrion and CamillaDSP
 - **Automatic DSP config switching** (TV / Squeezelite) via GPIO or TOSLINK
   detection
-- **HID remote control** (volume, mute, transport, tone, tilt, loudness,
+- **HID remote control** (volume, mute, config, tone, tilt, loudness,
   power)
 - **TM1637 display** with ambient light sensor for automatic brightness
 - **Power relay control**: switch off after silence, back on with sound,

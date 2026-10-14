@@ -122,8 +122,7 @@ EOL
     # 3. Dependencies
     # -------------------------------------------------------------------------
     sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5
-    sudo /opt/venv/bin/pip install "git+https://github.com/HEnquist/pycamilladsp.git@15d9b7c434b8e795bcad25783b75d5354acdb840"
-
+    sudo /opt/venv/bin/pip install "git+https://github.com/HEnquist/pycamilladsp.git"
     # -------------------------------------------------------------------------
     # 4. Download scripts
     # -------------------------------------------------------------------------
@@ -174,7 +173,7 @@ EOL
 install_camilladsp() {
     echo "🎛️ Installing CamillaDSP..."
     mkdir -p ~/camilladsp ~/camilladsp/coeffs ~/camilladsp/configs
-    wget https://github.com/HEnquist/camilladsp/releases/download/v3.0.1/camilladsp-linux-aarch64.tar.gz -O ~/camilladsp/camilladsp-linux-aarch64.tar.gz
+    wget https://github.com/HEnquist/camilladsp/releases/download/v4.1.3/camilladsp-linux-aarch64.tar.gz -O ~/camilladsp/camilladsp-linux-aarch64.tar.gz
     sudo tar -xvf ~/camilladsp/camilladsp-linux-aarch64.tar.gz -C /usr/local/bin/
 
     # Set up the systemd service for CamillaDSP
@@ -208,7 +207,7 @@ EOL
 
     # Install CamillaGUI
     echo "🖥️ Installing CamillaGUI..."
-    wget https://github.com/HEnquist/camillagui-backend/releases/download/v3.0.3/bundle_linux_aarch64.tar.gz -O ~/camilladsp/bundle_linux_aarch64.tar.gz
+    wget https://github.com/HEnquist/camillagui-backend/releases/download/V4.1.0/bundle_linux_aarch64.tar.gz -O ~/camilladsp/bundle_linux_aarch64.tar.gz
     tar -xvf ~/camilladsp/bundle_linux_aarch64.tar.gz -C ~/camilladsp/
 
     # Set up CamillaGUI systemd service

@@ -60,16 +60,16 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("remote")
 
 
-# ========================= CONSTANTS =========================
+# ========================= SETTINGS =========================
+# Everything you may want to change is here, grouped by topic.
+# (The on/off switches are in the FEATURES block above.)
+
+
+# ---------------------- Remote control ----------------------
 
 REMOTE_NAME = "HID Remote01 Keyboard"   # Found with `python3 -m evdev.evtest`
-POWER_OFF_DELAY = 2                     # Minutes of silence before the power relay is switched off
-HALT_DELAY = 48                         # Hours of silence (or without remote) before the Raspberry Pi shuts down
-POWER_GPIO = 4                          # GPIO controlling the power relay
-TV_GPIO = 12                            # GPIO reading the TV state (0 = TV on)
-CLK, DIO = 23, 24                       # TM1637 display pins
 
-# Remote control keys (all require ENABLE_REMOTE = True)
+# Keys (all require ENABLE_REMOTE = True)
 KEY_BINDINGS = {
     'VOLUMEDOWN':    'KEY_VOLUMEDOWN',   # Decrease volume
     'VOLUMEUP':      'KEY_VOLUMEUP',     # Increase volume
@@ -77,10 +77,10 @@ KEY_BINDINGS = {
     'PLAYPAUSE':     'KEY_PLAYPAUSE',    # Pause (short press) / stop (long press) - LMS
     'PREVIOUSSONG':  'KEY_PREVIOUSSONG', # Previous song (short press) / rewind (long press) - LMS
     'NEXTSONG':      'KEY_NEXTSONG',     # Next song (short press) / fast-forward (long press) - LMS
-    'UP':            'KEY_UP',           # Presence gain + / treble + (needs ENABLE_DISPLAY)
-    'DOWN':          'KEY_DOWN',         # Presence gain - / treble -        "
-    'LEFT':          'KEY_LEFT',         # Tilt gain - / bass -              "
-    'RIGHT':         'KEY_RIGHT',        # Tilt gain + / bass +              "
+    'UP':            'KEY_UP',           # Bass + / tilt + / loudness + (needs ENABLE_DISPLAY)
+    'DOWN':          'KEY_DOWN',         # Bass - / tilt - / loudness -      "
+    'LEFT':          'KEY_LEFT',         # Treble - / presence -             "
+    'RIGHT':         'KEY_RIGHT',        # Treble + / presence +             "
     'POWER':         'KEY_POWER',        # Long press: toggle relay (needs ENABLE_AUTO_POWEROFF)
                                          # Very long press: shutdown (always)
     'ENTER':         'KEY_ENTER',        # Short: bass/treble/tilt/presence all 0 or restored
@@ -90,51 +90,109 @@ KEY_BINDINGS = {
     'HOMEPAGE':      'KEY_HOMEPAGE',     # Next DSP config (files prefixed with "|")
 }
 
-CONFIG_DIR = os.path.expanduser("~") + "/camilladsp/configs/"
-SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
-
-SERIAL_PORT = "/dev/serial0"
-BAUD_RATE = 115200
-
-# Ambient light sensor (ADC) -> display brightness
-ADC_LEVELS = [80, 1000, 2500, 3500]
-BRIGHTNESS_LEVELS = [0, 1, 2, 3, 7]
-HYSTERESIS_RATIO = 0.03  # 3 % hysteresis between two brightness levels
-
-# Key hold durations, in key-repeat events
-HOLD_TOGGLE_POWER = 2
-HOLD_STOP = 10
-HOLD_SEEK = 10              # Long press on NEXT/PREVIOUS: key-repeat events before seeking starts
+# Hold durations, in key-repeat events
+HOLD_TOGGLE_POWER = 2       # POWER: toggle the relay
+HOLD_SHUTDOWN = 300         # POWER: shut the Raspberry Pi down
+HOLD_STOP = 10              # PLAY/PAUSE: stop
+HOLD_SEEK = 10              # NEXT/PREVIOUS: seeking starts
+HOLD_SWITCH_TONE_TILT = 15  # ENTER: switch between the tone and tilt screens
 SEEK_STEP_S = 10            # Seconds jumped at each seek
 SEEK_INTERVAL_S = 0.5       # Seconds between two seeks while the key is held (10 s / 0.5 s = 20x speed)
-HOLD_SWITCH_TONE_TILT = 15
-HOLD_SHUTDOWN = 300
 
+
+# ---------------------- Power ----------------------
+
+POWER_GPIO = 4              # GPIO controlling the power relay
+POWER_OFF_DELAY = 2         # Minutes of silence before the power relay is switched off
+HALT_DELAY = 48             # Hours of silence (or without remote) before the Raspberry Pi shuts down
+
+
+# ---------------------- Tone and loudness ----------------------
+
+TILT_DB_STEP = 2            # Real dB applied per displayed tilt step
+DEFAULT_LOUDNESS_REF = -30  # Loudness level restored by ENTER when no previous value is saved
+
+# Adjustment ranges (TONE_MAX_DB, PRESENCE_MAX_DB and TILT_MAX_STEPS: 9 at most, the display has 2 digits)
+TONE_MAX_DB = 9             # Bass / treble: -9 .. +9 dB
+PRESENCE_MAX_DB = 3         # Presence: -3 .. +3 dB
+TILT_MAX_STEPS = 3          # Tilt: -3 .. +3 displayed steps (TILT_DB_STEP dB each)
+LOUDNESS_MIN, LOUDNESS_MAX = -50, -10   # Loudness reference level range in dB (stay above -100, which means "off")
+LOUDNESS_STEP = 5           # Loudness: dB per key press
+
+
+# ---------------------- Display ----------------------
+
+CLK, DIO = 23, 24           # TM1637 display pins
 SCREEN_RETURN_DELAY = 30    # Seconds without key press before returning to the volume screen
+POWER_MSG_DURATION = 1.5    # Seconds PW ON / PW OFF stays on the display
+
+# Ambient light sensor (ADC) -> display brightness
+SERIAL_PORT = "/dev/serial0"
+BAUD_RATE = 115200
+ADC_LEVELS = [80, 1000, 2500, 3500]
+BRIGHTNESS_LEVELS = [0, 1, 2, 3, 7]
+HYSTERESIS_RATIO = 0.03     # 3 % hysteresis between two brightness levels
+
+
+# ---------------------- CamillaDSP and config switching ----------------------
+
+CAMILLA_ADDR = ("127.0.0.1", 1234)
+CONFIG_DIR = os.path.expanduser("~") + "/camilladsp/configs/"
+
+# ENABLE_CONFIG_SWITCH = "gpio"
+TV_GPIO = 12                # GPIO reading the TV state (0 = TV on)
+
+# ENABLE_CONFIG_SWITCH = "toslink"
+# NOTE: device / rate / channels are read at startup from the first "|*" YAML.
+TOSLINK_TV_ON_DB = -60.0        # TOSLINK free: level >= threshold -> TV
+TOSLINK_SILENCE_DELAY_S = 120   # Seconds of silence before going back to SQUEEZELITE
+
+
+# ---------------------- Logitech Media Server ----------------------
+
+LMS_ADDR = ("127.0.0.1", 9090)   # LMS CLI (the server runs on this Pi)
+LMS_PLAYER_MANUAL = ""           # "" = auto (MAC of the default interface); or e.g. "dc:a6:32:3c:1c:21" (raw, lowercase)
+LMS_SYNC_DEBUG = False           # Log every volume/mute change and the raw LMS notifications
+
+
+# ===================== INTERNAL (do not edit) =====================
+
+SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
 CONFIG_GROUPS = ("_", "|")  # Config file prefixes: "_" = stereo (BACK key), "|" = TV (HOMEPAGE key)
 
-# CamillaDSP filter -> parameter
-FILTER_PARAMS = {
-    "Bass":     "gain",
-    "Treble":   "gain",
-    "Tilt":     "gain",
-    "Presence": "gain",
-    "Loudness": "reference_level",
+# settings.json key -> (CamillaDSP filter, parameter)
+TONE_PARAMS = {
+    "bass_gain":     ("Bass", "gain"),
+    "treble_gain":   ("Treble", "gain"),
+    "tilt_gain":     ("Tilt", "gain"),
+    "loudness_ref":  ("Loudness", "reference_level"),
+    "presence_gain": ("Presence", "gain"),
 }
 
+# The four gains driven by the tone / tilt screens and the ENTER key: settings key -> filter
+GAIN_KEYS = {
+    "bass_gain":     "Bass",
+    "treble_gain":   "Treble",
+    "tilt_gain":     "Tilt",
+    "presence_gain": "Presence",
+}
 
-# TOSLINK detection (ENABLE_CONFIG_SWITCH = "toslink")
-# NOTE: device / rate / channels are read at startup from the first "|*" YAML.
-TOSLINK_TV_ON_DB = -60.0         # TOSLINK free: level >= threshold -> TV
-TOSLINK_SILENCE_DELAY_S = 120    # Seconds of silence before going back to SQUEEZELITE
-
-
-# LMS <-> CamillaDSP volume sync
-CAMILLA_ADDR = ("127.0.0.1", 1234)
-LMS_ADDR = ("127.0.0.1", 9090)           # LMS CLI (the server runs on this Pi)
-LMS_PLAYER_MANUAL = ""                   # "" = auto (MAC of the default interface); or e.g. "dc:a6:32:3c:1c:21" (raw, lowercase)
-LMS_SYNC_DEBUG = False                   # Log every volume/mute change and the raw LMS notifications
+# Arrow keys on the tone / tilt screens: screen -> key -> (filter, step, limit)
+ARROW_ADJUST = {
+    "tone": {
+        KEY_BINDINGS['UP']:    ("Bass",    1, TONE_MAX_DB),
+        KEY_BINDINGS['DOWN']:  ("Bass",   -1, TONE_MAX_DB),
+        KEY_BINDINGS['RIGHT']: ("Treble",  1, TONE_MAX_DB),
+        KEY_BINDINGS['LEFT']:  ("Treble", -1, TONE_MAX_DB),
+    },
+    "tilt": {
+        KEY_BINDINGS['UP']:    ("Tilt",  TILT_DB_STEP, TILT_MAX_STEPS * TILT_DB_STEP),
+        KEY_BINDINGS['DOWN']:  ("Tilt", -TILT_DB_STEP, TILT_MAX_STEPS * TILT_DB_STEP),
+        KEY_BINDINGS['RIGHT']: ("Presence",  1, PRESENCE_MAX_DB),
+        KEY_BINDINGS['LEFT']:  ("Presence", -1, PRESENCE_MAX_DB),
+    },
+}
 
 
 # ====================== VOLUME CURVE ======================
@@ -180,17 +238,7 @@ last_displayed = None
 blank_volume_when_mute = False
 enter_display_at_press = None   # Screen shown when ENTER was pressed (to tell short/long press apart)
 
-# Values restored by a short ENTER press. One entry per filter in FILTER_PARAMS;
-# Loudness uses its own default, all the others start at 0.
-prev_values = {
-    "Bass":     0,
-    "Treble":   0,
-    "Tilt":     0,
-    "Presence": 0,
-    "Loudness": -30,   # default loudness reference level when nothing is saved
-}
-DEFAULT_PREV = dict(prev_values)   # snapshot of the default values, used by reset / fallback
-
+prev_values = {}                # ENTER-key restore values, same keys as TONE_PARAMS (filled by load_prev_values)
 current_config_key = None       # Settings key of the active config file
 
 adc_buffer = b""                # Incomplete serial data waiting for its newline
@@ -390,18 +438,32 @@ def apply_filter_param(filters, filt, param, value):
     params[param] = value
 
 
-def get_filter_param(config, filt, param):
-    """Return a filter parameter, or None if the filter/parameter is missing."""
-    f = (config.get("filters") or {}).get(filt)
-    params = f.get("parameters") if isinstance(f, dict) else None
-    return params.get(param) if isinstance(params, dict) else None
+def active_filter_names(config):
+    """Names of the filters really used by the pipeline. A filter defined in
+    `filters:` but not listed in an (enabled) Filter step has no effect on the sound."""
+    names = set()
+    for step in config.get("pipeline") or []:
+        if isinstance(step, dict) and step.get("type") == "Filter" and not step.get("bypassed"):
+            step_names = step.get("names")
+            if isinstance(step_names, list):
+                names.update(n for n in step_names if isinstance(n, str))
+    return names
 
 
 def get_filter_params(config, filt):
-    """Return the 'parameters' dict of a filter, or None if the filter is missing."""
+    """Return the 'parameters' dict of a filter, or None if the filter is missing
+    from the config or not used by its pipeline."""
+    if filt not in active_filter_names(config):
+        return None
     f = (config.get("filters") or {}).get(filt)
     params = f.get("parameters") if isinstance(f, dict) else None
     return params if isinstance(params, dict) else None
+
+
+def get_filter_param(config, filt, param):
+    """Return a filter parameter, or None if the filter/parameter is missing."""
+    params = get_filter_params(config, filt)
+    return params.get(param) if params is not None else None
 
 
 def config_key(path):
@@ -412,18 +474,18 @@ def config_key(path):
 def get_tone(config):
     """Current tone values of a config (only for filters that really exist)."""
     tone = {}
-    for filt, param in FILTER_PARAMS.items():
+    for key, (filt, param) in TONE_PARAMS.items():
         value = get_filter_param(config, filt, param)
         if value is not None:
-            tone[filt] = value
+            tone[key] = value
     return tone
 
 
 def apply_tone(filters, tone):
     """Apply a saved tone dict to the filters of a config."""
-    for filt, param in FILTER_PARAMS.items():
-        if filt in tone:
-            apply_filter_param(filters, filt, param, tone[filt])
+    for key, (filt, param) in TONE_PARAMS.items():
+        if key in tone:
+            apply_filter_param(filters, filt, param, tone[key])
 
 
 def load_settings():
@@ -463,19 +525,14 @@ def save_audio_settings(config):
     write_settings()
 
 
-def reset_prev_values():
-    """Restore the ENTER-key restore values to their defaults."""
-    prev_values.update(DEFAULT_PREV)
-
-
-def load_prev_values(saved):
+def load_prev_values(saved=None):
     """Load the ENTER-key restore values saved for a config (defaults if none)."""
-    reset_prev_values()
-    prev = saved.get("prev") if saved else None
-    if isinstance(prev, dict):
-        for filt in FILTER_PARAMS:
-            if filt in prev:
-                prev_values[filt] = prev[filt]
+    saved_prev = saved.get("prev") if saved else None
+    if not isinstance(saved_prev, dict):
+        saved_prev = {}
+    for key in TONE_PARAMS:
+        default = DEFAULT_LOUDNESS_REF if key == "loudness_ref" else 0
+        prev_values[key] = saved_prev.get(key, default)
 
 
 def init_tone():
@@ -495,7 +552,7 @@ def init_tone():
 
 settings = load_settings()
 last_tone_tilt = settings["last_tone_tilt"]
-reset_prev_values()
+load_prev_values()
 if TONE_ACTIVE:
     init_tone()
 
@@ -529,8 +586,7 @@ def display_volume_info(current_volume=None, is_muted=None):
 
     segs = tm.encode_string(volume_str)
 
-    if any(get_filter_param(config_active, n, "gain")
-           for n in ("Bass", "Treble", "Tilt", "Presence")):
+    if any(get_filter_param(config_active, f, "gain") for f in GAIN_KEYS.values()):
         segs[3] |= 0x01    # top horizontal segment (A) on the 4th character: tone settings active
 
     if ENABLE_AUTO_POWEROFF and auto_power_enabled:
@@ -546,9 +602,9 @@ def display_volume_info(current_volume=None, is_muted=None):
 
 def display_tone_info():
     global last_displayed
-    bass = get_filter_param(config_active, "Bass", "gain")
-    treble = get_filter_param(config_active, "Treble", "gain")
-    show(f"{fmt_gain(bass)}B{fmt_gain(treble)}T")
+    bass_gain = get_filter_param(config_active, "Bass", "gain")
+    treble_gain = get_filter_param(config_active, "Treble", "gain")
+    show(f"{fmt_gain(bass_gain)}B{fmt_gain(treble_gain)}T")
     last_displayed = "tone"
 
 
@@ -557,8 +613,8 @@ def display_loudness_info():
     loudness_ref = get_filter_param(config_active, "Loudness", "reference_level")
     if loudness_ref is None:
         value_str = "---"        # no Loudness filter in this config
-    elif round(loudness_ref) == -99:
-        value_str = " No"        # loudness switched off
+    elif round(loudness_ref) == -100:
+        value_str = " No"        # loudness switched off (-100)
     else:
         value_str = f"{round(loudness_ref)}"
     show(f"{value_str} Ld")
@@ -567,11 +623,11 @@ def display_loudness_info():
 
 def display_tilt_info():
     global last_displayed
-    presence = get_filter_param(config_active, "Presence", "gain")
-    tilt = get_filter_param(config_active, "Tilt", "gain")
-    # Displayed -3..+3; 2 is the real dB applied per displayed tilt step
-    tilt_step = None if tilt is None else round(tilt / 2)
-    show(f"{fmt_gain(tilt_step)}T{fmt_gain(presence)}P")
+    tilt_gain = get_filter_param(config_active, "Tilt", "gain")
+    presence_gain = get_filter_param(config_active, "Presence", "gain")
+    # displayed in steps, actual gain = step * TILT_DB_STEP dB
+    tilt_step = None if tilt_gain is None else round(tilt_gain / TILT_DB_STEP)
+    show(f"{fmt_gain(tilt_step)}T{fmt_gain(presence_gain)}P")
     last_displayed = "tilt"
 
 
@@ -612,97 +668,71 @@ def get_repeat_speed(volume, direction, exponent=2.0, pivot=-50):
     return max(min_delay, delay * step_db)
 
 
-# Arrow keys: screen -> direction -> (filter, parameter, step, min, max)
-ARROW_ACTIONS = {
-    "tone": {
-        "UP":    ("Bass",   "gain", +1, -9,  9),
-        "DOWN":  ("Bass",   "gain", -1, -9,  9),
-        "RIGHT": ("Treble", "gain", +1, -9,  9),
-        "LEFT":  ("Treble", "gain", -1, -9,  9),
-    },
-    "tilt": {
-        "UP":    ("Tilt",     "gain", +2, -6, 6),   # 2 = real dB per displayed tilt step
-        "DOWN":  ("Tilt",     "gain", -2, -6, 6),
-        "RIGHT": ("Presence", "gain", +1, -3, 3),
-        "LEFT":  ("Presence", "gain", -1, -3, 3),
-    },
-    "loudness": {
-        "UP":   ("Loudness", "reference_level", +5, -50, -10),
-        "DOWN": ("Loudness", "reference_level", -5, -50, -10),
-    },
-}
-
-KEY_TO_DIR = {
-    KEY_BINDINGS['UP']:    "UP",
-    KEY_BINDINGS['DOWN']:  "DOWN",
-    KEY_BINDINGS['RIGHT']: "RIGHT",
-    KEY_BINDINGS['LEFT']:  "LEFT",
-}
-
-
-def adjust_param(filt, param, delta, low, high):
-    """Adjust a filter parameter, or return False if the filter is absent."""
-    params = get_filter_params(config_active, filt)
-    if params is None:
-        return False
-    params[param] = clamp(params.get(param, 0) + delta, low, high)
-    return True
-
-
 def handle_arrow_keys(key):
     """Adjust the parameters of the screen currently displayed."""
-    action = ARROW_ACTIONS.get(last_displayed, {}).get(KEY_TO_DIR.get(key))
-    if action and adjust_param(*action):
-        cdsp.config.set_active(config_active)
-        if last_displayed == "loudness":
+    up, down = KEY_BINDINGS['UP'], KEY_BINDINGS['DOWN']
+
+    if last_displayed == "loudness":
+        loudness_params = get_filter_params(config_active, "Loudness")
+        if loudness_params is not None and key in (up, down):   # LEFT / RIGHT do nothing here
+            ref_level = loudness_params.get('reference_level', 0) + (LOUDNESS_STEP if key == up else -LOUDNESS_STEP)
+            loudness_params['reference_level'] = clamp(ref_level, LOUDNESS_MIN, LOUDNESS_MAX)
+            cdsp.config.set_active(config_active)
             display_loudness_info()
-        elif last_displayed == "tilt":
+
+    elif last_displayed in ARROW_ADJUST:
+        filt, step, limit = ARROW_ADJUST[last_displayed][key]
+        params = get_filter_params(config_active, filt)
+        if params is not None:      # filter absent from this config: the key does nothing
+            params['gain'] = clamp(params.get('gain', 0) + step, -limit, limit)
+            cdsp.config.set_active(config_active)
+            (display_tilt_info if last_displayed == "tilt" else display_tone_info)()
+
+    else:
+        if last_tone_tilt == "tilt":
             display_tilt_info()
         else:
             display_tone_info()
-    elif last_displayed not in ARROW_ACTIONS:
-        # Not on a screen with arrow actions: pick the default screen
-        (display_tilt_info if last_tone_tilt == "tilt" else display_tone_info)()
 
 
 def handle_enter_press(screen):
     """Short ENTER press.
     - tone / tilt screen: bass, treble, tilt and presence are ALL set to 0,
       or ALL restored to their previous values if they are already all at 0.
-    - loudness screen: loudness is switched off (-99) or restored."""
-
+    - loudness screen: loudness is switched off (-100) or restored."""
     if screen in ("tone", "tilt"):
-        present = {
-            filt: get_filter_params(config_active, filt)
-            for filt in ("Bass", "Treble", "Tilt", "Presence")
-        }
-        present = {filt: p for filt, p in present.items() if p is not None}
-        if not present:
+        params = {key: get_filter_params(config_active, filt) for key, filt in GAIN_KEYS.items()}
+        existing = {key: p for key, p in params.items() if p is not None}
+        if not existing:
             return
 
-        if all(p.get("gain", 0) == 0 for p in present.values()):
+        if all(p.get('gain', 0) == 0 for p in existing.values()):
             # Everything is at 0: restore the previous values
-            for filt, p in present.items():
-                p["gain"] = prev_values[filt]
-                prev_values[filt] = 0
+            for key, p in existing.items():
+                p['gain'] = prev_values[key]
+            prev_values.update(dict.fromkeys(GAIN_KEYS, 0))
         else:
             # Remember the current values, then set everything to 0
-            for filt, p in present.items():
-                prev_values[filt] = p.get("gain", 0)
-                p["gain"] = 0
+            for key, p in params.items():
+                prev_values[key] = p.get('gain', 0) if p is not None else 0
+            for p in existing.values():
+                p['gain'] = 0
 
         cdsp.config.set_active(config_active)
-        (display_tone_info if screen == "tone" else display_tilt_info)()
+        if screen == "tone":
+            display_tone_info()
+        else:
+            display_tilt_info()
 
     elif screen == "loudness":
-        params = get_filter_params(config_active, "Loudness")
-        if params is not None:
-            if params.get("reference_level") == -99:
-                params["reference_level"] = prev_values["Loudness"]
-                prev_values["Loudness"] = -99
+        loudness_params = get_filter_params(config_active, "Loudness")
+        if loudness_params is not None:
+            if loudness_params.get('reference_level') == -100:      # -100 = loudness off
+                loudness_params['reference_level'] = prev_values["loudness_ref"]
+                prev_values["loudness_ref"] = -100
             else:
-                prev_values["Loudness"] = params.get("reference_level", DEFAULT_PREV["Loudness"])
-                params["reference_level"] = -99
+                prev_values["loudness_ref"] = loudness_params.get('reference_level', DEFAULT_LOUDNESS_REF)
+                loudness_params['reference_level'] = -100
             cdsp.config.set_active(config_active)
             display_loudness_info()
 
@@ -824,9 +854,6 @@ def toggle_power():
         show("PW OFF")
 
     last_displayed = "power"
-
-
-POWER_MSG_DURATION = 1.5    # Seconds PW ON / PW OFF stays on the display
 
 
 async def return_to_volume_later(delay=POWER_MSG_DURATION):

@@ -207,7 +207,7 @@ EOL
 
     # Install CamillaGUI
     echo "🖥️ Installing CamillaGUI..."
-    wget https://github.com/HEnquist/camillagui-backend/releases/download/V4.1.0/bundle_linux_aarch64.tar.gz -O ~/camilladsp/bundle_linux_aarch64.tar.gz
+    wget https://github.com/HEnquist/camillagui-backend/releases/download/v4.1.0/bundle_linux_aarch64.tar.gz -O ~/camilladsp/bundle_linux_aarch64.tar.gz
     tar -xvf ~/camilladsp/bundle_linux_aarch64.tar.gz -C ~/camilladsp/
 
     # Set up CamillaGUI systemd service

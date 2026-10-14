@@ -247,12 +247,12 @@ devices:
     type: Alsa
     channels: 2
     device: "plughw:Loopback,1,0"
-    format: S32LE
+    format: S32_LE
   playback:
     type: Alsa
     channels: 2
     device: "default"
-    format: S16LE
+    format: S16_LE
 title: Setup
 EOL
 

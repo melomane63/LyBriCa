@@ -1051,6 +1051,7 @@ async def auto_poweroff():
 
 async def monitor_tv_gpio():
     """Watch the TV GPIO; a state change is validated once it stays stable for 1 second."""
+    global is_waiting_for_sound
     last_state = lgpio.gpio_read(h, TV_GPIO)
 
     while True:
@@ -1059,8 +1060,16 @@ async def monitor_tv_gpio():
         if current_state != last_state:
             await asyncio.sleep(1.0)
             if lgpio.gpio_read(h, TV_GPIO) == current_state:
-                pattern = '|*' if current_state == 0 else '_*'  # 0 = TV on
-                await change_config(cdsp, CONFIG_DIR + pattern, cycle=False)
+                if current_state == 0:
+                    relay_was_on = lgpio.gpio_read(h, POWER_GPIO) == 1
+                    if relay_was_on:
+                        lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
+                    await change_config(cdsp, CONFIG_DIR + '|*', cycle=False)
+                    if relay_was_on:
+                        await asyncio.sleep(3.0)
+                        is_waiting_for_sound = True
+                else:
+                    await change_config(cdsp, CONFIG_DIR + '_*', cycle=False)
                 last_state = current_state
 
         await asyncio.sleep(0.05)

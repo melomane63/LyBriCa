@@ -567,6 +567,52 @@ in this section refer to the **ESP32-C3**, not to Raspberry Pi GPIO numbers.
 | GPIO10 | Output | Raspberry Pi shutdown request |
 | GPIO21 (UART1 TX) | Output | Sends filtered ADC readings to the Raspberry Pi |
 
+### Flashing the firmware
+
+The firmware is built with **ESP-IDF** (v5.x). Install ESP-IDF first, then:
+
+```bash
+source ~/esp-idf/export.sh
+
+idf.py fullclean
+idf.py set-target esp32c3
+idf.py build
+idf.py -p /dev/ttyACM0 flash
+idf.py -p /dev/ttyACM0 monitor
+```
+
+- `set-target esp32c3` is required the first time (or after `fullclean`) to
+  configure the build for the ESP32-C3.
+- `/dev/ttyACM0` is the USB CDC serial port exposed by the ESP32-C3. On some
+  systems it may be `/dev/ttyUSB0` — check with `ls /dev/tty*` before flashing.
+- `monitor` prints the BLE scan logs (`BLE_SCAN: ADV ...`) and the relay
+  messages. Press `Ctrl+]` to exit.
+
+### Ambient-light sensor wiring
+
+The firmware reads the LDR on **GPIO2 (ADC1 channel 0)** through a simple
+voltage divider:
+
+```
+3V3 ──── LDR ────┬──── GPIO2 (ADC)
+                 │
+                R
+                 │
+                GND
+```
+
+| Component | Value | Notes |
+|---|---|---|
+| LDR | **GL5516** | Common photoresistor; ~5–10 kΩ in bright light, ~1 MΩ in the dark |
+| Resistor `R` | **15 kΩ** | Default value used in the reference build |
+| Resistor `R` (alt.) | **16.2 kΩ** | Alternative value if 15 kΩ is not available; only shifts the ADC curve slightly |
+
+Either resistor value works: the ADC levels in `lybrica.py`
+(`ADC_LEVELS = [80, 1000, 2500, 3500]`) are thresholds, not absolute
+calibrations. If the display brightness does not react as expected, log the
+raw ADC value (see the ESP32 `monitor` output) and adjust `ADC_LEVELS` in
+`lybrica.py` to match your environment.
+
 ### Pairing the BLE remote with the ESP32
 
 The ESP32 firmware acts as a **BLE HID host**: it does not pair from the

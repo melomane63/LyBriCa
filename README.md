@@ -2,36 +2,29 @@
 
 **Ly**rion + **Bri**dge + **Ca**millaDSP
 
-A Raspberry Pi audio-control project connecting **Lyrion Music Server** and
-**CamillaDSP**, with bidirectional volume/mute synchronisation, a HID remote,
-a TM1637 display, automatic brightness, amplifier power control and automatic
-DSP configuration switching.
-
-An optional **ESP32-C3 companion** manages the Raspberry Pi power relay, reads
-a physical button and a BLE HID remote, and sends ambient-light readings to the
-Pi over UART serial.
+A Raspberry Pi audio-control project connecting
+**Lyrion Music Server** and **CamillaDSP**.
 
 LyBriCa is built around **five independent features**, all **enabled by
-default**. Each one can be turned off (or configured) on its own by editing
-the corresponding switch at the top of `lybrica.py`:
+default**. Each one can be turned off on its own by editing the corresponding
+switch at the top of `lybrica.py`:
 
-| # | Feature | Switch | Values |
-|---|---|---|---|
-| 1 | **Lyrion ↔ CamillaDSP volume/mute sync** | `ENABLE_LMS_SYNC` | `True` / `False` |
-| 2 | **Amplifier power relay** (silence / sound / halt) | `ENABLE_AUTO_POWEROFF` | `True` / `False` |
-| 3 | **HID remote control** | `ENABLE_REMOTE` | `True` / `False` |
-| 4 | **TM1637 display** + ambient-light brightness | `ENABLE_DISPLAY` | `True` / `False` |
-| 5 | **Automatic DSP config switching** | `ENABLE_CONFIG_SWITCH` | `False`, `"gpio"` **or** `"toslink"` (one at a time) |
+| # | Feature | Switch |
+|---|---|---|
+| 1 | Bidirectional volume / mute synchronisation | `ENABLE_LMS_SYNC` |
+| 2 | BLE HID remote (volume, tones, player, configs) | `ENABLE_REMOTE` |
+| 3 | TM1637 display with automatic brightness | `ENABLE_DISPLAY` |
+| 4 | Trigger control for amplifier power | `ENABLE_AUTO_POWEROFF` |
+| 5 | Automatic DSP configuration switching (GPIO or TOSLINK) | `ENABLE_CONFIG_SWITCH` |
+
+An optional **ESP32-C3 companion** manages the Raspberry Pi power, reads
+a physical button and the BLE HID remote, and sends ambient-light readings to
+the Pi over UART serial.
 
 When a feature is disabled, the hardware library it needs is **not imported
 and not required**, so LyBriCa can run on a minimal setup (for example
 volume-sync only, with no display and no remote). See
 [Feature switches](#feature-switches) for details.
-
-> ⚠️ `ENABLE_CONFIG_SWITCH` selects **one detection method** at a time. It is
-> **not** a combination: `"gpio"` reads the TV state on a GPIO, `"toslink"`
-> listens to the TOSLINK input, `False` disables automatic switching. The
-> manual keys (`BACK`, `HOMEPAGE`) still work in every case.
 
 ---
 

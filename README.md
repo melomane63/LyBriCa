@@ -102,7 +102,7 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
             | evdev     ^            |          ^             |
             v           | "gpio"     v          | "toslink"   v
     +--------------+    |    +---------------+  |     +--------------+
-    |  HID remote  |    |    | TM1637 display|  |     |  Amp relay   |
+    |  HID remote  |    |    | TM1637 display|  |     |  Trigger Amp    |
     +--------------+    |    | CLK 23 DIO 24 |  |     |   (GPIO 4)   |
                         |    +---------------+  |     +--------------+
                         |                       |

@@ -224,19 +224,6 @@ ARROW_ADJUST = {
     },
 }
 
-
-# ====================== VOLUME CURVE ======================
-# The volume curve (level 0..100 on the LMS scale <-> dB in CamillaDSP):
-# pct_to_db() and db_to_pct() are defined in the LMS bridge section below.
-#
-# Based on the gain sent by LMS to Squeezelite (dB = 20 * log10(gain / 65536)),
-# on a 0.5 dB grid:
-#     25 .. 100 : 0.5 dB / level  (-37.5 .. 0 dB)
-#      2 ..  24 : 1.5 dB / level  (-71 .. -38 dB)
-#      1 : -75 dB, 0 : -100 dB (the real mute is handled separately)
-# The curve is strictly increasing, which makes the inverse conversion exact.
-
-
 # ============================================================================
 # LMS <-> CAMILLADSP VOLUME BRIDGE (asyncio, no thread)
 # Inspired by the original work by mbrennwa, entirely reworked:
@@ -256,8 +243,14 @@ bridge_log = logging.getLogger("lms_bridge")
 
 
 # ====================== VOLUME CURVE FUNCTIONS ======================
-# Level 0..100 (LMS scale) <-> dB (CamillaDSP). The curve itself is described
-# in the "VOLUME CURVE" comment of the INTERNAL section further down.
+# Level 0..100 (LMS scale) <-> dB (CamillaDSP).
+#
+# Based on the gain sent by LMS to Squeezelite (dB = 20 * log10(gain / 65536)),
+# on a 0.5 dB grid:
+#     25 .. 100 : 0.5 dB / level  (-37.5 .. 0 dB)
+#      2 ..  24 : 1.5 dB / level  (-71 .. -38 dB)
+#      1 : -75 dB, 0 : -100 dB (the real mute is handled separately)
+# The curve is strictly increasing, which makes the inverse conversion exact.
 
 def pct_to_db(p):
     """Level 0..100 -> dB."""

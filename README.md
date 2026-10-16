@@ -11,7 +11,7 @@ switch at the top of `lybrica.py`:
 
 | # | Feature | Switch |
 |---|---|---|
-| 1 | Bidirectional volume / mute synchronisation (Material Skin) | `ENABLE_LMS_SYNC` |
+| 1 | Bidirectional volume / mute synchronisation | `ENABLE_LMS_SYNC` |
 | 2 | BLE HID remote (volume, tone, player control, configs) | `ENABLE_REMOTE` |
 | 3 | TM1637 display with automatic brightness | `ENABLE_DISPLAY` |
 | 4 | Trigger control for amplifier power | `ENABLE_AUTO_POWEROFF` |
@@ -57,7 +57,7 @@ volume-sync only, with no display and no remote). See
 
 LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 
-- **Bidirectional volume / mute sync** between Lyrion and CamillaDSP
+- **Bidirectional volume / mute sync** between Lyrion (on Material Skin) and CamillaDSP
 - **Automatic DSP config switching** (TV / Squeezelite) via GPIO **or** TOSLINK
   detection (one method at a time)
 - **BLE HID remote control** (volume, mute, config, tone, tilt, loudness,

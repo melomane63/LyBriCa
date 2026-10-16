@@ -11,7 +11,7 @@ switch at the top of `lybrica.py`:
 
 | # | Feature | Switch |
 |---|---|---|
-| 1 | Bidirectional volume / mute synchronisation on Material skin | `ENABLE_LMS_SYNC` |
+| 1 | Bidirectional volume / mute synchronisation (Material Skin) | `ENABLE_LMS_SYNC` |
 | 2 | BLE HID remote (volume, tone, player control, configs) | `ENABLE_REMOTE` |
 | 3 | TM1637 display with automatic brightness | `ENABLE_DISPLAY` |
 | 4 | Trigger control for amplifier power | `ENABLE_AUTO_POWEROFF` |
@@ -60,7 +60,7 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 - **Bidirectional volume / mute sync** between Lyrion and CamillaDSP
 - **Automatic DSP config switching** (TV / Squeezelite) via GPIO **or** TOSLINK
   detection (one method at a time)
-- **HID remote control** (volume, mute, config, tone, tilt, loudness,
+- **BLE HID remote control** (volume, mute, config, tone, tilt, loudness,
   power)
 - **TM1637 display** with ambient light sensor for automatic brightness
 - **Power relay control**: switch off after silence, back on with sound,
@@ -201,7 +201,7 @@ To change any of these, edit `install-lybrica.sh` directly.
 | **3. Lyrion** | Downloads and installs Lyrion Music Server 9.1.1, installs Squeezelite, configures the output device to `hw:Loopback,0` with options `-W -C 5 -r 48000-48000 -R hLE` |
 | **4. USB drive** | Detects the USB drive UUID with `blkid` and adds an entry to `/etc/fstab` (`auto defaults,nofail,x-systemd.device-timeout=1,noatime`) |
 | **5. Sound card** | Launches `alsamixer` for manual level adjustment, then saves with `alsactl store` |
-| **6. LyBriCa** | Rewrites `/boot/firmware/config.txt` and cleans `cmdline.txt`, adds the user to the required groups, creates `/opt/venv`, installs Python dependencies (pycamilladsp pinned to v4.0.0), downloads `lybrica.py` and `tm1637_lgpio.py`, creates and starts the systemd service |
+| **6. LyBriCa** | Rewrites `/boot/firmware/config.txt` and cleans `cmdline.txt`, adds the user to the required groups, creates the passwordless `/sbin/shutdown` sudoers rule, creates `/opt/venv`, installs Python dependencies (pycamilladsp pinned to v4.0.0), downloads `lybrica.py` and `tm1637_lgpio.py`, creates and starts the systemd service |
 | **7. Bluetooth remote** | Installs `bluetuith` if needed, launches it for pairing, detects the remote with `evdev`, updates `REMOTE_NAME` in `lybrica.py`, restarts the service |
 | **8. Shutdown** | Prompts for an optional system shutdown at the end |
 
@@ -211,6 +211,7 @@ To change any of these, edit `install-lybrica.sh` directly.
 |---|---|---|
 | `/boot/firmware/config.txt` | Rewritten (see [Raspberry Pi boot configuration](#raspberry-pi-boot-configuration)) | `config.txt.bak` |
 | `/boot/firmware/cmdline.txt` | `console=serial0,NNNN` removed | `cmdline.txt.bak` |
+| `/etc/sudoers.d/lybrica` | Created (passwordless `/sbin/shutdown`), mode `440` | - |
 | `/opt/venv` | Created (`python3 -m venv --system-site-packages`) | - |
 | `/opt/venv/lib/pythonX.Y/site-packages/tm1637_lgpio.py` | Copied | - |
 | `/etc/systemd/system/lybrica.service` | Created and enabled | - |
@@ -222,6 +223,18 @@ To change any of these, edit `install-lybrica.sh` directly.
 ```bash
 sudo usermod -aG dialout,gpio,input,spi,i2c,audio "$USER"
 ```
+
+### Sudoers rule added by the installer
+
+```bash
+echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee /etc/sudoers.d/lybrica > /dev/null
+sudo chmod 440 /etc/sudoers.d/lybrica
+```
+
+This rule is **required** for `lybrica.py` to halt the Pi without a password
+(see `shutdown_system()`). Without it, the **POWER long-press → shutdown**
+feature fails silently: `os.system("sudo shutdown -h now")` returns an error
+code that LyBriCa does not check.
 
 ---
 
@@ -336,6 +349,25 @@ The user running LyBriCa needs access to:
 sudo usermod -aG dialout,gpio,input,spi,i2c,audio $USER
 ```
 
+And for the shutdown command (required by `shutdown_system()` in `lybrica.py`):
+
+```bash
+echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee /etc/sudoers.d/lybrica > /dev/null
+sudo chmod 440 /etc/sudoers.d/lybrica
+```
+
+Verify the rule is active. **The `sudo -k` step clears the credential cache,
+otherwise the test is meaningless** (a previous `sudo` call in the same
+session would make the test pass for the wrong reason):
+
+```bash
+sudo -k
+sudo -n shutdown -h now   # should NOT ask for a password, and shuts the Pi down
+```
+
+If `sudo -n` prints `sudo: a password is required`, the rule is missing or
+incorrect and the **POWER long-press → shutdown** feature will not work.
+
 ---
 
 ## Configuration
@@ -390,22 +422,24 @@ hardware library is **not imported** and **not required**.
 |---|---|---|---|
 | `ENABLE_LMS_SYNC` | `True` | `True` / `False` | Lyrion <-> CamillaDSP volume/mute sync |
 | `ENABLE_AUTO_POWEROFF` | `True` | `True` / `False` | Power relay: off after silence, on with sound |
-| `ENABLE_REMOTE` | `True` | `True` / `False` | HID remote control |
+| `ENABLE_REMOTE` | `True` | `True` / `False` | BLE HID remote control |
 | `ENABLE_DISPLAY` | `True` | `True` / `False` | TM1637 display + ambient light sensor |
 | `ENABLE_CONFIG_SWITCH` | `"gpio"` | `False` / `"gpio"` / `"toslink"` | Automatic config switching — **only one method at a time** |
 
 ### `ENABLE_CONFIG_SWITCH` details
 
-The switch accepts **exactly one** of these three values:
+The switch is a **single choice**. Set it to exactly one of these three
+values:
 
 | Value | Meaning |
 |---|---|
-| `False` | Automatic config switching is disabled. Only the manual keys `BACK` and `HOMEPAGE` can change the config. |
-| `"gpio"` | The TV state is read on `TV_GPIO` (0 = TV on). Matches the original hardware setup. |
-| `"toslink"` | The TOSLINK input is probed with ALSA. `TOSLINK_SILENCE_DELAY_S` seconds of silence switches back to Squeezelite. |
+| `False` | Automatic config switching is off. Only the manual keys `BACK` and `HOMEPAGE` can change the config. |
+| `"gpio"` | The TV state is read on `TV_GPIO` (0 = TV on). |
+| `"toslink"` | The TOSLINK input is monitored through ALSA. `TOSLINK_SILENCE_DELAY_S` seconds of silence switches back to Squeezelite. |
 
-An invalid value raises `ValueError` at startup (checked in the `FEATURES`
-block of `lybrica.py`).
+`"gpio"` and `"toslink"` are **mutually exclusive** — you cannot run both
+detectors at the same time. An invalid value raises `ValueError` at startup
+(checked in the `FEATURES` block of `lybrica.py`).
 
 ---
 
@@ -814,6 +848,39 @@ If the volume keeps jumping or correcting itself:
 - Check that **Material Skin** is installed and active.
 - Enable `LMS_SYNC_DEBUG = True` in `lybrica.py` and look at the `[LMS sync]`
   lines in the journal.
+
+### Shutdown from the remote (POWER long-press) does nothing
+
+`lybrica.py` halts the Pi with `os.system("sudo shutdown -h now")`. If the
+user running the service is not allowed to run `shutdown` as root **without a
+password**, the command fails silently (its exit code is not checked).
+
+Check the rule:
+
+```bash
+cat /etc/sudoers.d/lybrica
+# expected:
+# <your-user> ALL=(ALL) NOPASSWD: /sbin/shutdown
+
+ls -l /etc/sudoers.d/lybrica
+# expected mode: -r--r----- (440)
+```
+
+Test it correctly — **the credential cache must be cleared first**, otherwise
+a previous `sudo` call may make the test pass for the wrong reason:
+
+```bash
+sudo -k
+sudo -n shutdown -h now
+```
+
+- If the Pi shuts down: the rule is correct.
+- If you see `sudo: a password is required`: add the rule (see
+  [Manual installation → Permissions](#permissions)).
+
+> ⚠️ A `sudo -n ...` test run **right after** another `sudo` command is
+> unreliable, because `sudo` caches the credential for ~15 minutes by default.
+> Always run `sudo -k` before testing.
 
 ### Display stays blank
 

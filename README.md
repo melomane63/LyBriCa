@@ -321,7 +321,7 @@ installer and the systemd service):
 sudo mkdir -p /opt/venv
 sudo python3 -m venv --system-site-packages /opt/venv
 sudo /opt/venv/bin/pip install --upgrade pip
-sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5
+sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5 pyalsaaudio
 sudo /opt/venv/bin/pip install "git+https://github.com/HEnquist/pycamilladsp.git@v4.0.0"
 ```
 

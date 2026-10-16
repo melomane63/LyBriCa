@@ -127,7 +127,7 @@ HALT_DELAY = 48             # Hours of silence (or without remote) before the Ra
 # ---------------------- Tone and loudness ----------------------
 
 TILT_DB_STEP = 2            # Real dB applied per displayed tilt step
-DEFAULT_LOUDNESS_REF = -30  # Loudness level restored by ENTER when no previous value is saved
+DEFAULT_LOUDNESS_REF = -20  # Loudness level restored by ENTER when no previous value is saved
 
 # Adjustment ranges (TONE_MAX_DB, PRESENCE_MAX_DB and TILT_MAX_STEPS: 9 at most, the display has 2 digits)
 TONE_MAX_DB = 9             # Bass / treble: -9 .. +9 dB
@@ -165,7 +165,7 @@ TV_GPIO = 12                # GPIO reading the TV state (0 = TV on)
 
 # ENABLE_CONFIG_SWITCH = "toslink"
 # NOTE: device / rate / channels are read at startup from the first "|*" YAML.
-TOSLINK_TV_ON_DB = -60.0        # TOSLINK free: level >= threshold -> TV
+TOSLINK_TV_ON_DB = -40.0        # TOSLINK free: level >= threshold -> TV
 TOSLINK_SILENCE_DELAY_S = 120   # Seconds of silence before going back to SQUEEZELITE
 
 

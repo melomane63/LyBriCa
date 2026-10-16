@@ -196,7 +196,7 @@ To change any of these, edit `install-lybrica.sh` directly.
 
 | Step | Action |
 |---|---|
-| **1. System** | `apt update`, `apt upgrade`, installs `git`, `wget`, `curl`, `python3-pip`, `python3-venv`, `systemd` |
+| **1. System** | `apt update`, `apt upgrade`, installs `git`, `wget`, `curl`, `python3-pip`, `systemd` |
 | **2. CamillaDSP** | Downloads and installs CamillaDSP v4.1.3 to `/usr/local/bin/`, CamillaGUI v4.1.0 to `/opt/camillagui_backend/`, creates the systemd services `camilladsp.service` and `camillagui.service`, writes a default `statefile.yml` and `_Setup.yml` config, sets up the ALSA loopback (`snd-aloop` loaded at boot) |
 | **3. Lyrion** | Downloads and installs Lyrion Music Server 9.1.1, installs Squeezelite, configures the output device to `hw:Loopback,0` with options `-W -C 5 -r 48000-48000 -R hLE` |
 | **4. USB drive** | Detects the USB drive UUID with `blkid` and adds an entry to `/etc/fstab` (`auto defaults,nofail,x-systemd.device-timeout=1,noatime`) |
@@ -252,7 +252,6 @@ Key lines added:
 | `dtoverlay=gpio-poweroff,gpiopin=21,active_low=1` | Signal "Pi is really off" to the ESP32 on **GPIO21**. The ESP32 reads it on its own **GPIO6** (power-good). |
 | `dtoverlay=gpio-shutdown,gpio_pin=20,active_low=0,gpio_pull=down` | Allow the ESP32 (**GPIO10**) to request a clean shutdown of the Pi on **GPIO20**. |
 | `enable_uart=1` | Enable `/dev/serial0`, used to receive the ambient-light ADC value from the ESP32 |
-| `dtoverlay=disable-wifi` | Disable the built-in Wi-Fi (see the warning below) |
 | `arm_64bit=1` | Run in 64-bit mode |
 | `arm_boost=1` | Run as fast as the firmware / board allows |
 
@@ -278,14 +277,6 @@ The installer's boot overlays expect the ESP32 to be wired as follows:
 > Make sure the wire goes from ESP32 GPIO10 to Raspberry Pi GPIO20. If your
 > wiring differs, adjust either `dtoverlay=gpio-shutdown,gpio_pin=NN` or the
 > `#define GPIO_SHUTDOWN` in the firmware.
-
-> ⚠️ **`dtoverlay=disable-wifi`**: this disables the built-in Wi-Fi. On some
-> Raspberry Pi models this can also disable the built-in Bluetooth. If you use
-> the Bluetooth remote pairing step (`pair_bluetooth_remote`), verify that the
-> Bluetooth adapter is still present (`hciconfig -a`, `bluetoothctl list`). If
-> not, remove `dtoverlay=disable-wifi` from `/boot/firmware/config.txt` and
-> reboot.
-
 ---
 
 ## Manual installation

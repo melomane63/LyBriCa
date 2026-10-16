@@ -180,7 +180,7 @@ The installer uses the following fixed values:
 | LyBriCa repository | `https://raw.githubusercontent.com/melomane63/LyBriCa/main` |
 | CamillaDSP version | `v4.1.3` |
 | CamillaGUI version | `v4.1.0` |
-| pycamilladsp version | `v4.0.0` (pinned) |
+| pycamilladsp version | `v4.0.0` |
 | Lyrion version | `9.1.1` |
 | Python venv | `/opt/venv` (created with `--system-site-packages`) |
 | Service Python | `/opt/venv/bin/python3` |

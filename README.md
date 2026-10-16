@@ -132,7 +132,8 @@ How the pieces talk to each other:
   - Pi GPIO21 -> ESP32 GPIO6: power-good (`gpio-poweroff` overlay)
   - ESP32 GPIO21 -> Pi GPIO15: ambient light over UART (115200 8N1)
 - **HID remote**: BLE to the ESP32 while the Pi is off (wake-up), then to the Pi
-  (evdev) once it has booted, if the remote accepts two hosts in turn.
+  (evdev) once it has booted. The same remote is used on both sides, one at a
+  time (see [Using one remote with both the ESP32 and the Pi](#using-one-remote-with-both-the-esp32-and-the-pi)).
 - **Config switching** (one method at a time): with `"gpio"`, LyBriCa reads the
   TV state on GPIO 12; with `"toslink"`, it probes the TOSLINK capture device
   through ALSA while CamillaDSP is not holding it. Either one makes LyBriCa load
@@ -914,11 +915,16 @@ its BLE connection, which frees the remote so that the Pi can connect to it once
 booted. After the Pi shuts down, the ESP32 restarts and reconnects to the saved
 MAC.
 
-This hand-over only works if **the remote accepts being connected to two hosts
-one after the other**. Many BLE remotes do, but some keep a single bond and
-will refuse the second host. If yours does not, pair it with the Pi only and
-use the ESP32's physical button (GPIO7) to power on. Use the remote
-only on one side at a time; do not expect both to be connected simultaneously.
+This hand-over works with the reference remote of this project (the one
+matching the default `REMOTE_NAME = "HID Remote01 Keyboard"`): it can be known
+to the ESP32 (by its saved address) and paired with the Pi, and it reconnects to
+whichever of the two is available. The remote is only ever connected to **one
+host at a time**: the ESP32 while the Pi is off, the Pi once it has booted.
+
+The hand-over depends on the remote itself, so it is **not guaranteed with
+other models**. Some remotes keep a single bond or only advertise after a key
+press, and would refuse the second host. If yours does, pair it with the Pi
+only and use the ESP32's physical button (GPIO7) to power on.
 
 **Note on BLE shutdown:**
 

@@ -6,12 +6,10 @@ import logging
 import math
 import os
 import re
-import select
 import signal
 import socket
 import struct
 import sys
-import threading
 import time
 from urllib.parse import quote, unquote
 from camilladsp import CamillaClient
@@ -21,7 +19,7 @@ from camilladsp import CamillaClient
 # Each block can be switched off. A disabled block is never started, and the
 # hardware libraries it needs are neither imported nor required.
 
-ENABLE_LMS_SYNC      = True   # LMS <-> CamillaDSP volume bridge (own thread)
+ENABLE_LMS_SYNC      = True   # LMS <-> CamillaDSP volume bridge (asyncio task)
 ENABLE_AUTO_POWEROFF = True   # Power relay: off after silence, on with sound,
                               # halt after HALT_DELAY, relay toggle on POWER long press
 ENABLE_REMOTE        = True   # Remote control (all keys: volume, mute, LMS, BACK,
@@ -40,7 +38,8 @@ if ENABLE_CONFIG_SWITCH not in (False, "gpio", "toslink"):
 # Derived from the switches above (do not edit)
 SWITCH_GPIO    = ENABLE_CONFIG_SWITCH == "gpio"
 SWITCH_TOSLINK = ENABLE_CONFIG_SWITCH == "toslink"
-NEED_CDSP    = ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_AUTO_POWEROFF or bool(ENABLE_CONFIG_SWITCH)
+NEED_CDSP    = (ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_AUTO_POWEROFF
+                or bool(ENABLE_CONFIG_SWITCH) or ENABLE_LMS_SYNC)
 TONE_ACTIVE  = ENABLE_REMOTE or bool(ENABLE_CONFIG_SWITCH)   # tone is saved / restored per config
 USE_GPIO     = ENABLE_AUTO_POWEROFF or SWITCH_GPIO           # TOSLINK detection needs no GPIO
 
@@ -99,6 +98,24 @@ HOLD_SWITCH_TONE_TILT = 15  # ENTER: switch between the tone and tilt screens
 SEEK_STEP_S = 10            # Seconds jumped at each seek
 SEEK_INTERVAL_S = 0.5       # Seconds between two seeks while the key is held (10 s / 0.5 s = 20x speed)
 
+# VOLUME+ / VOLUME- held: apply a volume step only on every Nth repeat of the
+# remote. 1 = every repeat (fastest), 2 = every other repeat, 3 = one in three,
+# etc. The remote repeats every 40 ms (measured with evdev), so the real time
+# to go from 0 to 100 is roughly N * 4 seconds.
+#
+#   value   steps/s    0 -> 100
+#   1       ~25 /s     ~4 s     fastest possible (one step per repeat)
+#   2       ~12.5 /s   ~8 s
+#   3       ~8.3 /s    ~12 s
+#   4       ~6.25 /s   ~16 s
+#   5       ~5 /s      ~20 s
+#   6       ~4.2 /s    ~24 s
+#   7       ~3.6 /s    ~28 s
+VOLUME_SLOWDOWN = {
+    KEY_BINDINGS['VOLUMEUP']:   2,
+    KEY_BINDINGS['VOLUMEDOWN']: 1,
+}
+
 
 # ---------------------- Power ----------------------
 
@@ -139,6 +156,10 @@ HYSTERESIS_RATIO = 0.03     # 3 % hysteresis between two brightness levels
 CAMILLA_ADDR = ("127.0.0.1", 1234)
 CONFIG_DIR = os.path.expanduser("~") + "/camilladsp/configs/"
 
+POLL_INTERVAL_S = 0.25      # One read cycle of CamillaDSP (volume + mute)
+TITLE_EVERY = 2             # The config title is read every N cycles (2 -> every 0.5 s)
+CDSP_RECONNECT_DELAY_S = 2.0    # Seconds to wait before trying to reconnect to CamillaDSP after an error
+
 # ENABLE_CONFIG_SWITCH = "gpio"
 TV_GPIO = 12                # GPIO reading the TV state (0 = TV on)
 
@@ -148,11 +169,20 @@ TOSLINK_TV_ON_DB = -60.0        # TOSLINK free: level >= threshold -> TV
 TOSLINK_SILENCE_DELAY_S = 120   # Seconds of silence before going back to SQUEEZELITE
 
 
+# ---------------------- Robustness ----------------------
+
+TASK_RESTART_DELAY_S = 2.0  # Seconds before a background task that crashed is restarted
+
+
 # ---------------------- Logitech Media Server ----------------------
 
 LMS_ADDR = ("127.0.0.1", 9090)   # LMS CLI (the server runs on this Pi)
 LMS_PLAYER_MANUAL = ""           # "" = auto (MAC of the default interface); or e.g. "dc:a6:32:3c:1c:21" (raw, lowercase)
 LMS_SYNC_DEBUG = False           # Log every volume/mute change and the raw LMS notifications
+LMS_COALESCE_S = 0.05            # Bursts of volume changes coming from LMS are merged: one write to CamillaDSP per this delay (0 = write immediately)
+LMS_RESTORE_WINDOW_S = 0.5       # After an unmute, LMS may announce a wrong volume during this delay (seconds): the bridge corrects it
+LMS_CONNECT_TIMEOUT_S = 5        # Timeout when connecting to the LMS CLI (seconds)
+LMS_RETRY_S = 5                  # Seconds before the bridge restarts after an error
 
 
 # ===================== INTERNAL (do not edit) =====================
@@ -196,7 +226,8 @@ ARROW_ADJUST = {
 
 
 # ====================== VOLUME CURVE ======================
-# Volume curve: level 0..100 (LMS scale) <-> dB (CamillaDSP).
+# The volume curve (level 0..100 on the LMS scale <-> dB in CamillaDSP):
+# pct_to_db() and db_to_pct() are defined in the LMS bridge section below.
 #
 # Based on the gain sent by LMS to Squeezelite (dB = 20 * log10(gain / 65536)),
 # on a 0.5 dB grid:
@@ -205,6 +236,28 @@ ARROW_ADJUST = {
 #      1 : -75 dB, 0 : -100 dB (the real mute is handled separately)
 # The curve is strictly increasing, which makes the inverse conversion exact.
 
+
+# ============================================================================
+# LMS <-> CAMILLADSP VOLUME BRIDGE (asyncio, no thread)
+# Inspired by the original work by mbrennwa, entirely reworked:
+#     https://github.com/mbrennwa/camilla_LMS_volume_sync
+#
+#   - it reads the values published by ONE reader (cdsp_poller) in a VolumeState,
+#     instead of querying CamillaDSP itself;
+#   - the LMS connection uses asyncio streams;
+#   - bursts of volume changes coming from LMS are coalesced (at most one write
+#     to CamillaDSP every `coalesce_s` seconds);
+#   - CamillaDSP readings that started before our last write, or that are taken
+#     while a coalesced write is pending, are ignored (otherwise a stale reading
+#     could undo a change that was just received from LMS).
+# ============================================================================
+
+bridge_log = logging.getLogger("lms_bridge")
+
+
+# ====================== VOLUME CURVE FUNCTIONS ======================
+# Level 0..100 (LMS scale) <-> dB (CamillaDSP). The curve itself is described
+# in the "VOLUME CURVE" comment of the INTERNAL section further down.
 
 def pct_to_db(p):
     """Level 0..100 -> dB."""
@@ -217,13 +270,281 @@ def pct_to_db(p):
 
 
 def db_to_pct(d):
-    """dB -> level 0..100 (nearest integer)."""
+    """dB -> level 0..100 (nearest integer level)."""
     if d >= -37.5:
         return clamp(round(100 + d * 2), 25, 100)
     if d >= -71.0:
         return clamp(round((d + 71.0) / 1.5) + 2, 2, 24)
-    # Below -71 dB: levels 0, 1 or 2, whichever is nearest
     return min((0, 1, 2), key=lambda i: abs(pct_to_db(i) - d))
+
+
+# ====================== SHARED STATE ======================
+
+class VolumeState:
+    """Last CamillaDSP reading, published by a single reader (cdsp_poller).
+
+    `stamp` is the time (time.monotonic) at which the reading STARTED; it is
+    used to discard stale readings."""
+
+    def __init__(self):
+        self.db = None
+        self.muted = None
+        self.title = None
+        self.stamp = 0.0
+        self._events = []
+
+    def subscribe(self):
+        ev = asyncio.Event()
+        self._events.append(ev)
+        return ev
+
+    def unsubscribe(self, ev):
+        try:
+            self._events.remove(ev)
+        except ValueError:
+            pass
+
+    def publish(self, db, muted, title=None, stamp=None):
+        self.db = db
+        self.muted = bool(muted)
+        if title:                      # an empty title (e.g. during a config reload) is ignored: the previous one is kept
+            self.title = title
+        self.stamp = time.monotonic() if stamp is None else stamp
+        for ev in self._events:
+            ev.set()
+
+
+# ====================== THE BRIDGE ======================
+
+class LmsBridge:
+    def __init__(self, player, state, set_volume_db, set_mute, lms_addr, *,
+                 coalesce_s, restore_window_s, connect_timeout_s,
+                 debug=False, clock=time.monotonic):
+        """
+        player            : MAC address of the LMS player (raw format, lowercase)
+        state             : VolumeState fed by the single CamillaDSP reader
+        set_volume_db     : function(db) that writes the volume to CamillaDSP
+        set_mute          : function(bool) that writes the mute to CamillaDSP
+        lms_addr          : (host, port) of the LMS CLI
+        coalesce_s        : delay used to coalesce bursts of volume changes
+                            coming from LMS (0 = write immediately)
+        restore_window_s  : after an unmute, LMS may announce a wrong volume
+                            during this delay
+        connect_timeout_s : timeout when connecting to the LMS CLI
+        (the timings come from the SETTINGS block, see LMS_* constants)
+        """
+        self.player = player
+        self.pq = quote(player, safe="")
+        self.state = state
+        self.set_volume_db = set_volume_db
+        self.set_mute = set_mute
+        self.lms_addr = lms_addr
+        self.debug = debug
+        self.coalesce_s = coalesce_s
+        self.restore_window_s = restore_window_s
+        self.connect_timeout_s = connect_timeout_s
+        self.clock = clock
+        player_re = re.escape(player)
+        self._re_vol = re.compile(
+            rf"{player_re} prefset server volume (-?\d+(?:\.\d+)?)$", re.I)
+        self._re_mute = re.compile(
+            rf"{player_re} prefset server mute ([01])$", re.I)
+        self._writer = None
+        self._reset()
+
+    # ---------- internal state ----------
+
+    def _reset(self):
+        self.pct = 0
+        self.muted = False
+        self.restore_until = 0.0   # deadline (clock) of the post-unmute window
+        self.prev = None           # previous CamillaDSP reading (a change must be seen twice)
+        self._written_at = 0.0     # time (clock) of our last write to CamillaDSP
+        self._pending_pct = None
+        self._flush_handle = None
+
+    def _say(self, message):
+        bridge_log.info("[LMS sync] %s", message)
+
+    def _send(self, cmd):
+        w = self._writer
+        if w is None or w.is_closing():
+            raise ConnectionError("LMS connection closed")
+        w.write((cmd + "\n").encode())
+
+    # ---------- writes to CamillaDSP ----------
+
+    def _cancel_flush(self):
+        if self._flush_handle is not None:
+            self._flush_handle.cancel()
+        self._flush_handle = None
+        self._pending_pct = None
+
+    def _schedule_cdsp_volume(self, p):
+        """Coalesce bursts: at most one write every coalesce_s seconds."""
+        self._pending_pct = p
+        self.prev = None   # a change already seen once is obsolete: we are about to write
+        if self._flush_handle is not None:
+            return
+        if self.coalesce_s <= 0:
+            self._flush()
+            return
+        loop = asyncio.get_running_loop()
+        self._flush_handle = loop.call_later(self.coalesce_s, self._flush)
+
+    def _flush(self):
+        self._flush_handle = None
+        p, self._pending_pct = self._pending_pct, None
+        if p is None:
+            return
+        try:
+            self.set_volume_db(pct_to_db(p))
+        except Exception as e:
+            self._say(f"cannot write volume to CamillaDSP: {e!r}")
+        self._written_at = self.clock()
+
+    def _apply_mute_to_camilla(self, new):
+        try:
+            self.set_mute(new)
+        finally:
+            self._written_at = self.clock()
+
+    # ---------- synchronization logic ----------
+
+    def _set_mute(self, new, origin, apply):
+        # After an unmute, LMS may announce a wrong volume (the +/- keys restart
+        # from 0/5 %), or nothing at all (click on the mute icon). During the
+        # restore window that starts here, a wrong volume announced by LMS is
+        # corrected, and no volume is pushed from CamillaDSP to LMS.
+        self.muted = new
+        if self.debug:
+            self._say(f"{origin} mute={new}")
+        apply(new)
+        self.restore_until = 0.0 if new else self.clock() + self.restore_window_s
+
+    def _on_lms_volume(self, p):
+        if self.clock() < self.restore_until:
+            if p != self.pct:
+                self._say(f"LMS unmute: restore LMS to {self.pct}%")
+                self._send(f"{self.pq} mixer volume {self.pct}")
+            else:
+                self.restore_until = 0.0
+            return
+        if p != self.pct:   # real user action (an echo of our own push has p == pct)
+            self.pct = p
+            if self.debug:
+                self._say(f"LMS {p}% -> Camilla {pct_to_db(p):.1f} dB")
+            self._schedule_cdsp_volume(p)
+
+    def _on_line(self, line):
+        if self.debug and "prefset server" in line:
+            self._say(f"<< {line}")
+        m = self._re_mute.match(line)
+        if m:
+            lms_muted = m[1] == "1"
+            if lms_muted != self.muted:
+                self._set_mute(lms_muted, "LMS -> Camilla",
+                               self._apply_mute_to_camilla)
+            return
+        m = self._re_vol.match(line)
+        if m and not self.muted:
+            self._on_lms_volume(round(abs(float(m[1]))))
+
+    def _on_camilla_reading(self, db, cam_muted):
+        if cam_muted != self.muted:
+            self._set_mute(cam_muted, "Camilla -> LMS",
+                           lambda m: self._send(f"{self.pq} mixer muting {int(m)}"))
+        if self.muted or self.clock() < self.restore_until:
+            self.prev = None
+            return
+        p = db_to_pct(db)
+        if p != self.pct and p == self.prev:   # seen on two consecutive readings
+            self.pct, self.prev = p, None
+            if self.debug:
+                self._say(f"Camilla {p}% -> LMS")
+            self._send(f"{self.pq} mixer volume {p}")
+        else:
+            self.prev = p
+
+    # ---------- loops ----------
+
+    async def _lms_loop(self, reader):
+        while True:
+            raw = await reader.readline()
+            if not raw:
+                raise ConnectionError("LMS closed the connection")
+            self._on_line(unquote(raw.decode(errors="replace")).strip())
+
+    async def _cam_loop(self, ev):
+        while True:
+            await ev.wait()
+            ev.clear()
+            st = self.state
+            if st.db is None or st.stamp <= self._written_at:
+                continue   # reading started before our last write: stale
+            if self._flush_handle is not None:
+                continue   # a coalesced write is pending: CamillaDSP still shows
+                           # the old value, so skip this reading (nothing is
+                           # sent back to LMS)
+            self._on_camilla_reading(st.db, bool(st.muted))
+
+    async def run_session(self, connect=None):
+        """One bridge session. It only ends by raising an exception (connection
+        lost...) or when cancelled."""
+        if connect is None:
+            async def connect(host, port):
+                return await asyncio.open_connection(host, port, limit=1 << 20)
+        self._reset()
+        ev = self.state.subscribe()
+        try:
+            while self.state.db is None:       # wait for the first CamillaDSP reading
+                await ev.wait()
+                ev.clear()
+            reader, writer = await asyncio.wait_for(
+                connect(*self.lms_addr), timeout=self.connect_timeout_s)
+            self._writer = writer
+            self._say("Connected to LMS CLI")
+
+            # At startup, CamillaDSP wins: its values are pushed to LMS
+            self.pct = db_to_pct(self.state.db)
+            self.muted = bool(self.state.muted)
+            self._send("listen 1")
+            self._send(f"{self.pq} mixer volume {self.pct}")
+            self._send(f"{self.pq} mixer muting {int(self.muted)}")
+            self._say(f"Startup: Camilla -> LMS {self.pct}% muted={self.muted}")
+            ev.clear()
+
+            tasks = [asyncio.create_task(self._lms_loop(reader)),
+                     asyncio.create_task(self._cam_loop(ev))]
+            try:
+                done, _ = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    t.result()                 # re-raises the exception, if any
+            finally:
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self.state.unsubscribe(ev)
+            self._cancel_flush()
+            w, self._writer = self._writer, None
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+
+    async def run_forever(self, *, retry_s, connect=None):
+        """Restart the bridge `retry_s` seconds after any error."""
+        while True:
+            try:
+                await self.run_session(connect)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._say(f"Bridge error: {e!r}, restart in {retry_s:g}s")
+            await asyncio.sleep(retry_s)
 
 
 # ====================== GLOBAL VARIABLES ======================
@@ -248,6 +569,8 @@ silent_now = False              # True when CamillaDSP reports silence (updated 
 display_is_off = False          # True when the display has been blanked
 
 display_refresh_event = asyncio.Event()
+
+vol_state = VolumeState()       # Last volume / mute / title read from CamillaDSP (published by cdsp_poller)
 
 
 # ====================== HELPERS ======================
@@ -322,12 +645,10 @@ def adc_to_brightness(adc_value):
     else:
         target_level = len(BRIGHTNESS_LEVELS) - 1
 
-    if target_level > last_level:
-        if adc_value > ADC_LEVELS[last_level] * (1 + HYSTERESIS_RATIO):
-            last_level = target_level
-    elif target_level < last_level:
-        if adc_value < ADC_LEVELS[target_level] * (1 - HYSTERESIS_RATIO):
-            last_level = target_level
+    if target_level > last_level and adc_value > ADC_LEVELS[last_level] * (1 + HYSTERESIS_RATIO):
+        last_level = target_level
+    elif target_level < last_level and adc_value < ADC_LEVELS[target_level] * (1 - HYSTERESIS_RATIO):
+        last_level = target_level
 
     return BRIGHTNESS_LEVELS[last_level]
 
@@ -348,10 +669,7 @@ def get_config_display_label():
     Prefer the config `title` field; fall back to the config file name.
     Config file prefixes ("_" and "|") are stripped in both cases."""
     title = cdsp.config.title()
-    if title:
-        label = title.strip().replace("_", "").replace("|", "")
-    else:
-        label = "---"
+    label = title.strip().replace("_", "").replace("|", "") if title else "---"
     return label[:3].ljust(3)
 
 
@@ -398,7 +716,7 @@ if ENABLE_REMOTE:
         os.system("sudo shutdown -h now")
         sys.exit(0)
 
-# CamillaDSP (the LMS sync thread has its own connection)
+# CamillaDSP
 cdsp = None
 config_active = {}
 if NEED_CDSP:
@@ -646,28 +964,6 @@ def change_volume_from_key(key, current_volume, volume_step=1):
         display_volume_info(new_volume)
 
 
-def get_repeat_speed(volume, direction, exponent=2.0, pivot=-50):
-    """Delay between two volume steps while a key is held (volume in dB)."""
-    min_delay = 0.01
-    max_delay = 0.5
-
-    if direction == "down":
-        return min_delay
-    if direction != "up":
-        raise ValueError("direction must be 'up' or 'down'")
-
-    volume = clamp(volume, -99, 0)
-    t = (volume - pivot) / (0 - pivot) if volume >= pivot else 0
-    delay = min_delay + (t ** exponent) * (max_delay - min_delay)
-
-    # The delays above were tuned for 1 dB per step. A step is now ~0.5 dB in the
-    # upper range, so scale the delay by the real dB size of the next step to keep
-    # the same speed in dB per second.
-    pct = db_to_pct(volume)
-    step_db = pct_to_db(min(pct + 1, 100)) - pct_to_db(pct)
-    return max(min_delay, delay * step_db)
-
-
 def handle_arrow_keys(key):
     """Adjust the parameters of the screen currently displayed."""
     up, down = KEY_BINDINGS['UP'], KEY_BINDINGS['DOWN']
@@ -820,9 +1116,8 @@ async def change_config(cdsp, config_pattern, cycle=True):
     load_prev_values(saved)
 
     # Remember this config as the last used of its group (survives TV on/off and restarts)
-    new_group = os.path.basename(new_config_path)[:1]
-    if new_group in CONFIG_GROUPS:
-        settings["last_config"][new_group] = new_key
+    if group in CONFIG_GROUPS:
+        settings["last_config"][group] = new_key
         write_settings()
 
     display_volume_info()
@@ -834,15 +1129,10 @@ async def change_config(cdsp, config_pattern, cycle=True):
 def toggle_power():
     global auto_power_enabled, is_waiting_for_sound, last_displayed
 
-    if not auto_power_enabled:
-        # Relay was forced off: switch it on and re-enable auto power-off
+    if not auto_power_enabled or is_waiting_for_sound:
+        # Relay forced off (re-enable auto power-off), or switched off by
+        # auto power-off (back on): either way, switch it on
         auto_power_enabled = True
-        lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
-        show("PW ON")
-        is_waiting_for_sound = False
-
-    elif is_waiting_for_sound:
-        # Relay was switched off by auto power-off: switch it back on
         lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
         show("PW ON")
         is_waiting_for_sound = False
@@ -864,7 +1154,103 @@ async def return_to_volume_later(delay=POWER_MSG_DURATION):
         display_volume_info()
 
 
+# ====================== CAMILLADSP CONNECTION ======================
+
+def reconnect_cdsp():
+    """Close and reopen the main connection. It is the SAME `cdsp` object, so
+    every existing call keeps working."""
+    try:
+        cdsp.disconnect()
+    except Exception:
+        pass
+    cdsp.connect()
+
+
+def resync_after_reconnect():
+    """After a CamillaDSP restart: re-read the active config and re-apply the
+    saved tone."""
+    global config_active, current_config_key
+    new_active = cdsp.config.active() or {}
+    if isinstance(new_active, dict) and new_active:
+        config_active = new_active
+    path = cdsp.config.file_path()
+    current_config_key = config_key(path) if path else None
+    saved = settings["configs"].get(current_config_key) if current_config_key else None
+    load_prev_values(saved)
+    if TONE_ACTIVE and saved:
+        filters = config_active.get("filters")
+        apply_tone(filters if isinstance(filters, dict) else {}, saved)
+        cdsp.config.set_active(config_active)
+
+
 # ====================== BACKGROUND TASKS ======================
+
+async def supervised(name, factory):
+    """Restart a task that crashes, instead of bringing the whole script down."""
+    while True:
+        try:
+            await factory()
+            return                          # normal end (e.g. auto_poweroff after the shutdown, or TOSLINK detection disabled)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Task '%s' crashed, restarting in %g s", name, TASK_RESTART_DELAY_S)
+            await asyncio.sleep(TASK_RESTART_DELAY_S)
+
+
+async def cdsp_poller():
+    """Periodic reader of the CamillaDSP volume / mute / title (the TOSLINK
+    monitor still reads the title by itself).
+    Publishes into vol_state; volume_watcher_loop and the LMS bridge consume it.
+    On error: automatic reconnection, the script keeps running."""
+    n = 0
+    failures = 0
+    while True:
+        try:
+            t0 = time.monotonic()           # start of the read (stale-reading guard)
+            db = cdsp.volume.main_volume()
+            muted = bool(cdsp.volume.main_mute())
+            title = cdsp.config.title() if n % TITLE_EVERY == 0 else None
+            n += 1
+            vol_state.publish(db, muted, title, stamp=t0)
+            if failures:
+                log.info("CamillaDSP reachable again")
+                failures = 0
+        except Exception as e:
+            failures += 1
+            if failures == 1 or failures % 20 == 0:
+                log.warning("CamillaDSP unreachable (%s), reconnecting...", e)
+            await asyncio.sleep(CDSP_RECONNECT_DELAY_S)
+            try:
+                reconnect_cdsp()
+                resync_after_reconnect()
+                log.info("CamillaDSP connection restored")
+            except Exception as e2:
+                log.warning("Reconnection failed (%s)", e2)
+            continue
+        await asyncio.sleep(POLL_INTERVAL_S)
+
+
+async def lms_bridge_task():
+    """Run the LMS <-> CamillaDSP volume bridge (see LmsBridge above)."""
+    while True:
+        try:
+            player = LMS_PLAYER_MANUAL or detect_player_mac()
+            bridge = LmsBridge(
+                player, vol_state,
+                set_volume_db=cdsp.volume.set_main_volume,
+                set_mute=cdsp.volume.set_main_mute,
+                lms_addr=LMS_ADDR, debug=LMS_SYNC_DEBUG,
+                coalesce_s=LMS_COALESCE_S,
+                restore_window_s=LMS_RESTORE_WINDOW_S,
+                connect_timeout_s=LMS_CONNECT_TIMEOUT_S)
+            await bridge.run_forever(retry_s=LMS_RETRY_S)   # restarts itself after any error
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("[LMS sync] cannot start (%s), retry in %s s", e, LMS_RETRY_S)
+            await asyncio.sleep(LMS_RETRY_S)
+
 
 async def silence_monitor():
     """Single reader of the CamillaDSP levels: refreshes `silent_now` once per
@@ -911,29 +1297,27 @@ async def adc_reader_loop():
 
 
 async def volume_watcher_loop():
-    """Watch for external changes: main volume, mute, and active config title.
-    On a config change, resync the local state (config_active, current_config_key,
-    prev values) so that the script does not later overwrite the external config."""
+    """Consume vol_state (no direct CamillaDSP reads any more): redraw the
+    display when volume / mute / title change, and resync the local state when
+    the config changes from outside, so that the script does not later
+    overwrite the external config."""
     global config_active, current_config_key
 
-    last_volume = cdsp.volume.main_volume()
-    last_mute = cdsp.volume.main_mute()
-    last_title = cdsp.config.title()
+    ev = vol_state.subscribe()
+    while vol_state.db is None:
+        await ev.wait()
+        ev.clear()
+    last_volume, last_mute, last_title = vol_state.db, vol_state.muted, vol_state.title
     last_warned_title = None
 
-
     while True:
-        await asyncio.sleep(0.5)
-        try:
-            current_volume = cdsp.volume.main_volume()
-            current_mute = cdsp.volume.main_mute()
-            current_title = cdsp.config.title()
-        except Exception as e:
-            log.warning("Volume watcher: CamillaDSP unreachable (%s)", e)
-            continue
+        await ev.wait()
+        ev.clear()
+        current_volume, current_mute = vol_state.db, vol_state.muted
+        current_title = vol_state.title
 
-        # Ignore empty titles (CamillaDSP can briefly report "" during a reload)
-        title_changed = current_title != last_title
+        # Empty titles are ignored by vol_state (CamillaDSP can briefly report "" during a reload)
+        title_changed = bool(current_title) and current_title != last_title
         if current_title:
             last_title = current_title
 
@@ -958,7 +1342,6 @@ async def volume_watcher_loop():
                 if current_title != last_warned_title:
                     log.warning("Config changed but active config is unusable; keeping previous (title=%r)", current_title)
                     last_warned_title = current_title
-
 
         if current_volume != last_volume or current_mute != last_mute or title_changed:
             last_volume = current_volume
@@ -1038,11 +1421,11 @@ async def auto_poweroff():
 
         else:
             silence_counter = 0
-            if auto_power_enabled and lgpio.gpio_read(h, POWER_GPIO) == 0:
-                if is_waiting_for_sound:
-                    lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
-                    display_volume_info()
-                    is_waiting_for_sound = False
+            if (auto_power_enabled and is_waiting_for_sound
+                    and lgpio.gpio_read(h, POWER_GPIO) == 0):
+                lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
+                display_volume_info()
+                is_waiting_for_sound = False
             elif not auto_power_enabled and lgpio.gpio_read(h, POWER_GPIO) == 1:
                 lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
 
@@ -1246,8 +1629,8 @@ async def remote_events(device):
     global last_displayed, key_hold_counter, screen_idle_ticks, is_key_held, is_volume_key_held
     global last_tone_tilt, enter_display_at_press
 
-    last_repeat_time = 0
     last_seek_time = 0
+    volume_repeat_count = 0         # repeats since the last applied volume step (VOLUME_SLOWDOWN)
     swallowed_key = None            # key that only woke the display: ignored until released
     while True:
         try:
@@ -1278,6 +1661,7 @@ async def remote_events(device):
 
                     if key in volume_keys:
                         is_volume_key_held = True
+                        volume_repeat_count = 0
                         current_volume = cdsp.volume.main_volume()
                         is_muted = cdsp.volume.main_mute()
 
@@ -1312,18 +1696,11 @@ async def remote_events(device):
 
                     if key in volume_keys:
                         is_volume_key_held = True
-                        current_time = time.time()
-                        current_volume = cdsp.volume.main_volume()
-
-                        if key == KEY_BINDINGS['VOLUMEUP']:
-                            direction, pivot = "up", -60
-                        else:
-                            direction, pivot = "down", -40
-
-                        repeat_speed = get_repeat_speed(current_volume, direction, exponent=2.0, pivot=pivot)
-                        if current_time - last_repeat_time >= repeat_speed:
-                            change_volume_from_key(key, current_volume)
-                            last_repeat_time = current_time
+                        # One step every VOLUME_SLOWDOWN repeats of the remote
+                        volume_repeat_count += 1
+                        if volume_repeat_count >= VOLUME_SLOWDOWN[key]:
+                            volume_repeat_count = 0
+                            change_volume_from_key(key, cdsp.volume.main_volume())
 
                     elif key in (KEY_BINDINGS['PREVIOUSSONG'], KEY_BINDINGS['NEXTSONG']):
                         key_hold_counter += 1
@@ -1370,9 +1747,9 @@ async def remote_events(device):
 
                     elif key in volume_keys:
                         display_refresh_event.set()
+                        volume_repeat_count = 0
 
                     key_hold_counter = 0
-                    last_repeat_time = 0
                     last_seek_time = 0
 
         except OSError as e:
@@ -1384,129 +1761,10 @@ async def remote_events(device):
                     await asyncio.sleep(1)
             log.info("Remote reconnected.")
 
-
-# ====================== LMS <-> CAMILLADSP VOLUME SYNC ======================
-# Based on the original work by mbrennwa:
-#     https://github.com/mbrennwa/camilla_LMS_volume_sync
-# Runs in its own thread (blocking socket + select) with its own CamillaDSP
-# connection, so it never blocks the asyncio loop of the remote.
-
-def blog(message):
-    log.info("[LMS sync] %s", message)
-
-
-def run_lms_sync():
-    """One bridge session. Only ever leaves by raising (connection lost...)."""
-    player = LMS_PLAYER_MANUAL or detect_player_mac()
-    pq = quote(player, safe="")
-    player_re = re.escape(player)
-    re_vol = re.compile(rf"{player_re} prefset server volume (-?\d+(?:\.\d+)?)$", re.I)
-    re_mute = re.compile(rf"{player_re} prefset server mute ([01])$", re.I)
-
-    sync_cdsp = CamillaClient(*CAMILLA_ADDR)
-    sync_cdsp.connect()
-    blog("Connected to CamillaDSP")
-    sock = None
-    try:
-        sock = socket.create_connection(LMS_ADDR, timeout=5)
-        sock.settimeout(None)
-        blog("Connected to LMS CLI")
-        send = lambda cmd: sock.sendall((cmd + "\n").encode())
-
-        # --- Bridge state ---
-        vol = sync_cdsp.volume
-        pct = db_to_pct(vol.main_volume())
-        muted = bool(vol.main_mute())
-        restore_until = 0.0   # monotonic deadline of the post-unmute window (0 = none)
-        prev = None           # previous Camilla reading (debounce)
-
-        def set_mute(new, origin, apply):
-            # After an unmute LMS may report a wrong volume (+/- keys restart from 0/5 %),
-            # or nothing at all (icon click). During the restore window, correct any wrong
-            # volume it reports and push nothing from Camilla.
-            nonlocal muted, restore_until
-            muted = new
-            if LMS_SYNC_DEBUG:
-                blog(f"{origin} mute={new}")
-            apply(new)
-            restore_until = 0.0 if new else time.monotonic() + 0.5   # 0.5 s: after an unmute, LMS may report a wrong volume for this long
-
-        def on_lms_volume(p):
-            nonlocal pct, restore_until
-            if time.monotonic() < restore_until:
-                if p != pct:
-                    blog(f"LMS unmute: restore LMS to {pct}%")
-                    send(f"{pq} mixer volume {pct}")
-                else:
-                    restore_until = 0.0
-                return
-            if p != pct:   # real user action (an echo of our own push has p == pct)
-                pct = p
-                if LMS_SYNC_DEBUG:
-                    blog(f"LMS {p}% -> Camilla {pct_to_db(p):.1f} dB")
-                vol.set_main_volume(pct_to_db(p))
-
-        # --- Startup: Camilla wins ---
-        send("listen 1")
-        send(f"{pq} mixer volume {pct}")
-        send(f"{pq} mixer muting {int(muted)}")
-        blog(f"Startup: Camilla -> LMS {pct}% muted={muted}")
-
-        buf = b""
-        while True:
-            # --- LMS -> Camilla ---
-            # 0.25 s: max wait for an LMS message, and so the polling interval of CamillaDSP
-            if select.select([sock], [], [], 0.25)[0]:
-                data = sock.recv(4096)
-                if not data:
-                    raise ConnectionError("LMS closed the connection")
-                buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = unquote(line.decode(errors="replace")).strip()
-                    if LMS_SYNC_DEBUG and "prefset server" in line:
-                        blog(f"<< {line}")
-                    if (m := re_mute.match(line)):
-                        if (lms_muted := m[1] == "1") != muted:
-                            set_mute(lms_muted, "LMS -> Camilla", vol.set_main_mute)
-                        continue
-                    if (m := re_vol.match(line)) and not muted:
-                        on_lms_volume(round(abs(float(m[1]))))
-
-            # --- Camilla -> LMS ---
-            if (cam_muted := bool(vol.main_mute())) != muted:
-                set_mute(cam_muted, "Camilla -> LMS",
-                         lambda m: send(f"{pq} mixer muting {int(m)}"))
-
-            if muted or time.monotonic() < restore_until:
-                prev = None
-                continue
-
-            p = db_to_pct(vol.main_volume())
-            if p != pct and p == prev:   # confirmed by two consecutive reads
-                pct, prev = p, None
-                if LMS_SYNC_DEBUG:
-                    blog(f"Camilla {p}% -> LMS")
-                send(f"{pq} mixer volume {p}")
-            else:
-                prev = p
-    finally:
-        if sock is not None:
-            sock.close()
-        try:
-            sync_cdsp.disconnect()
         except Exception:
-            pass
-
-
-def lms_sync_loop():
-    """Thread body: run the bridge and restart it 5 s after any error."""
-    while True:
-        try:
-            run_lms_sync()
-        except Exception as e:
-            blog(f"Bridge error: {e}, restart in 5s")
-            time.sleep(5)
+            # An error while handling a key must not stop the remote (or the script)
+            log.exception("Remote handler error, continuing")
+            await asyncio.sleep(0.2)
 
 
 # ====================== SHUTDOWN / MAIN ======================
@@ -1544,33 +1802,39 @@ async def main():
     if ENABLE_DISPLAY:
         display_volume_info()  # change_config returns early when the config is already active
 
-    if ENABLE_LMS_SYNC:
-        # Daemon thread: it dies with the process (SIGTERM handler -> sys.exit)
-        threading.Thread(target=lms_sync_loop, name="lms-sync", daemon=True).start()
-
     tasks = []
+
+    def spawn(name, factory):
+        tasks.append(asyncio.create_task(supervised(name, factory)))
+
+    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_CONFIG_SWITCH or ENABLE_LMS_SYNC:
+        # The periodic reader of volume / mute / title, shared through vol_state
+        # (monitor_tv_toslink still reads the title by itself)
+        spawn("cdsp-poller", cdsp_poller)
     if ENABLE_AUTO_POWEROFF or ENABLE_DISPLAY or SWITCH_TOSLINK:
         # Single reader of the CamillaDSP levels, shared through `silent_now`
-        tasks.append(asyncio.create_task(silence_monitor()))
+        spawn("silence", silence_monitor)
     if ENABLE_AUTO_POWEROFF:
-        tasks.append(asyncio.create_task(auto_poweroff()))
+        spawn("auto-poweroff", auto_poweroff)
     if ENABLE_DISPLAY:
-        tasks.append(asyncio.create_task(display_manager_loop()))
-        tasks.append(asyncio.create_task(adc_reader_loop()))
+        spawn("display", display_manager_loop)
+        spawn("adc", adc_reader_loop)
     if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_CONFIG_SWITCH:
         # Redraws the display and resyncs config_active after an external change
-        tasks.append(asyncio.create_task(volume_watcher_loop()))
+        spawn("volume-watcher", volume_watcher_loop)
+    if ENABLE_LMS_SYNC:
+        spawn("lms-bridge", lms_bridge_task)
     if SWITCH_GPIO:
-        tasks.append(asyncio.create_task(monitor_tv_gpio()))
+        spawn("tv-gpio", monitor_tv_gpio)
     elif SWITCH_TOSLINK:
-        tasks.append(asyncio.create_task(monitor_tv_toslink()))
+        spawn("tv-toslink", monitor_tv_toslink)
     if ENABLE_REMOTE:
-        tasks.append(asyncio.create_task(remote_events(remote)))
+        spawn("remote", lambda: remote_events(remote))
 
     if tasks:
         await asyncio.gather(*tasks)
     else:
-        await asyncio.Event().wait()   # only the LMS sync thread is running
+        await asyncio.Event().wait()
 
 
 if __name__ == "__main__":

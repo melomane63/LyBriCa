@@ -236,6 +236,18 @@ This rule is **required** for `lybrica.py` to halt the Pi without a password
 feature fails silently: `os.system("sudo shutdown -h now")` returns an error
 code that LyBriCa does not check.
 
+The rule is validated immediately with `visudo -c`, so a syntax error stops
+the installer (thanks to `set -e`) instead of leaving `/etc/sudoers.d/` in a
+state that would break `sudo` system-wide:
+
+```bash
+sudo visudo -c -f /etc/sudoers.d/lybrica > /dev/null
+```
+
+`visudo -c` does not modify the file — it only checks the syntax and returns
+a non-zero exit code on error. This is the reason it is used instead of
+editing `/etc/sudoers` directly with a text editor.
+
 ---
 
 ## Raspberry Pi boot configuration

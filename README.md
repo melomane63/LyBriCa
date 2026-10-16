@@ -74,33 +74,69 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 ## Architecture
 
 ```
-                        +----------+
-                        | Sensors  |
-                        | Light    |
-                        | Button   |
-                        +----+-----+
-                             |
-                             | ADC / GPIO
-                             v
-+----------------+     +---------+     +-------------+
-|  Power supply  |---->|  ESP32  |---->| Power relay |
-+----------------+     +----+----+     +------+------+
-                           |                 |
-                           | GPIO            | 5V
-                           | Serial          |
-                           v                 v
-                      +----+-----------------+----+
-                      |      Raspberry Pi        |
-                      |  (LyBriCa + CamillaDSP   |
-                      |       + Lyrion)          |
-                      +---+--------+-------+-----+
-                          |        |       |
-                          v        v       v
-              +-----------+--+ +---+------+ +------+-------+
-              |  HID remote  | | TM1637   | |  Relay       |
-              |              | | display  | |  Power Amp   |
-              +--------------+ +----------+ +--------------+
+                               +-----------+
+                               |  Sensors  |
+                               |   Light   |
+                               |   Button  |
+                               +-----+-----+
+                                     |
+                                     | ADC / GPIO
+                                     v
++--------------+           +---------+---------+           +----------------+
+| Power supply |---------->|       ESP32       |---------->| Pi power relay |
++--------------+           +---------+---------+           +-------+--------+
+                                     |                             |
+                         GPIO / UART |                             | 5V
+                                     v                             v
++----------------------------------------------------------------------------+
+|                                Raspberry Pi                                |
+|                 volume / mute              volume / mute                   |
+|     +----------+             +------------+             +------------+     |
+|     |  Lyrion  |<----------->|  LyBriCa   |<----------->| CamillaDSP |     |
+|     |  (LMS)   |  CLI :9090  |  (bridge)  |   WS :1234  |   engine   |     |
+|     +----------+             +------------+             +------------+     |
+|                                                                            |
+|  Audio path: Lyrion -> Squeezelite -> ALSA loopback -> CamillaDSP -> DAC   |
+|                                                                            |
++----------------------------------------------------------------------------+
+            | evdev     ^            |          ^             |
+            v           | "gpio"     v          | "toslink"   v
+    +--------------+    |    +---------------+  |     +--------------+
+    |  HID remote  |    |    | TM1637 display|  |     |  Amp relay   |
+    +--------------+    |    | CLK 23 DIO 24 |  |     |   (GPIO 4)   |
+                        |    +---------------+  |     +--------------+
+                        |                       |
+                        |                       |
+                 +------+-----+          +------+-----+
+                 |  TV state  |          | TOSLINK in |
+                 | (GPIO 12)  |          |   (ALSA)   |
+                 +------------+          +------------+
+
+            Config switching: one of the two, set by ENABLE_CONFIG_SWITCH
 ```
+
+How the pieces talk to each other:
+
+- **Volume bridge (LyBriCa)**: LyBriCa listens to Lyrion through its CLI
+  (port 9090) and reads/writes the CamillaDSP main volume and mute through its
+  WebSocket (port 1234), in both directions. CamillaDSP is read by a single
+  poller, and bursts of changes coming from Lyrion are merged before being
+  written (see [Lyrion Music Server setup](#lyrion-music-server-setup)).
+- **Audio path** (it does not go through LyBriCa): Lyrion streams to
+  Squeezelite, which plays into the ALSA loopback (`hw:Loopback,0`);
+  CamillaDSP captures it (`plughw:Loopback,1,0`), applies the filters and
+  plays to the DAC.
+- **ESP32 <-> Pi signals**:
+  - ESP32 GPIO5 -> Pi power relay (HIGH = on)
+  - ESP32 GPIO10 -> Pi GPIO20: shutdown request (`gpio-shutdown` overlay)
+  - Pi GPIO21 -> ESP32 GPIO6: power-good (`gpio-poweroff` overlay)
+  - ESP32 GPIO21 -> Pi GPIO15: ambient light over UART (115200 8N1)
+- **HID remote**: BLE to the ESP32 while the Pi is off (wake-up), then to the Pi
+  (evdev) once it has booted, if the remote accepts two hosts in turn.
+- **Config switching** (one method at a time): with `"gpio"`, LyBriCa reads the
+  TV state on GPIO 12; with `"toslink"`, it probes the TOSLINK capture device
+  through ALSA while CamillaDSP is not holding it. Either one makes LyBriCa load
+  the next `|*` (TV) or `_*` (stereo) config in CamillaDSP.
 
 The **ESP32** manages the Raspberry Pi's physical power supply and can request
 a wake-up from a button or remote-control event. It also reads the ambient-light

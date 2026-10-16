@@ -49,7 +49,8 @@ volume-sync only, with no display and no remote). See
 17. [ESP32-C3 companion](#esp32-c3-companion)
 18. [Systemd service](#systemd-service)
 19. [Troubleshooting](#troubleshooting)
-20. [License](#license)
+20. [Known limitations](#known-limitations)
+21. [License](#license)
 
 ---
 
@@ -74,7 +75,7 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 
 ```
                         +----------+
-                        | Capteurs |
+                        | Sensors  |
                         | Light    |
                         | Button   |
                         +----+-----+
@@ -114,7 +115,7 @@ that relay switches the amplifier, not the Raspberry Pi's own power supply.
 
 | Component | Role | Connection |
 |---|---|---|
-| Raspberry Pi | Runs LyBriCa | - |
+| Raspberry Pi (**64-bit capable**, see note) | Runs LyBriCa | - |
 | ESP32-C3 | Raspberry Pi power relay, BLE HID remote, light sensor | UART TX to `/dev/serial0` |
 | HID remote | User input | USB / Bluetooth (evdev) |
 | TM1637 display | 6-digit display | GPIO 23 (CLK), GPIO 24 (DIO) |
@@ -122,6 +123,11 @@ that relay switches the amplifier, not the Raspberry Pi's own power supply.
 | TV state input | Detects TV on/off | GPIO 12 (optional) |
 | Ambient light sensor | Auto brightness | Via ESP32 (serial) |
 | TOSLINK input | Source detection | ALSA (optional) |
+
+> **64-bit only.** The installer downloads `aarch64` binaries (CamillaDSP,
+> CamillaGUI), an `arm64` build of `bluetuith`, and sets `arm_64bit=1` in
+> `config.txt`. A 32-bit-only Raspberry Pi (Pi 1, Zero, original Pi 2) is not
+> supported by the installer, even though the GPIO features alone would run.
 
 ---
 
@@ -170,6 +176,11 @@ The script opens an interactive menu:
 Choose **1) Install Everything** for a full installation, or pick individual
 steps.
 
+> **Running option 7 on its own?** Run **option 2 (Upgrade System)** first.
+> The system packages needed to build `pyalsaaudio` (`libasound2-dev`, `git`,
+> `python3-pip`...) are installed by option 2, not by option 7. Without them,
+> the `pip install pyalsaaudio` step fails and the installer stops (`set -e`).
+
 ### Installer defaults
 
 The installer uses the following fixed values:
@@ -196,10 +207,10 @@ To change any of these, edit `install-lybrica.sh` directly.
 
 | Step | Action |
 |---|---|
-| **1. System** | `apt update`, `apt upgrade`, installs `git`, `wget`, `curl`, `python3-pip`, `systemd` |
-| **2. CamillaDSP** | Downloads and installs CamillaDSP v4.1.3 to `/usr/local/bin/`, CamillaGUI v4.1.0 to `/opt/camillagui_backend/`, creates the systemd services `camilladsp.service` and `camillagui.service`, writes a default `statefile.yml` and `_Setup.yml` config, sets up the ALSA loopback (`snd-aloop` loaded at boot) |
+| **1. System** | `apt update`, `apt upgrade`, installs `git`, `wget`, `curl`, `python3-pip`, `systemd`, `libasound2-dev` |
+| **2. CamillaDSP** | Downloads and installs CamillaDSP v4.1.3 to `/usr/local/bin/`, CamillaGUI v4.1.0 to `/opt/camillagui_backend/`, creates the systemd services `camilladsp.service` and `camillagui.service`, writes a default `~/camilladsp/statefile.yml` and `~/camilladsp/configs/_Setup.yml`, sets up the ALSA loopback (`snd-aloop` loaded at boot) |
 | **3. Lyrion** | Downloads and installs Lyrion Music Server 9.1.1, installs Squeezelite, configures the output device to `hw:Loopback,0` with options `-W -C 5 -r 48000-48000 -R hLE` |
-| **4. USB drive** | Detects the USB drive UUID with `blkid` and adds an entry to `/etc/fstab` (`auto defaults,nofail,x-systemd.device-timeout=1,noatime`) |
+| **4. USB drive** | Looks for a UUID on `/dev/sda1` only (via `blkid`); if none is found, asks for the UUID. Adds an entry to `/etc/fstab` (`auto defaults,nofail,x-systemd.device-timeout=1,noatime`) |
 | **5. Sound card** | Launches `alsamixer` for manual level adjustment, then saves with `alsactl store` |
 | **6. LyBriCa** | Rewrites `/boot/firmware/config.txt` and cleans `cmdline.txt`, adds the user to the required groups, creates the passwordless `/sbin/shutdown` sudoers rule, creates `/opt/venv`, installs Python dependencies (pycamilladsp pinned to v4.0.0), downloads `lybrica.py` and `tm1637_lgpio.py`, creates and starts the systemd service |
 | **7. Bluetooth remote** | Installs `bluetuith` if needed, launches it for pairing, detects the remote with `evdev`, updates `REMOTE_NAME` in `lybrica.py`, restarts the service |
@@ -209,7 +220,7 @@ To change any of these, edit `install-lybrica.sh` directly.
 
 | Path | Change | Backup |
 |---|---|---|
-| `/boot/firmware/config.txt` | Rewritten (see [Raspberry Pi boot configuration](#raspberry-pi-boot-configuration)) | `config.txt.bak` |
+| `/boot/firmware/config.txt` | **Rewritten entirely** (see [Raspberry Pi boot configuration](#raspberry-pi-boot-configuration)) | `config.txt.bak` |
 | `/boot/firmware/cmdline.txt` | `console=serial0,NNNN` removed | `cmdline.txt.bak` |
 | `/etc/sudoers.d/lybrica` | Created (passwordless `/sbin/shutdown`), mode `440` | - |
 | `/opt/venv` | Created (`python3 -m venv --system-site-packages`) | - |
@@ -224,6 +235,8 @@ To change any of these, edit `install-lybrica.sh` directly.
 sudo usermod -aG dialout,gpio,input,spi,i2c,audio "$USER"
 ```
 
+Log out and back in (or reboot) for the new groups to apply to your own shell.
+
 ### Sudoers rule added by the installer
 
 ```bash
@@ -232,21 +245,27 @@ sudo chmod 440 /etc/sudoers.d/lybrica
 ```
 
 This rule is **required** for `lybrica.py` to halt the Pi without a password
-(see `shutdown_system()`). Without it, the **POWER long-press → shutdown**
+(see `shutdown_system()`). Without it, the **POWER very-long-press → shutdown**
 feature fails silently: `os.system("sudo shutdown -h now")` returns an error
 code that LyBriCa does not check.
 
-The rule is validated immediately with `visudo -c`, so a syntax error stops
-the installer (thanks to `set -e`) instead of leaving `/etc/sudoers.d/` in a
-state that would break `sudo` system-wide:
+The installer then checks the syntax of the file with `visudo -c`:
 
 ```bash
 sudo visudo -c -f /etc/sudoers.d/lybrica > /dev/null
 ```
 
-`visudo -c` does not modify the file — it only checks the syntax and returns
-a non-zero exit code on error. This is the reason it is used instead of
-editing `/etc/sudoers` directly with a text editor.
+`visudo -c` does not modify the file; it only returns a non-zero exit code on
+error, which stops the installer (`set -e`). Note that the check runs **after**
+the file has been written: if the syntax were ever invalid, the installer would
+stop but the faulty file would remain in `/etc/sudoers.d/` and could break
+`sudo`. In that case, remove it from a root shell (`su -` or `pkexec`):
+
+```bash
+rm /etc/sudoers.d/lybrica
+```
+
+With the fixed content above, this does not happen in practice.
 
 ---
 
@@ -255,6 +274,11 @@ editing `/etc/sudoers` directly with a text editor.
 The installer **rewrites** `/boot/firmware/config.txt` (a backup is saved as
 `config.txt.bak` before the first install; a marker `#installed-by-lybrica` is
 added at the end so the file is not rewritten on later runs).
+
+> ⚠️ The file is **replaced**, not edited. Any personal line you had
+> (`dtparam=i2c_arm=on`, `dtparam=spi=on`, extra overlays, display settings...)
+> is lost and must be restored by hand from `config.txt.bak` if you need it.
+> Notably, the new file does **not** enable I2C or SPI.
 
 Key lines added:
 
@@ -277,10 +301,11 @@ The installer's boot overlays expect the ESP32 to be wired as follows:
 
 | ESP32-C3 pin | Direction | Function | Raspberry Pi side |
 |---|---|---|---|
+| GPIO0 (ADC1 channel 0) | Input | Ambient-light sensor (LDR, voltage divider) | - |
 | GPIO5 | Output | Raspberry Pi power-relay control (HIGH = relay on) | - |
 | GPIO6 | Input | Raspberry Pi power-good signal (internal pull-down) | **GPIO21** via `gpio-poweroff` |
 | GPIO7 | Input | Physical button (also BLE-scan trigger at boot) | - |
-| GPIO8 | Output | Bluetooth status LED (inverted: LOW = on) | - |
+| GPIO8 | Output | Bluetooth status LED, on-board (inverted: LOW = on) | - |
 | GPIO10 | Output | Raspberry Pi shutdown request | **GPIO20** via `gpio-shutdown` |
 | GPIO21 (UART1 TX) | Output | Filtered ambient-light ADC value (`<integer>\n`) | **GPIO15** (RXD, `/dev/serial0`) |
 
@@ -289,6 +314,7 @@ The installer's boot overlays expect the ESP32 to be wired as follows:
 > Make sure the wire goes from ESP32 GPIO10 to Raspberry Pi GPIO20. If your
 > wiring differs, adjust either `dtoverlay=gpio-shutdown,gpio_pin=NN` or the
 > `#define GPIO_SHUTDOWN` in the firmware.
+
 ---
 
 ## Manual installation
@@ -297,8 +323,8 @@ If you prefer to install step by step:
 
 ### Prerequisites
 
-- Raspberry Pi (any model with GPIO)
-- Raspberry Pi OS (Bookworm or later recommended)
+- Raspberry Pi with GPIO, **64-bit capable** (if you use the installer binaries)
+- Raspberry Pi OS (Bookworm or later recommended), 64-bit
 - Python 3.9+
 - CamillaDSP installed and running
 - Lyrion Music Server installed and running
@@ -306,11 +332,18 @@ If you prefer to install step by step:
 
 ### System dependencies
 
+The installer (option 2) installs `git wget curl python3-pip systemd libasound2-dev`.
+For a manual installation, install at least:
+
 ```bash
 sudo apt update
-sudo apt install -y python3-pip python3-dev python3-venv \
+sudo apt install -y git wget curl python3-pip python3-dev python3-venv \
                     liblgpio-dev libasound2-dev
 ```
+
+(`python3-dev`, `python3-venv` and `liblgpio-dev` are not installed by the
+installer; on Raspberry Pi OS they are normally already present or pulled in
+by the pip builds.)
 
 ### Python dependencies
 
@@ -357,6 +390,7 @@ And for the shutdown command (required by `shutdown_system()` in `lybrica.py`):
 ```bash
 echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee /etc/sudoers.d/lybrica > /dev/null
 sudo chmod 440 /etc/sudoers.d/lybrica
+sudo visudo -c -f /etc/sudoers.d/lybrica
 ```
 
 Verify the rule is active. **The `sudo -k` step clears the credential cache,
@@ -369,7 +403,7 @@ sudo -n shutdown -h now   # should NOT ask for a password, and shuts the Pi down
 ```
 
 If `sudo -n` prints `sudo: a password is required`, the rule is missing or
-incorrect and the **POWER long-press → shutdown** feature will not work.
+incorrect and the **POWER very-long-press → shutdown** feature will not work.
 
 ---
 
@@ -386,11 +420,32 @@ ENABLE_DISPLAY       = True
 ENABLE_CONFIG_SWITCH = "gpio"   # False | "gpio" | "toslink"
 ```
 
+### Remote
+
+```python
+REMOTE_NAME = "HID Remote01 Keyboard"   # found with: python3 -m evdev.evtest
+```
+
+The installer (option 8) sets this line for you after pairing.
+
+If `ENABLE_REMOTE = True` and the remote is not found at startup, LyBriCa
+**waits and retries every second for up to `HALT_DELAY` hours (48 h by
+default)**, then shuts the Pi down. While it waits, nothing else is started,
+including the volume sync. If you want to run without a remote, set
+`ENABLE_REMOTE = False`.
+
 ### Network addresses
 
 ```python
 CAMILLA_ADDR = ("127.0.0.1", 1234)   # CamillaDSP WebSocket
 LMS_ADDR     = ("127.0.0.1", 9090)   # Lyrion CLI
+```
+
+### Paths
+
+```python
+CONFIG_DIR = "~/camilladsp/configs/"   # DSP configs (expanded to the user's home)
+# settings.json is stored next to lybrica.py
 ```
 
 ### GPIO pins
@@ -414,6 +469,26 @@ TOSLINK_SILENCE_DELAY_S = 120   # Seconds of TOSLINK silence before switching ba
 silence/shutdown behaviour. It is not the same as the ESP32's physical power
 management for the Raspberry Pi.
 
+### Other settings (advanced)
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `TOSLINK_TV_ON_DB` | `-30.0` | TOSLINK level (dB) at or above which the source is considered "TV" |
+| `VOLUME_SLOWDOWN` | `{UP: 2, DOWN: 1}` | Volume step applied once every N key repeats (the remote repeats every ~40 ms) |
+| `HOLD_TOGGLE_POWER` | `2` | POWER held: repeats before the relay toggles |
+| `HOLD_SHUTDOWN` | `300` | POWER held: repeats before the Pi shuts down (about 12 s at 40 ms per repeat) |
+| `HOLD_STOP` / `HOLD_SEEK` | `10` | PLAY/PAUSE: repeats before *stop*; NEXT/PREVIOUS: repeats before seeking starts |
+| `HOLD_SWITCH_TONE_TILT` | `15` | ENTER held: repeats before switching tone/tilt screen |
+| `SEEK_STEP_S`, `SEEK_INTERVAL_S` | `10`, `0.5` | Seek jump (seconds) and delay between jumps while the key is held |
+| `TONE_MAX_DB`, `PRESENCE_MAX_DB`, `TILT_MAX_STEPS`, `TILT_DB_STEP` | `9`, `3`, `3`, `2` | Tone / presence / tilt ranges |
+| `LOUDNESS_MIN`, `LOUDNESS_MAX`, `LOUDNESS_STEP` | `-50`, `-10`, `5` | Loudness reference range and step (dB) |
+| `LMS_PLAYER_MANUAL` | `""` | Player MAC address; empty = MAC of the default network interface |
+| `LMS_SYNC_DEBUG` | `False` | Log every volume/mute change and raw LMS notification |
+| `LMS_COALESCE_S`, `LMS_RESTORE_WINDOW_S` | `0.05`, `0.5` | Burst merging and post-unmute correction window |
+| `LMS_CONNECT_TIMEOUT_S`, `LMS_RETRY_S` | `5`, `5` | LMS CLI connection timeout and restart delay |
+| `POLL_INTERVAL_S`, `CDSP_RECONNECT_DELAY_S` | `0.25`, `2.0` | CamillaDSP polling period and reconnection delay |
+| `ADC_LEVELS`, `BRIGHTNESS_LEVELS`, `HYSTERESIS_RATIO` | see [Display](#display) | Ambient light → brightness mapping |
+
 ---
 
 ## Feature switches
@@ -425,8 +500,8 @@ hardware library is **not imported** and **not required**.
 |---|---|---|---|
 | `ENABLE_LMS_SYNC` | `True` | `True` / `False` | Lyrion <-> CamillaDSP volume/mute sync |
 | `ENABLE_AUTO_POWEROFF` | `True` | `True` / `False` | Power relay: off after silence, on with sound |
-| `ENABLE_REMOTE` | `True` | `True` / `False` | BLE HID remote control |
-| `ENABLE_DISPLAY` | `True` | `True` / `False` | TM1637 display + ambient light sensor |
+| `ENABLE_REMOTE` | `True` | `True` / `False` | HID remote control (all keys; if `False`, no key works) |
+| `ENABLE_DISPLAY` | `True` | `True` / `False` | TM1637 display + ambient light sensor (the tone / tilt / loudness keys need it) |
 | `ENABLE_CONFIG_SWITCH` | `"gpio"` | `False` / `"gpio"` / `"toslink"` | Automatic config switching — **only one method at a time** |
 
 ### `ENABLE_CONFIG_SWITCH` details
@@ -448,18 +523,16 @@ detectors at the same time. An invalid value raises `ValueError` at startup
 
 The `"toslink"` mode imports the `alsaaudio` Python module
 (`pyalsaaudio`). The installer installs it, together with its system
-dependency `libasound2-dev`, so the mode works out of the box:
+dependency `libasound2-dev` (installed by **option 2 / Upgrade System**; see the
+note in [Quick install](#quick-install)):
 
 ```bash
-# System library (ALSA headers)
+# System library (ALSA headers, needed to BUILD pyalsaaudio)
 sudo apt install -y libasound2-dev
 
 # Python binding, installed inside the venv used by the service
 sudo /opt/venv/bin/pip install pyalsaaudio
 ```
-
-These two commands are exactly what `install-lybrica.sh` runs when the
-script is used, so no manual step is required for a normal installation.
 
 If the module is missing (for example after a manual install that skipped
 the step), `lybrica.py` raises `ModuleNotFoundError: No module named
@@ -471,17 +544,19 @@ above and then:
 sudo systemctl restart lybrica
 ```
 
-> ⚠️ `libasound2-dev` is required even if a pre-built `pyalsaaudio` wheel is
-> used, because it provides the ALSA headers used at runtime. On most
-> Raspberry Pi OS images `python3-alsaaudio` is also available via `apt` and
-> already pulls in `libasound2-dev`:
+> ⚠️ `libasound2-dev` is needed to **compile** `pyalsaaudio` (it provides the
+> ALSA headers). Once built, only the runtime library `libasound2` is needed,
+> and it is present on any Raspberry Pi OS image. On most images
+> `python3-alsaaudio` is also available via `apt`, which avoids compilation
+> altogether:
 >
 > ```bash
 > sudo apt install -y python3-alsaaudio
 > ```
 >
-> Installing it via `apt` is often simpler than via `pip`, and avoids
-> compilation issues on fresh systems.
+> Because the service uses a venv created with `--system-site-packages`, the
+> apt package is visible from `/opt/venv`.
+
 ---
 
 ## Lyrion Music Server setup
@@ -543,12 +618,31 @@ If the bridge keeps correcting the volume in a loop, the player is not set to
 | `PLAYPAUSE` | Pause | Stop (LMS) |
 | `PREVIOUSSONG` | Previous track | Rewind (10 s steps) |
 | `NEXTSONG` | Next track | Fast-forward (10 s steps) |
-| `UP` / `DOWN` | Increase / decrease bass on the tone screen; tilt on the tilt screen | - |
-| `LEFT` / `RIGHT` | Decrease / increase treble on the tone screen; presence on the tilt screen | - |
-| `ENTER` | Reset / restore tone values; toggle loudness on its screen | Switch between tone and tilt screens |
+| `UP` / `DOWN` | Bass +/- on the tone screen; tilt +/- on the tilt screen; loudness +/- on the loudness screen | - |
+| `LEFT` / `RIGHT` | Treble -/+ on the tone screen; presence -/+ on the tilt screen; nothing on the loudness screen | - |
+| `ENTER` | Reset / restore tone values (tone and tilt screens); toggle loudness on/off (loudness screen) | Switch between tone and tilt screens |
 | `BACK` | Next config whose filename starts with `_` (stereo group) | - |
-| `HOMEPAGE` | Next config whose filename starts with `|` (TV group) | - |
-| `POWER` | - | Toggle amplifier relay; a very long press shuts down the Pi |
+| `HOMEPAGE` | Next config whose filename starts with `\|` (TV group) | - |
+| `POWER` | - | Held ~2 repeats: toggle amplifier relay. Held ~300 repeats (about 12 s): shut down the Pi |
+
+Notes:
+
+- The UP / DOWN / LEFT / RIGHT / ENTER behaviours need `ENABLE_DISPLAY = True`.
+- Toggling the amplifier relay with POWER needs `ENABLE_AUTO_POWEROFF = True`.
+  The shutdown works regardless.
+- If the display is blanked (after a long silence), the **first** key press only
+  wakes it up and is otherwise ignored.
+
+### Screen navigation
+
+- From the **volume screen**, an arrow key opens the last used **tone** or
+  **tilt** screen; `ENTER` opens the **loudness** screen.
+- Between tone and tilt: long-press `ENTER`.
+- The loudness screen is reachable **only from the volume screen**. To go from
+  loudness to tone/tilt, wait for the automatic return to the volume screen
+  (`SCREEN_RETURN_DELAY`, 30 s by default) and press an arrow key.
+- Any other screen returns to the volume screen after `SCREEN_RETURN_DELAY`
+  seconds without a key press.
 
 ---
 
@@ -556,11 +650,15 @@ If the bridge keeps correcting the volume in a loop, the player is not set to
 
 The TM1637 display shows:
 
-- **Volume screen**: config label (3 chars) + volume (0-100)
+- **Volume screen**: config label (3 chars) + volume (0-100). At 100 the volume
+  is shown as `HI`; when muted it is shown as `--`.
 - **Tone screen**: bass / treble (` 3B 2T`)
-- **Tilt screen**: tilt / presence (` 2T 1P`)
-- **Loudness screen**: reference level (`-30 Ld`)
+- **Tilt screen**: tilt / presence (` 2T 1P`), tilt in steps of `TILT_DB_STEP` dB
+- **Loudness screen**: reference level (`-30 Ld`); ` No Ld` when loudness is off
 - **Power screen**: `PW ON` / `PW OFF` / ` HALT `
+
+A value shown as `--` means the corresponding filter does not exist (or is not
+used by the pipeline) in the active config.
 
 Special indicators:
 
@@ -568,8 +666,12 @@ Special indicators:
 - Decimal point on the 4th character: power relay ON
 - Top segment on the 4th character: tone settings active
 
-Brightness is adjusted automatically from the ambient light sensor
-(4 levels with hysteresis).
+### Automatic brightness
+
+The ambient-light value received from the ESP32 is compared with four
+thresholds (`ADC_LEVELS = [80, 1000, 2500, 3500]`), which gives **five
+brightness levels** (`BRIGHTNESS_LEVELS = [0, 1, 2, 3, 7]`), with a 3 %
+hysteresis (`HYSTERESIS_RATIO`) between two levels to avoid flickering.
 
 ---
 
@@ -593,7 +695,8 @@ the only mute mechanism.
 
 ## DSP configuration files
 
-Automatic configuration switching uses filename prefixes:
+Automatic configuration switching uses filename prefixes in `CONFIG_DIR`
+(`~/camilladsp/configs/`):
 
 - `_` identifies the stereo/Squeezelite group, selected with `BACK`.
 - `|` identifies the TV group, selected with `HOMEPAGE`.
@@ -601,18 +704,30 @@ Automatic configuration switching uses filename prefixes:
   still work).
 - `ENABLE_CONFIG_SWITCH = "gpio"` uses the TV-state input (`TV_GPIO`).
 - `ENABLE_CONFIG_SWITCH = "toslink"` detects audio on the TOSLINK input and
-  uses `TOSLINK_SILENCE_DELAY_S` before returning to Squeezelite.
+  uses `TOSLINK_SILENCE_DELAY_S` before returning to Squeezelite. The capture
+  device, rate and channels are read at startup from the **first `|*` config
+  file**, so all `|*` configs must share the same capture input.
 
 Make sure the configuration files in `CONFIG_DIR` use the prefixes expected
-by your setup.
+by your setup. The installer creates a default `_Setup.yml` there.
+
+Tone filters are looked up **by name** in each config: `Bass`, `Treble`,
+`Tilt`, `Presence` (parameter `gain`) and `Loudness` (parameter
+`reference_level`). A filter must also be listed in an enabled `Filter` step of
+the pipeline to be taken into account; otherwise it is shown as `--` and its
+keys do nothing.
 
 ---
 
 ## Settings file
 
-`settings.json` stores the saved tone-related values for each configuration,
-the previous values used by the ENTER restore function, and the last tone/tilt
-screen selection.
+`settings.json` (stored next to `lybrica.py`) contains:
+
+- the saved tone-related values for each configuration (`configs`), including
+  the previous values used by the ENTER restore function;
+- the last config used in each group (`last_config`, for `_` and `|`), so that
+  a TV on/off cycle or a restart returns to the last used config of the group;
+- the last tone/tilt screen selection (`last_tone_tilt`).
 
 If the file is missing, `load_settings()` falls back to safe defaults (empty
 dictionaries, `last_tone_tilt = "tone"`), so LyBriCa still starts and creates
@@ -634,11 +749,11 @@ in this section refer to the **ESP32-C3**, not to Raspberry Pi GPIO numbers.
 
 | ESP32-C3 pin | Direction | Function |
 |---|---|---|
-| GPIO2 (ADC1 channel 0) | Input | Ambient-light sensor (LDR) |
+| GPIO0 (ADC1 channel 0) | Input | Ambient-light sensor (LDR) |
 | GPIO5 | Output | Raspberry Pi power-relay control: HIGH = relay on, LOW = relay off |
 | GPIO6 | Input | Raspberry Pi power-good signal; has an internal pull-down |
 | GPIO7 | Input | Physical button; also used to request BLE scanning during startup |
-| GPIO8 | Output | Bluetooth status LED, inverted logic: LOW = on, HIGH = off |
+| GPIO8 | Output | Bluetooth status LED (on-board LED), inverted logic: LOW = on, HIGH = off |
 | GPIO10 | Output | Raspberry Pi shutdown request |
 | GPIO21 (UART1 TX) | Output | Sends filtered ADC readings to the Raspberry Pi |
 
@@ -663,13 +778,20 @@ idf.py -p /dev/ttyACM0 monitor
 - `monitor` prints the BLE scan logs (`BLE_SCAN: ADV ...`) and the relay
   messages. Press `Ctrl+]` to exit.
 
+> **Console output.** The firmware sends the light readings on **UART1 TX
+> (GPIO21)**. By default, ESP-IDF on the ESP32-C3 also sends its console logs
+> to UART0, whose TX pin is also GPIO21. To keep the serial link to the Pi
+> clean, set the console to the USB port: `idf.py menuconfig` → *Component
+> config → ESP System Settings → Channel for console output* →
+> **USB Serial/JTAG**. This is also what makes `monitor` work over USB.
+
 ### Ambient-light sensor wiring
 
-The firmware reads the LDR on **GPIO2 (ADC1 channel 0)** through a simple
+The firmware reads the LDR on **GPIO0 (ADC1 channel 0)** through a simple
 voltage divider:
 
 ```
-3V3 ──── LDR ────┬──── GPIO2 (ADC)
+3V3 ──── LDR ────┬──── GPIO0 (ADC)
                  │
                 R
                  │
@@ -690,10 +812,10 @@ raw ADC value (see the ESP32 `monitor` output) and adjust `ADC_LEVELS` in
 
 ### Pairing the BLE remote with the ESP32
 
-The ESP32 firmware acts as a **BLE HID host**: it does not pair from the
-Raspberry Pi side, and the remote must **not** be paired with the Pi's own
-Bluetooth stack. Pairing is done entirely on the ESP32, using its physical
-button (GPIO7) and the NVS storage.
+The ESP32 firmware acts as a **BLE HID host**. It stores the **address (MAC)**
+of the remote in its NVS and connects to it by address. This pairing is
+independent from the Raspberry Pi's own Bluetooth pairing (see
+[Using one remote with both the ESP32 and the Pi](#using-one-remote-with-both-the-esp32-and-the-pi)).
 
 **One-time pairing procedure:**
 
@@ -702,18 +824,21 @@ button (GPIO7) and the NVS storage.
    until the LED blinks fast — see your remote's manual).
 3. **Hold GPIO7 LOW** (press the ESP32 button) while the ESP32-C3 boots, and
    keep it held until the scan starts. Concretely: press the button, release
-   the ESP32 reset, then release the button once the scan has begun (the LED
-   on GPIO8 will blink slowly during the scan).
+   the ESP32 reset, and release the button once the scan has begun (watch the
+   `Starting BLE scan` line in the console; the status LED does **not**
+   indicate the scan).
 4. The firmware scans BLE for **5 seconds** and prints every advertisement
    with RSSI ≥ −80 dBm to its console. It then keeps the **strongest** device
-   and saves its MAC in NVS under `target_mac`.
+   and saves its MAC in NVS under `target_mac`. The strongest device is
+   simply the strongest BLE advertiser nearby, **not necessarily a remote**.
 5. The ESP32 automatically **restarts**. On the next boot, it loads the saved
    MAC and opens the BLE HID connection to the remote.
 
 **Re-pairing to another remote:**
 
 - Repeat the same procedure: hold GPIO7 LOW at boot. The previous MAC in NVS
-  is simply **overwritten** by the new strongest device found during the scan.
+  is **overwritten** by the new strongest device found during the scan. If no
+  device qualifies, the previous MAC is kept.
 
 **If the scan picks the wrong device:**
 
@@ -721,14 +846,15 @@ button (GPIO7) and the NVS storage.
   Move the remote closer to the ESP32 (a few centimetres) during the 5-second
   scan window, and move other BLE devices (phones, watches, speakers) away.
 
-**Checking the status:**
+**Checking the status (status LED on GPIO8, on-board):**
 
-- GPIO8 LED behaviour on the ESP32:
-  - **Solid** (LOW): a BLE HID connection is established and the remote is
-    ready.
-  - **Slow blink** (LOW/HIGH ~300 ms / 1.7 s): no MAC is saved in NVS yet, or
-    the connection to the saved MAC failed. Re-do the pairing procedure.
-- The ESP32 logs (UART0, typically the USB console) show:
+- **Solid on**: a BLE HID connection is established and the remote is ready.
+- **Slow blink** (on ~300 ms / off ~1.7 s): **no MAC is saved** in NVS. Re-do
+  the pairing procedure.
+- **Off**: a MAC is saved but the connection is not (yet) established. The
+  firmware retries every 5 seconds; check that the remote is on, in range, and
+  not connected to another host.
+- The ESP32 logs (USB console) show:
   ```
   BLE_SCAN: ADV aa:bb:cc:dd:ee:ff   RSSI=-52
   BLE_SCAN: Best BLE device: aa:bb:cc:dd:ee:ff   RSSI=-52
@@ -736,23 +862,36 @@ button (GPIO7) and the NVS storage.
   BLE_SCAN: Restarting ESP32-C3...
   ```
 
-**After pairing:**
+#### Using one remote with both the ESP32 and the Pi
 
-- The remote is used **only through the ESP32**, not through the Pi's
-  `bluetuith` / `evdev` stack. On the Pi side, `ENABLE_REMOTE` and
-  `REMOTE_NAME` refer to a **separate** HID remote that is paired directly
-  with the Pi via USB or Bluetooth.
-- To use a single remote, either pair it with the ESP32 (for wake-up) **or**
-  with the Pi (for key events), but pairing with both at the same time usually
-  does not work: a BLE HID device can typically only be connected to one host.
+Two different things use a remote:
+
+- **The ESP32** uses it to **wake the Raspberry Pi** (any HID input while the Pi
+  is off triggers the relay sequence).
+- **The Pi** (`lybrica.py`, via `evdev`) uses it for all the **key actions**
+  (volume, tone, player, configs...). `ENABLE_REMOTE` and `REMOTE_NAME` refer to
+  the remote as seen by the Pi, paired with the installer's option 8 (`bluetuith`).
+
+As soon as the relay activates, the ESP32 calls `deinit_bluetooth()` and drops
+its BLE connection, which frees the remote so that the Pi can connect to it once
+booted. After the Pi shuts down, the ESP32 restarts and reconnects to the saved
+MAC.
+
+This hand-over only works if **the remote accepts being connected to two hosts
+one after the other**. Many BLE remotes do, but some keep a single bond and
+will refuse the second host. If yours does not, pair it with the Pi only and
+use the ESP32's physical button (GPIO7) to power on. Use the remote
+only on one side at a time; do not expect both to be connected simultaneously.
 
 **Note on BLE shutdown:**
 
-- As soon as the relay activates (RPi powered on), the firmware calls
-  `deinit_bluetooth()` and drops the BLE connection. During that window the
-  remote is **not** connected to the ESP32 (see
+- While the relay is active (Pi powered on), the BLE remote **cannot** send
+  HID events to the ESP32. Only the physical button (GPIO7) can request the
+  Raspberry Pi shutdown during that window.
+- This is intentional: it avoids a BLE event immediately re-triggering the
+  relay while the Pi is booting, frees the remote for the Pi, and frees the BLE
+  stack while the ESP32 is only polling GPIO6 (see
   [Bluetooth shutdown when the relay activates](#bluetooth-shutdown-when-the-relay-activates)).
-  The ESP32 reconnects on the next restart.
 
 ### Button and BLE pairing
 
@@ -779,8 +918,8 @@ are separated by approximately 500 ms, so the actual detection time depends on
 when the signal changes relative to the polling loop.
 
 GPIO10 is set HIGH when a shutdown request is made. In the supplied firmware,
-that output is not explicitly returned to LOW afterward; do not assume it is a
-short pulse.
+that output is not explicitly returned to LOW afterward (it is reset by the
+ESP32 restart that follows the shutdown); do not assume it is a short pulse.
 
 ### Bluetooth shutdown when the relay activates
 
@@ -794,9 +933,6 @@ When `activate_relay_sequence()` runs, the firmware calls `deinit_bluetooth()`
 - Consequence: while the relay is active, the BLE remote **cannot** send new
   HID events to the ESP32. Only the physical button (GPIO7) can request the
   Raspberry Pi shutdown during that window.
-- This is intentional: it avoids a BLE event immediately re-triggering the
-  relay while the Pi is booting, and frees the BLE stack while the ESP32 is
-  only polling GPIO6.
 
 ### Ambient-light serial data
 
@@ -862,7 +998,9 @@ journalctl -u lybrica -f
 /opt/venv/bin/python3 -m evdev.evtest
 ```
 
-Check that the remote name matches `REMOTE_NAME` in `lybrica.py`.
+Check that the remote name matches `REMOTE_NAME` in `lybrica.py`. If the remote
+is missing at startup, LyBriCa keeps retrying (for up to `HALT_DELAY` hours)
+before shutting the Pi down, and starts nothing else in the meantime.
 
 ### CamillaDSP unreachable
 
@@ -890,7 +1028,7 @@ If the volume keeps jumping or correcting itself:
 - Enable `LMS_SYNC_DEBUG = True` in `lybrica.py` and look at the `[LMS sync]`
   lines in the journal.
 
-### Shutdown from the remote (POWER long-press) does nothing
+### Shutdown from the remote (POWER very-long-press) does nothing
 
 `lybrica.py` halts the Pi with `os.system("sudo shutdown -h now")`. If the
 user running the service is not allowed to run `shutdown` as root **without a
@@ -928,6 +1066,15 @@ sudo -n shutdown -h now
 - Check the TM1637 wiring (CLK, DIO)
 - Check the ambient light sensor value in the logs
 - Check that `ENABLE_DISPLAY = True`
+- After a long silence the display is blanked on purpose: press a key or play
+  sound to wake it
+
+### Display brightness does not follow the light
+
+- Check that the ESP32 sends values: `ADC = ... -> Brightness = ...` lines
+  appear in the journal when the level changes.
+- If the values never change when you cover the LDR, check that the LDR is on
+  **GPIO0** of the ESP32-C3 (ADC1 channel 0), and adjust `ADC_LEVELS`.
 
 ### ESP32 not responding
 
@@ -936,6 +1083,9 @@ sudo -n shutdown -h now
 - Check the ESP32 logs (if available)
 - Check that `enable_uart=1` is present in `/boot/firmware/config.txt` and that
   `console=serial0,...` has been removed from `/boot/firmware/cmdline.txt`.
+- Check that the ESP32 console is set to USB Serial/JTAG (see
+  [Flashing the firmware](#flashing-the-firmware)), so that no log text is mixed
+  with the light readings on GPIO21.
 
 ### BLE remote does not connect to the ESP32
 
@@ -944,6 +1094,8 @@ sudo -n shutdown -h now
 - Move the remote closer than usual (RSSI must be **> −80 dBm**).
 - Check the ESP32 console logs for `ADV` and `MAC saved to NVS`.
 - If the LED on GPIO8 blinks slowly, no MAC was saved: re-do the pairing.
+- If the LED is off, a MAC is saved but the connection fails: check that the
+  remote is on, in range, and not connected to another host (for example the Pi).
 
 ### Bluetooth remote pairing fails on the Pi
 
@@ -980,6 +1132,28 @@ journalctl -u lybrica -f
 journalctl -u camilladsp -f
 journalctl -u camillagui -f
 ```
+
+---
+
+## Known limitations
+
+- **ESP32 firmware, ADC API**: it uses the legacy `driver/adc.h` API, which is
+  deprecated in ESP-IDF 5.x and removed in later major versions. A move to
+  `esp_adc/adc_oneshot.h` will be needed for newer ESP-IDF releases.
+- **ESP32 firmware, no saved MAC**: the firmware still logs `Loaded MAC` and
+  tries to open the HID connection with an all-zero address, retrying every
+  5 seconds. Harmless, but the log line is misleading; rely on the slow LED
+  blink to detect this state.
+- **ESP32 firmware, button while the relay is active**: once the relay
+  sequence is running, the button is handled inside that sequence (second press
+  asserts GPIO10); the "relay already active" branch of the main loop is not
+  reached.
+- **Config switching**: `ENABLE_CONFIG_SWITCH = 0` is accepted by the startup
+  check (since `0 == False`) and behaves like `False`.
+- **Installer, `/etc/sudoers.d/lybrica`**: syntax is checked after the file is
+  written (see [Sudoers rule](#sudoers-rule-added-by-the-installer)).
+- **Installer, USB drive**: only `/dev/sda1` is auto-detected; otherwise the
+  UUID must be typed in.
 
 ---
 

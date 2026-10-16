@@ -87,7 +87,6 @@ dtparam=audio=off
 dtoverlay=gpio-poweroff,gpiopin=21,active_low=1
 dtoverlay=gpio-shutdown,gpio_pin=20,active_low=0,gpio_pull=down
 enable_uart=1
-dtoverlay=disable-wifi
 
 #installed-by-lybrica
 EOL
@@ -110,7 +109,7 @@ EOL
     # -------------------------------------------------------------------------
     # 2. User groups & venv
     # -------------------------------------------------------------------------
-    sudo usermod -aG dialout,gpio,input,spi,i2c "$USER"
+    sudo usermod -aG dialout,gpio,input,spi,i2c,audio "$USER"
 
     if [ ! -d "/opt/venv" ]; then
         sudo mkdir -p /opt/venv
@@ -122,7 +121,7 @@ EOL
     # 3. Dependencies
     # -------------------------------------------------------------------------
     sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5
-    sudo /opt/venv/bin/pip install "git+https://github.com/HEnquist/pycamilladsp.git"
+    sudo /opt/venv/bin/pip install "git+https://github.com/HEnquist/pycamilladsp.git@v4.0.0"
     # -------------------------------------------------------------------------
     # 4. Download scripts
     # -------------------------------------------------------------------------

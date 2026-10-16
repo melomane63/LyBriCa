@@ -240,8 +240,15 @@ Log out and back in (or reboot) for the new groups to apply to your own shell.
 ### Sudoers rule added by the installer
 
 ```bash
-echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee /etc/sudoers.d/lybrica > /dev/null
-sudo chmod 440 /etc/sudoers.d/lybrica
+SUDOERS_TMP=$(mktemp)
+echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" > "$SUDOERS_TMP"
+if ! sudo visudo -c -f "$SUDOERS_TMP" > /dev/null; then
+    rm -f "$SUDOERS_TMP"
+    echo "Invalid sudoers rule, nothing installed."
+    exit 1
+fi
+sudo install -m 440 -o root -g root "$SUDOERS_TMP" /etc/sudoers.d/lybrica
+rm -f "$SUDOERS_TMP"
 ```
 
 This rule is **required** for `lybrica.py` to halt the Pi without a password
@@ -249,23 +256,11 @@ This rule is **required** for `lybrica.py` to halt the Pi without a password
 feature fails silently: `os.system("sudo shutdown -h now")` returns an error
 code that LyBriCa does not check.
 
-The installer then checks the syntax of the file with `visudo -c`:
-
-```bash
-sudo visudo -c -f /etc/sudoers.d/lybrica > /dev/null
-```
-
-`visudo -c` does not modify the file; it only returns a non-zero exit code on
-error, which stops the installer (`set -e`). Note that the check runs **after**
-the file has been written: if the syntax were ever invalid, the installer would
-stop but the faulty file would remain in `/etc/sudoers.d/` and could break
-`sudo`. In that case, remove it from a root shell (`su -` or `pkexec`):
-
-```bash
-rm /etc/sudoers.d/lybrica
-```
-
-With the fixed content above, this does not happen in practice.
+The rule is first written to a temporary file and checked with `visudo -c`
+(which does not modify anything and only returns a non-zero exit code on
+error). It is copied to `/etc/sudoers.d/lybrica` (mode `440`, owner `root`)
+only if the syntax is valid, so an invalid rule can never break `sudo`
+system-wide. If the check fails, the installer stops and nothing is installed.
 
 ---
 
@@ -388,9 +383,15 @@ sudo usermod -aG dialout,gpio,input,spi,i2c,audio $USER
 And for the shutdown command (required by `shutdown_system()` in `lybrica.py`):
 
 ```bash
-echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee /etc/sudoers.d/lybrica > /dev/null
-sudo chmod 440 /etc/sudoers.d/lybrica
-sudo visudo -c -f /etc/sudoers.d/lybrica
+SUDOERS_TMP=$(mktemp)
+echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" > "$SUDOERS_TMP"
+if ! sudo visudo -c -f "$SUDOERS_TMP" > /dev/null; then
+    rm -f "$SUDOERS_TMP"
+    echo "Invalid sudoers rule, nothing installed."
+    exit 1
+fi
+sudo install -m 440 -o root -g root "$SUDOERS_TMP" /etc/sudoers.d/lybrica
+rm -f "$SUDOERS_TMP"
 ```
 
 Verify the rule is active. **The `sudo -k` step clears the credential cache,
@@ -1150,8 +1151,6 @@ journalctl -u camillagui -f
   reached.
 - **Config switching**: `ENABLE_CONFIG_SWITCH = 0` is accepted by the startup
   check (since `0 == False`) and behaves like `False`.
-- **Installer, `/etc/sudoers.d/lybrica`**: syntax is checked after the file is
-  written (see [Sudoers rule](#sudoers-rule-added-by-the-installer)).
 - **Installer, USB drive**: only `/dev/sda1` is auto-detected; otherwise the
   UUID must be typed in.
 

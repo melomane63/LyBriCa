@@ -165,7 +165,7 @@ TV_GPIO = 12                # GPIO reading the TV state (0 = TV on)
 
 # ENABLE_CONFIG_SWITCH = "toslink"
 # NOTE: device / rate / channels are read at startup from the first "|*" YAML.
-TOSLINK_TV_ON_DB = -40.0        # TOSLINK free: level >= threshold -> TV
+TOSLINK_TV_ON_DB = -30.0        # TOSLINK free: level >= threshold -> TV
 TOSLINK_SILENCE_DELAY_S = 120   # Seconds of silence before going back to SQUEEZELITE
 
 

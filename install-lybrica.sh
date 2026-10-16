@@ -111,6 +111,14 @@ EOL
     # -------------------------------------------------------------------------
     sudo usermod -aG dialout,gpio,input,spi,i2c,audio "$USER"
 
+    # -------------------------------------------------------------------------
+    # 2b. Sudoers rule for passwordless shutdown (used by lybrica.py)
+    # -------------------------------------------------------------------------
+    echo "🔐 Adding sudoers rule for passwordless shutdown..."
+    echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee /etc/sudoers.d/lybrica > /dev/null
+    sudo chmod 440 /etc/sudoers.d/lybrica
+    sudo visudo -c -f /etc/sudoers.d/lybrica > /dev/null
+
     if [ ! -d "/opt/venv" ]; then
         sudo mkdir -p /opt/venv
         sudo python3 -m venv --system-site-packages /opt/venv

@@ -117,7 +117,7 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 
 How the pieces talk to each other:
 
-- **Volume bridge (LyBriCa)**: LyBriCa listens to Lyrion through its CLI
+- **Volume bridge **: LyBriCa listens to Lyrion through its CLI
   (port 9090) and reads/writes the CamillaDSP main volume and mute through its
   WebSocket (port 1234), in both directions. CamillaDSP is read by a single
   poller, and bursts of changes coming from Lyrion are merged before being

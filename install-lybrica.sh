@@ -9,7 +9,7 @@ set -e
 upgrade_system() {
     echo "🔄 Updating and upgrading system..."
     sudo apt update && sudo apt upgrade -y
-    sudo apt install -y git wget curl python3-pip systemd
+    sudo apt install -y git wget curl python3-pip systemd libasound2-dev
 }
 
 # =============================================================================
@@ -128,7 +128,7 @@ EOL
     # -------------------------------------------------------------------------
     # 3. Dependencies
     # -------------------------------------------------------------------------
-    sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5
+    sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5 pyalsaaudio
     sudo /opt/venv/bin/pip install "git+https://github.com/HEnquist/pycamilladsp.git@v4.0.0"
     # -------------------------------------------------------------------------
     # 4. Download scripts

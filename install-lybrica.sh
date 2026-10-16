@@ -115,9 +115,15 @@ EOL
     # 2b. Sudoers rule for passwordless shutdown (used by lybrica.py)
     # -------------------------------------------------------------------------
     echo "🔐 Adding sudoers rule for passwordless shutdown..."
-    echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" | sudo tee /etc/sudoers.d/lybrica > /dev/null
-    sudo chmod 440 /etc/sudoers.d/lybrica
-    sudo visudo -c -f /etc/sudoers.d/lybrica > /dev/null
+    SUDOERS_TMP=$(mktemp)
+    echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" > "$SUDOERS_TMP"
+    if ! sudo visudo -c -f "$SUDOERS_TMP" > /dev/null; then
+       rm -f "$SUDOERS_TMP"
+       echo "❌ Invalid sudoers rule, nothing installed."
+       exit 1
+    fi
+    sudo install -m 440 -o root -g root "$SUDOERS_TMP" /etc/sudoers.d/lybrica
+    rm -f "$SUDOERS_TMP"
 
     if [ ! -d "/opt/venv" ]; then
         sudo mkdir -p /opt/venv

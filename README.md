@@ -2,12 +2,12 @@
 
 **Ly**rion + **Bri**dge + **Ca**millaDSP
 
-A bidirectional bridge between **Lyrion Music Server** and **CamillaDSP** for
-Raspberry Pi, with HID remote control, TM1637 display, ambient light sensor,
-power relay control and automatic power management.
+A bidirectional volume bridge between **Lyrion Music Server** and **CamillaDSP** for
+Raspberry Pi, with HID remote control, TM1637 display with ambient light sensor,
+power relay control, automatic trigger management and auto select config.
 
 The ESP32 companion handles the physical power on/off of the Pi,
-receives the remote control signals and reports the ambient light level.
+whit button and remote control and reports the ambient light level.
 
 ---
 

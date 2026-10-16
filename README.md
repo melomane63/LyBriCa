@@ -444,6 +444,47 @@ values:
 detectors at the same time. An invalid value raises `ValueError` at startup
 (checked in the `FEATURES` block of `lybrica.py`).
 
+#### TOSLINK mode dependencies
+
+The `"toslink"` mode imports the `alsaaudio` Python module
+(`pyalsaaudio`). **This module is not installed by the default installer**,
+because the `"gpio"` and `False` modes do not need it — the same
+"library not imported if feature disabled" rule that applies to the other
+switches.
+
+If you want to use `ENABLE_CONFIG_SWITCH = "toslink"`, install the
+dependencies manually **before** starting LyBriCa:
+
+```bash
+# System library required to build/use pyalsaaudio
+sudo apt install -y libasound2-dev
+
+# Python binding, installed inside the venv used by the service
+sudo /opt/venv/bin/pip install pyalsaaudio
+```
+
+Then restart the service:
+
+```bash
+sudo systemctl restart lybrica
+```
+
+Without these packages, `lybrica.py` raises `ModuleNotFoundError: No module
+named 'alsaaudio'` at startup and the service **crashes in a restart loop**
+(`Restart=on-failure`, `RestartSec=5`).
+
+> ⚠️ `libasound2-dev` is required even if a pre-built `pyalsaaudio` wheel is
+> used, because it provides the ALSA headers used at runtime. On most
+> Raspberry Pi OS images `python3-alsaaudio` is available via `apt` and
+> already pulls in `libasound2-dev`:
+>
+> ```bash
+> sudo apt install -y python3-alsaaudio
+> ```
+>
+> Installing it via `apt` is often simpler than via `pip`, and avoids
+> compilation issues on fresh systems.
+
 ---
 
 ## Lyrion Music Server setup

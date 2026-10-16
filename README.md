@@ -11,8 +11,8 @@ switch at the top of `lybrica.py`:
 
 | # | Feature | Switch |
 |---|---|---|
-| 1 | Bidirectional volume / mute synchronisation | `ENABLE_LMS_SYNC` |
-| 2 | BLE HID remote (volume, tones, player, configs) | `ENABLE_REMOTE` |
+| 1 | Bidirectional volume / mute synchronisation on Material skin | `ENABLE_LMS_SYNC` |
+| 2 | BLE HID remote (volume, tone, player control, configs) | `ENABLE_REMOTE` |
 | 3 | TM1637 display with automatic brightness | `ENABLE_DISPLAY` |
 | 4 | Trigger control for amplifier power | `ENABLE_AUTO_POWEROFF` |
 | 5 | Automatic DSP configuration switching (GPIO or TOSLINK) | `ENABLE_CONFIG_SWITCH` |

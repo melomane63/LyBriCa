@@ -26,7 +26,7 @@ ENABLE_REMOTE        = True   # Remote control (all keys: volume, mute, LMS, BAC
                               # HOMEPAGE, POWER). If False, no key works at all.
 ENABLE_DISPLAY       = True   # TM1637 display + ambient light sensor
                               # (the tone / tilt / loudness keys need it)
-ENABLE_CONFIG_SWITCH = "gpio" # Auto config switching: False | "gpio" | "toslink"
+ENABLE_CONFIG_SWITCH = "toslink" # Auto config switching: False | "gpio" | "toslink"
                               #   False     : disabled
                               #   "gpio"    : TV GPIO (original logic)
                               #   "toslink" : audio detection on the TOSLINK input
@@ -66,7 +66,7 @@ log = logging.getLogger("remote")
 
 # ---------------------- Remote control ----------------------
 
-REMOTE_NAME = "HID Remote01 Keyboard"   # Found with `python3 -m evdev.evtest`
+REMOTE_NAME = "pCP BLE HID Keyboard"
 
 # Keys (all require ENABLE_REMOTE = True)
 KEY_BINDINGS = {
@@ -154,7 +154,7 @@ HYSTERESIS_RATIO = 0.03     # 3 % hysteresis between two brightness levels
 # ---------------------- CamillaDSP and config switching ----------------------
 
 CAMILLA_ADDR = ("127.0.0.1", 1234)
-CONFIG_DIR = os.path.expanduser("~") + "/camilladsp/configs/"
+CONFIG_DIR = ("/mnt/mmcblk0p2/tce" if os.path.isdir("/mnt/mmcblk0p2/tce") else os.path.expanduser("~")) + "/camilladsp/configs/"
 
 POLL_INTERVAL_S = 0.25      # One read cycle of CamillaDSP (volume + mute)
 TITLE_EVERY = 2             # The config title is read every N cycles (2 -> every 0.5 s)
@@ -624,7 +624,7 @@ def shutdown_system():
     if ENABLE_AUTO_POWEROFF:
         lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
     show(" HALT ")
-    os.system("sudo shutdown -h now")
+    os.system("sudo poweroff")
 
 
 def adc_to_brightness(adc_value):
@@ -649,13 +649,17 @@ def adc_to_brightness(adc_value):
 @functools.lru_cache(maxsize=None)   # read once; a failure (exception) is not cached
 def detect_player_mac():
     """MAC of the default network interface, raw format (dc:a6:32:3c:1c:21)."""
-    with os.popen("ip route show default") as route_info:
-        default_iface = next((line.split()[4] for line in route_info if "default" in line), None)
-    if not default_iface:
+    with open("/proc/net/route") as f:
+        next(f)  # header
+        iface = next(
+            (cols[0] for cols in map(str.split, f)
+             if len(cols) >= 8 and cols[1] == cols[7] == "00000000"),
+            None,
+        )
+    if not iface:
         raise RuntimeError("No default network interface found")
-    with open(f"/sys/class/net/{default_iface}/address") as f:
+    with open(f"/sys/class/net/{iface}/address") as f:
         return f.read().strip().lower()
-
 
 def get_config_display_label():
     """Return the 3-character label shown on the display for the active config.
@@ -691,7 +695,7 @@ def find_remote():
         device = evdev.InputDevice(path)
         if device.name == REMOTE_NAME:
             log.info("'%s' found at %s.", REMOTE_NAME, path)
-            device.grab()
+            #device.grab()
             return device
     return None
 
@@ -706,7 +710,7 @@ if ENABLE_REMOTE:
         time.sleep(1)
     if remote is None:
         log.info("'%s' not found after %s hours. Shutting down...", REMOTE_NAME, HALT_DELAY)
-        os.system("sudo shutdown -h now")
+        os.system("sudo poweroff")
         sys.exit(0)
 
 # CamillaDSP

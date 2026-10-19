@@ -904,6 +904,10 @@ def display_volume_info(current_volume=None, is_muted=None):
     if any(get_filter_param(config_active, f, "gain") for f in GAIN_KEYS.values()):
         segs[3] |= 0x01    # top horizontal segment (A) on the 4th character: tone settings active
 
+    loudness_ref = get_filter_param(config_active, "Loudness", "reference_level")
+    if loudness_ref is not None and round(loudness_ref) != -100:
+        segs[3] |= 0x08    # bottom horizontal segment (D) on the 4th character: loudness active
+
     if ENABLE_AUTO_POWEROFF and auto_power_enabled:
         segs[2] |= 0x80    # decimal point on the 3rd character: auto power-off active
 

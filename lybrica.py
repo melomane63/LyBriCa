@@ -154,7 +154,10 @@ HYSTERESIS_RATIO = 0.03     # 3 % hysteresis between two brightness levels
 # ---------------------- CamillaDSP and config switching ----------------------
 
 CAMILLA_ADDR = ("127.0.0.1", 1234)
-CONFIG_DIR = ("/mnt/mmcblk0p2/tce" if os.path.isdir("/mnt/mmcblk0p2/tce") else os.path.expanduser("~")) + "/camilladsp/configs/"
+
+PCP_DIR = "/mnt/mmcblk0p2/tce"   # exists only on PiCorePlayer
+BASE_DIR = PCP_DIR if os.path.isdir(PCP_DIR) else os.path.expanduser("~")
+CONFIG_DIR = BASE_DIR + "/camilladsp/configs/"
 
 POLL_INTERVAL_S = 0.25      # One read cycle of CamillaDSP (volume + mute)
 TITLE_EVERY = 2             # The config title is read every N cycles (2 -> every 0.5 s)

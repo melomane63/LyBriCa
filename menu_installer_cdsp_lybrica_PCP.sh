@@ -4,9 +4,9 @@
 #
 #   1) CamillaDSP 5.x + CamillaGUI  (Squeezelite -> loopback -> CamillaDSP -> DAC)
 #   2) Bridge BLE HID               (Bluetooth remote)
-#   3) LyBriCa                      (modules Python, TM1637, daemon TOSLINK/LMS/volume)
-#   4) ESP32C3                      (UART + GPIO overlays: moves power/shutdown
-#                                    off I2S pins, enables /dev/serial0)
+#   3) LyBriCa                      (modules Python, daemon)
+#   4) ESP32C3                      (UART + GPIO overlays)
+#                                    
 #
 # Usage (SSH, user tc):
 #   sh install_pcp.sh      -> interactive menu (no parameters)

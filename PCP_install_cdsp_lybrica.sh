@@ -6,7 +6,6 @@
 #   2) Bridge BLE HID               (Bluetooth remote)
 #   3) LyBriCa                      (modules Python, daemon)
 #   4) ESP32C3                      (UART + GPIO overlays)
-#                                    
 #
 # Usage (SSH, user tc):
 #   sh install_pcp.sh      -> interactive menu (no parameters)
@@ -19,6 +18,14 @@
 SELF="$0"
 BOOTLOCAL=/opt/bootlocal.sh
 HOME_DIR=/home/tc
+
+# Exit code a step returns when the user cancels it (shown as SKIPPED).
+# Chosen so it cannot be confused with the exit codes of wget, tar, etc.
+SKIP_RC=10
+
+# Exit code the ESP32C3 subscript returns when config.txt already contains
+# every line it wants to add (no change, no reboot needed).
+UNCHANGED_RC=20
 
 say()  { echo "==> $*"; }
 fail() { echo "ERROR: $*" >&2; exit 1; }
@@ -388,8 +395,10 @@ install_bridge() {
             echo "Scanning (15 s)..."
             bluetoothctl --timeout 15 scan on > "$SCAN_OUT" 2>&1
 
-            N_RSSI=$(grep -c "RSSI:" "$SCAN_OUT" 2>/dev/null || echo 0)
-            echo ">>> $N_RSSI RSSI captured"
+            # grep -c prints the count (0 included) but exits 1 when it is 0,
+            # so "|| true" avoids a second "0" being printed.
+            N_RSSI=$(grep -c "RSSI:" "$SCAN_OUT" 2>/dev/null || true)
+            echo ">>> ${N_RSSI:-0} RSSI captured"
 
             # --- 3) Names (after the scan, no concurrent bluetoothctl) ---------
             bluetoothctl devices 2>/dev/null \
@@ -824,12 +833,33 @@ EOF
 ###########################################################################
 install_esp32c3() {
     echo
-    echo "-----------------------------------------------------------------"
-    echo " ESP32C3 microcontroller support:"
-    echo "   - Enable the UART on GPIO 14/15 (used by the ESP32C3)."
-    echo "   - Enable gpio-poweroff / gpio-shutdown on GPIO 26/16"
-    echo "   (config.txt lives on the FAT partition, reboot required)"
-    echo "-----------------------------------------------------------------"
+    echo '-----------------------------------------------------------------'
+    echo ' ESP32C3 microcontroller support'
+    echo '-----------------------------------------------------------------'
+    echo ' This step edits config.txt (FAT partition, /mnt/mmcblk0p1).'
+    echo ''
+    echo ' It ADDS, under [all], the lines that are not already there:'
+    echo '   dtoverlay=gpio-poweroff,gpiopin=26,active_low=1'
+    echo '       (GPIO 26: "shutdown done" signal to the ESP32)'
+    echo '   dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down'
+    echo '       (GPIO 16: shutdown request from the ESP32)'
+    echo '   enable_uart=1'
+    echo '       (UART on GPIO 14/15, link with the ESP32)'
+    echo ''
+    echo ' Nothing is removed. Meant for a fresh install: on a bare Raspberry Pi'
+    echo ' these GPIOs are free (GPIO 14/15 = UART, GPIO 16 and 26 = plain GPIOs).'
+    echo ' If you use a HAT or another add-on board, check its pinout first.'
+    echo ''
+    echo ' Expected setup (ESP32C3 + relay):'
+    echo '   1. A physical button is wired to the ESP32.'
+    echo '   2. Pressing it while the Pi runs: the ESP32 requests a shutdown (GPIO 16).'
+    echo '   3. The Pi shuts down and signals it (GPIO 26); the ESP32 then cuts'
+    echo '      the power with a relay.'
+    echo '   4. Pressing the button again: the ESP32 closes the relay and the Pi boots.'
+    echo ''
+    echo ' A backup is kept as config.txt.bak (created once, never overwritten).'
+    echo ' A reboot is required to apply the changes.'
+    echo '-----------------------------------------------------------------'
     echo
     printf "Apply the ESP32C3 configuration to config.txt? [y/N]: "
     read -r ESP_ANS
@@ -837,14 +867,14 @@ install_esp32c3() {
         y|Y) ;;
         *)
             say "Cancelled (config.txt unchanged)."
-            return 0 ;;
+            return "$SKIP_RC" ;;
     esac
 
     ESP_SCRIPT=/tmp/fix_gpio_overlays.sh
     cat > "$ESP_SCRIPT" <<'GPIO_SCRIPT_EOF'
 #!/bin/sh
-# Replace old gpio-poweroff/gpio-shutdown overlays with new ones on GPIO 26/16,
-# and enable the UART.
+# Add the gpio-poweroff (GPIO 26) and gpio-shutdown (GPIO 16) overlays and
+# enable the UART, only for the lines that are not already in config.txt.
 
 set -e
 
@@ -854,45 +884,82 @@ CONFIG="$FAT_MNT/config.txt"
 
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root (sudo $0)" >&2; exit 1; }
 
-# Mount the FAT partition if not already mounted
+# Mount the FAT partition if not already mounted.
+# MOUNTED_BY_US remembers it, so it is unmounted at the end only in that case.
+MOUNTED_BY_US=0
 if ! mount | grep -q " $FAT_MNT "; then
     mkdir -p "$FAT_MNT"
     mount "$FAT_DEV" "$FAT_MNT"
+    MOUNTED_BY_US=1
     echo ">>> $FAT_DEV mounted on $FAT_MNT"
 fi
 
 [ -f "$CONFIG" ] || { echo "ERROR: $CONFIG not found" >&2; exit 1; }
 
-# Remove any previous gpio-poweroff / gpio-shutdown lines (whatever GPIO)
-sed -i -E '/^[[:space:]]*dtoverlay=gpio-(poweroff|shutdown)/d' "$CONFIG"
+# Backup of the original config.txt (created once, never overwritten, so the
+# first untouched copy is always kept).
+if [ ! -f "$CONFIG.bak" ]; then
+    cp -p "$CONFIG" "$CONFIG.bak"
+    echo ">>> Backup created: $CONFIG.bak"
+else
+    echo ">>> Backup already present: $CONFIG.bak (kept as is)"
+fi
 
-# Remove any previous enable_uart line (will be re-added below)
-sed -i -E '/^[[:space:]]*enable_uart=/d' "$CONFIG"
+# Add a line only if it is not already in config.txt (exact line match).
+# "[all]" is written once, before the first added line: without it, the
+# lines would only apply to the conditional section (e.g. [pi4]) the file
+# happens to end with.
+ADDED=0
+add_line() {
+    if grep -qxF "$1" "$CONFIG"; then
+        echo ">>> Already present: $1"
+    else
+        if [ "$ADDED" -eq 0 ]; then
+            # Make sure the file ends with a newline before appending
+            [ -z "$(tail -c1 "$CONFIG")" ] || echo >> "$CONFIG"
+            echo "[all]" >> "$CONFIG"
+            ADDED=1
+        fi
+        echo "$1" >> "$CONFIG"
+        echo ">>> Added: $1"
+    fi
+}
 
-# Append the new lines
-cat >> "$CONFIG" <<'EOF'
+add_line "dtoverlay=gpio-poweroff,gpiopin=26,active_low=1"
+add_line "dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down"
+add_line "enable_uart=1"
 
-dtoverlay=gpio-poweroff,gpiopin=26,active_low=1
-dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down
-enable_uart=1
-EOF
+echo ">>> $CONFIG, last lines:"
+tail -10 "$CONFIG"
 
-echo ">>> $CONFIG updated, last lines:"
-tail -8 "$CONFIG"
+if [ "$MOUNTED_BY_US" -eq 1 ]; then
+    umount "$FAT_MNT"
+    echo ">>> $FAT_MNT unmounted"
+else
+    echo ">>> $FAT_MNT was already mounted: left mounted"
+fi
 
-umount "$FAT_MNT"
-echo ">>> $FAT_MNT unmounted"
+# Tell the caller whether anything was actually added.
+# 20 matches UNCHANGED_RC in install_pcp.sh: "already up to date".
+if [ "$ADDED" -eq 0 ]; then
+    exit 20
+fi
+exit 0
 GPIO_SCRIPT_EOF
 
     chmod 755 "$ESP_SCRIPT"
-    if sudo sh "$ESP_SCRIPT"; then
-        say "config.txt updated."
-        echo ">>> Reboot required to apply:  pcp reboot"
-    else
-        rm -f "$ESP_SCRIPT"
-        fail "config.txt update failed (see above)."
-    fi
+    sudo sh "$ESP_SCRIPT"
+    ESP_RC=$?
     rm -f "$ESP_SCRIPT"
+    case "$ESP_RC" in
+        0)
+            say "config.txt updated."
+            echo ">>> Reboot required to apply:  pcp reboot" ;;
+        "$UNCHANGED_RC")
+            say "config.txt already up to date, no reboot needed." ;;
+        *)
+            fail "config.txt update failed (see above)." ;;
+    esac
 }
 
 ###########################################################################
@@ -918,12 +985,14 @@ run_step() {  # $1 = camilla|bridge|lybrica|esp32c3
     echo "############################################################"
     echo "# Step: $1"
     echo "############################################################"
-    if sh "$SELF" --run "$1"; then
-        DONE="$DONE $1:OK"
-    else
-        DONE="$DONE $1:FAILED"
-        echo "!!! Step '$1' failed (see messages above)." >&2
-    fi
+    sh "$SELF" --run "$1"
+    rc=$?
+    case "$rc" in
+        0)        DONE="$DONE $1:OK" ;;
+        "$SKIP_RC") DONE="$DONE $1:SKIPPED" ;;
+        *)        DONE="$DONE $1:FAILED"
+                  echo "!!! Step '$1' failed (see messages above)." >&2 ;;
+    esac
 }
 
 do_reboot() {
@@ -945,7 +1014,6 @@ run_choice() {
             2|bridge)  run_step bridge ;;
             3|lybrica) run_step lybrica ;;
             4|esp32c3) run_step esp32c3 ;;
-            a|A|all)   run_step camilla; run_step bridge; run_step lybrica; run_step esp32c3 ;;
             r|R)       do_reboot ;;
             q|Q)       return 1 ;;
             *) echo "Unknown choice: $c" ;;
@@ -972,7 +1040,6 @@ while true; do
     echo "  2) BLE HID bridge (remote)"
     echo "  3) LyBriCa (Python modules, TM1637, daemon)"
     echo "  4) ESP32C3 (UART + GPIO overlays)"
-    echo "  A) Install everything (1, 2, 3 then 4)"
     echo "  R) Reboot now"
     echo "  Q) Quit"
     echo "----------------------------------------------"

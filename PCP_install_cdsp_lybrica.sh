@@ -827,9 +827,7 @@ install_esp32c3() {
     echo "-----------------------------------------------------------------"
     echo " ESP32C3 microcontroller support:"
     echo "   - Enable the UART on GPIO 14/15 (used by the ESP32C3)."
-    echo "   - Move gpio-poweroff / gpio-shutdown from GPIO 20/21"
-    echo "     (reserved by I2S) to GPIO 26/16, so that an I2S DAC can be"
-    echo "     added later without a GPIO conflict."
+    echo "   - Enable gpio-poweroff / gpio-shutdown on GPIO 26/16"
     echo "   (config.txt lives on the FAT partition, reboot required)"
     echo "-----------------------------------------------------------------"
     echo

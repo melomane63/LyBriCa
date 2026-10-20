@@ -168,9 +168,8 @@ TV_GPIO = 12                # GPIO reading the TV state (0 = TV on)
 
 # ENABLE_CONFIG_SWITCH = "toslink"
 # NOTE: device / rate / channels are read at startup from the first "|*" YAML.
-TOSLINK_TV_ON_DB = -30.0        # TOSLINK free: level >= threshold -> TV
-TOSLINK_SILENCE_DELAY_S = 120   # Seconds of silence before going back to SQUEEZELITE
-
+TOSLINK_ON_DB           = -40.0   # TOSLINK free: peak level >= threshold -> TV
+LOOPBACK_ON_DB          = -50.0   # Loopback free: peak level >= threshold -> SQUEEZELITE
 
 # ---------------------- Robustness ----------------------
 
@@ -254,6 +253,10 @@ bridge_log = logging.getLogger("lms_bridge")
 #      2 ..  24 : 1.5 dB / level  (-71 .. -38 dB)
 #      1 : -75 dB, 0 : -100 dB (the real mute is handled separately)
 # The curve is strictly increasing, which makes the inverse conversion exact.
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
 
 def pct_to_db(p):
     """Level 0..100 -> dB."""
@@ -570,10 +573,6 @@ vol_state = VolumeState()       # Last volume / mute / title read from CamillaDS
 
 
 # ====================== HELPERS ======================
-
-def clamp(value, low, high):
-    return max(low, min(high, value))
-
 
 class NullDisplay:
     """Stand-in for the TM1637 when ENABLE_DISPLAY is False: accepts every call
@@ -1046,32 +1045,15 @@ def send_lms_command(command):
 
 
 async def remote_watcher():
-    """Tâche de fond pour détecter et connecter/reconnecter la télécommande sans bloquer le boot."""
+    """Background task: detect and reconnect the remote without blocking boot."""
     global remote
     while ENABLE_REMOTE:
         if remote is None:
             remote = find_remote()
             if remote:
-                log.info("'%s' connectée avec succès !", REMOTE_NAME)
-                # Lance l'écoute des événements de la télécommande en tâche de fond
+                log.info("'%s' connected successfully!", REMOTE_NAME)
                 asyncio.create_task(supervised("remote", lambda: remote_events(remote)))
-        await asyncio.sleep(5)  # Vérifie toutes les 5 secondes si absente
-
-
-async def remote_events_loop():
-    """Boucle asynchrone de lecture des appuis sur la télécommande."""
-    global remote
-    try:
-        # Utilisation d'async_read_loop pour lire les événements evdev en asynchrone
-        async for event in remote.async_read_loop():
-            # --- INSÉREZ ICI VOTRE LOGIQUE EXISTANTE DE TRAITEMENT DES TOUCHES ---
-            # Exemple : 
-            # if event.type == evdev.ecodes.EV_KEY:
-            #     ...
-            pass
-    except Exception as e:
-        log.error("Perte de connexion avec la télécommande : %r", e)
-        remote = None  # Déclenche la reconnexion via le remote_watcher
+        await asyncio.sleep(5)
 
 
 # ====================== DSP CONFIGURATION ======================
@@ -1479,21 +1461,19 @@ async def monitor_tv_gpio():
         await asyncio.sleep(0.05)
 
 # --------------------- Config switching: TOSLINK mode ---------------------
-# Same structure as monitor_tv_gpio: a `last_source` variable holds the previous
-# state and the action is triggered only when the state changes.
+# The prefix of the currently active config (_ or |) is the single source of
+# truth, re-read every second from cdsp.config.file_path(). No internal state
+# is maintained: manual BACK / HOMEPAGE presses are honoured automatically.
 #
-# Two phases:
-#   - SQUEEZELITE: the toslink device is free, it is read directly.
-#     Source = "TV" if level >= TOSLINK_TV_ON_DB, else "SQUEEZELITE".
-#   - TV: the TOSLINK is held by CamillaDSP.
-#     Source = "SQUEEZELITE" if STALLED or silent for TOSLINK_SILENCE_DELAY_S,
-#     else "TV".
+#   _XX : CamillaDSP captures the loopback -> TOSLINK is free.
+#         TOSLINK peak level >= TOSLINK_ON_DB AND crest >= 2.0
+#         for 2 consecutive readings
+#           -> switch to |XX + STOP LMS
 #
-# Manual override: if the config title changes on its own, the detection stops
-# acting until the title matches the TV reference title again.
-#
-# Script-initiated switch: the title of the config we load is memorized in
-# `expected_title`, so the watcher does not mistake our own change for a manual one.
+#   |XX : CamillaDSP captures TOSLINK -> loopback is free.
+#         TOSLINK silent (silent_now == True) AND
+#         loopback level >= LOOPBACK_ON_DB
+#           -> switch to _XX
 
 def read_toslink_capture_params():
     """Read device / rate / channels from the first '|*' YAML config.
@@ -1523,27 +1503,115 @@ def read_toslink_capture_params():
         return None
 
 
+_CAMILLA_FMT_TO_ALSA = {
+    "S16_LE":  (alsaaudio.PCM_FORMAT_S16_LE,  2),
+    "S24_3LE": (alsaaudio.PCM_FORMAT_S24_3LE, 3),
+    "S32_LE":  (alsaaudio.PCM_FORMAT_S32_LE,  4),
+}
+
+
+def read_loopback_capture_params():
+    """Read device / rate / channels / format from the first '_*' YAML config.
+    All '_*' configs share the same capture input (Squeezelite loopback),
+    so the first one is enough.
+    Returns a dict {'device', 'rate', 'channels', 'format', 'sample_bytes'}
+    or None on failure."""
+    files = sorted(glob.glob(CONFIG_DIR + "_*"))
+    if not files:
+        log.error("[LOOPBACK] No '_*' config file found in %s", CONFIG_DIR)
+        return None
+    try:
+        data = cdsp.config.read_and_parse_file(files[0])
+        if not isinstance(data, dict):
+            return None
+        dev = data.get("devices") or {}
+        cap = dev.get("capture") or {}
+        device = cap.get("device")
+        if not isinstance(device, str) or not device:
+            log.error("[LOOPBACK] No capture device in %s", files[0])
+            return None
+        fmt_name = (cap.get("format") or "S32_LE").upper()
+        fmt, sb = _CAMILLA_FMT_TO_ALSA.get(
+            fmt_name, (alsaaudio.PCM_FORMAT_S32_LE, 4))
+        return {
+            "device":       device,
+            "rate":         int(dev.get("samplerate") or 48000),
+            "channels":     int(cap.get("channels") or 2),
+            "format":       fmt,
+            "sample_bytes": sb,
+        }
+    except Exception as e:
+        log.error("[LOOPBACK] Cannot read %s: %s", files[0], e)
+        return None
+
+
 def _toslink_probe(params):
     """Runs in a thread (blocks ~0.5 s).
     `params` is the dict returned by read_toslink_capture_params().
-    Returns (db, None) if the TOSLINK is free, (None, error) if it is busy."""
+    Returns (peak_db, rms_db, err) if the TOSLINK is free,
+    (None, None, err) if it is busy, (None, None, None) if no samples."""
     try:
         pcm = alsaaudio.PCM(
             type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NONBLOCK,
-            device=params["device"], channels=params["channels"], rate=params["rate"],
-            format=alsaaudio.PCM_FORMAT_S16_LE, periodsize=4096,
+            device=params["device"], channels=params["channels"],
+            rate=params["rate"], format=alsaaudio.PCM_FORMAT_S16_LE,
+            periodsize=4096,
         )
     except Exception as e:
-        return None, e
+        return None, None, e
 
-    peak = 0.0
+    sum_sq = 0
+    count = 0
+    peak = 0
     try:
         deadline = time.monotonic() + 0.5
         while time.monotonic() < deadline:
             length, data = pcm.read()
             if length > 0:
                 samples = struct.unpack(f"<{len(data) // 2}h", data)
-                peak = max(peak, max((abs(s) for s in samples), default=0) / 32768.0)
+                for s in samples:
+                    a = abs(s)
+                    if a > peak:
+                        peak = a
+                    sum_sq += s * s
+                count += len(samples)
+            else:
+                time.sleep(0.01)
+    finally:
+        pcm.close()
+
+    if count == 0:
+        return None, None, None
+    peak_db = 20.0 * math.log10(peak / 32768.0) if peak > 0 else -1000.0
+    rms     = math.sqrt(sum_sq / count) / 32768.0
+    rms_db  = 20.0 * math.log10(rms) if rms > 0 else -1000.0
+    return peak_db, rms_db, None
+
+
+def _loopback_probe(params):
+    """Runs in a thread (blocks ~0.5 s).
+    `params` is the dict returned by read_loopback_capture_params().
+    Returns (db, None) if the loopback is free, (None, error) if it is busy."""
+    try:
+        pcm = alsaaudio.PCM(
+            type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NONBLOCK,
+            device=params["device"], channels=params["channels"],
+            rate=params["rate"], format=params["format"], periodsize=4096,
+        )
+    except Exception as e:
+        return None, e
+
+    peak = 0.0
+    sb = params["sample_bytes"]
+    scale = 2147483648.0 if sb == 4 else 32768.0
+    fmt_char = "i" if sb == 4 else "h"
+    try:
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            length, data = pcm.read()
+            if length > 0:
+                samples = struct.unpack(f"<{len(data) // sb}{fmt_char}", data)
+                peak = max(peak, max((abs(s) for s in samples), default=0) / scale)
             else:
                 time.sleep(0.01)
     finally:
@@ -1551,105 +1619,92 @@ def _toslink_probe(params):
     return (20.0 * math.log10(peak) if peak > 0 else -1000.0), None
 
 
-def toslink_read_title_from_file(pattern):
-    """Title of the first config file matching the pattern."""
-    files = sorted(glob.glob(pattern))
-    if not files:
-        return None
-    try:
-        data = cdsp.config.read_and_parse_file(files[0])
-        return (data.get("title") or None) if isinstance(data, dict) else None
-    except Exception as e:
-        log.error("[TOSLINK] Cannot read %s: %s", files[0], e)
-        return None
-
-
 async def monitor_tv_toslink():
-    """Detect the source (TV / SQUEEZELITE) from the audio and switch config."""
+    """TOSLINK <-> SQUEEZELITE auto switching.
+
+    The config prefix (_ or |) is the single source of truth, re-read every
+    second from cdsp.config.file_path(). Manual BACK / HOMEPAGE presses are
+    therefore always honoured without any extra state.
+    """
     loop = asyncio.get_running_loop()
 
-    # Capture parameters are read once from the first '|*' YAML config
-    capture_params = read_toslink_capture_params()
-    if capture_params is None:
-        log.error("[TOSLINK] Cannot determine capture parameters, disabling detection")
+    toslink_params = read_toslink_capture_params()
+    if toslink_params is None:
+        log.error("[TOSLINK] Cannot determine capture params, detection disabled")
         return
     log.info("[TOSLINK] Capture: %s @ %d Hz, %d ch",
-             capture_params["device"], capture_params["rate"], capture_params["channels"])
+             toslink_params["device"], toslink_params["rate"],
+             toslink_params["channels"])
 
-    tv_title = toslink_read_title_from_file(CONFIG_DIR + "|*")
-    log.info("[TOSLINK] TV reference title: %r", tv_title)
+    loopback_params = read_loopback_capture_params()
+    if loopback_params is None:
+        log.error("[LOOPBACK] Cannot determine capture params, detection disabled")
+        return
+    log.info("[LOOPBACK] Capture: %s @ %d Hz, %d ch (%dB samples)",
+             loopback_params["device"], loopback_params["rate"],
+             loopback_params["channels"], loopback_params["sample_bytes"])
 
-    last_title = cdsp.config.title() or None
-    expected_title = None       # Title expected after OUR switch
-    manual_override = False
-    last_source = None
-    last_phase = None
-    silence_counter = 0
+    toslink_hits = 0
 
     while True:
         await asyncio.sleep(1.0)
         try:
-            # --- 0. Ignore transient states ---
-            state = cdsp.general.state().name
-            current_title = cdsp.config.title()
-            if state == "STARTING" or not current_title:
+            if cdsp.general.state().name == "STARTING":
                 continue
 
-            # --- 1. Watch the title for external changes ---
-            if current_title != last_title:
-                if expected_title is not None and current_title == expected_title:
-                    log.info("[TOSLINK] Script switch confirmed: %r", current_title)
-                    expected_title = None
-                else:
-                    log.info("[TOSLINK] Manual change: %r -> %r", last_title, current_title)
-                    manual_override = True
-                last_title = current_title
-
-            # --- 2. Resume when the title is back to the TV reference ---
-            if manual_override and tv_title is not None and current_title == tv_title:
-                log.info("[TOSLINK] Back on TV config, resuming")
-                manual_override = False
-                last_source = "TV"
-
-            # --- 3. Manual override: do nothing ---
-            if manual_override:
-                continue
-
-            # --- 4. Detect the source ---
-            db, err = await loop.run_in_executor(None, _toslink_probe, capture_params)
-
-            if err is None:
-                # SQUEEZELITE phase: TOSLINK free, direct reading
-                if last_phase != "SQUEEZELITE":
-                    last_phase, silence_counter = "SQUEEZELITE", 0
-                    log.info("[TOSLINK] phase: SQUEEZELITE (input available)")
-                current_source = "TV" if db >= TOSLINK_TV_ON_DB else "SQUEEZELITE"
+            path = cdsp.config.file_path() or ""
+            if path.startswith(CONFIG_DIR + '|'):
+                prefix = '|'
+            elif path.startswith(CONFIG_DIR + '_'):
+                prefix = '_'
             else:
-                # TV phase: TOSLINK held by CamillaDSP
-                if last_phase != "TV":
-                    last_phase, silence_counter = "TV", 0
-                    log.info("[TOSLINK] phase: TV (input busy: %s)", err)
+                continue
 
-                silent = silent_now   # shared value, no extra CamillaDSP request
+            if prefix == '_':
+                # _XX: TOSLINK is free -> probe it
+                peak_db, rms_db, err = await loop.run_in_executor(
+                    None, _toslink_probe, toslink_params)
 
-                if state == "STALLED":
-                    silence_counter = 0
-                    current_source = "SQUEEZELITE"
-                elif silent:
-                    silence_counter += 1
-                    current_source = ("SQUEEZELITE"
-                                      if silence_counter >= TOSLINK_SILENCE_DELAY_S else "TV")
-                else:
-                    silence_counter = 0
-                    current_source = "TV"
+                if err is not None or peak_db is None:
+                    toslink_hits = 0
+                    continue
 
-            # --- 5. Act only when the source changes ---
-            if current_source != last_source:
-                pattern = '|*' if current_source == "TV" else '_*'
-                new_title = await change_config(cdsp, CONFIG_DIR + pattern, cycle=False)
-                if new_title is not None:
-                    expected_title = new_title
-                last_source = current_source
+                crest = peak_db - rms_db
+
+                # Protection 1: peak ~= rms -> steady noise floor, ignore it
+                if crest < 2.0:
+                    toslink_hits = 0
+                    continue
+
+                if peak_db < TOSLINK_ON_DB:
+                    toslink_hits = 0
+                    continue
+
+                # Protection 2: N consecutive readings above threshold
+                toslink_hits += 1
+                if toslink_hits >= 2:
+                    log.info("[TOSLINK] TV confirmed: peak=%.1f rms=%.1f "
+                             "crest=%.1f (%d hits) -> switch to |XX + STOP LMS",
+                             peak_db, rms_db, crest, toslink_hits)
+                    await change_config(cdsp, CONFIG_DIR + '|*', cycle=False)
+                    await asyncio.to_thread(send_lms_command, "pause")
+                    toslink_hits = 0
+                    await asyncio.sleep(2.0)
+
+            else:
+                # |XX: TOSLINK captured by CamillaDSP, loopback is free
+                toslink_hits = 0
+
+                if not silent_now:
+                    continue
+
+                db, err = await loop.run_in_executor(
+                    None, _loopback_probe, loopback_params)
+                if err is None and db is not None and db >= LOOPBACK_ON_DB:
+                    log.info("[LOOPBACK] Squeezelite %.1f dB + TOSLINK silent "
+                             "-> switch to _XX", db)
+                    await change_config(cdsp, CONFIG_DIR + '_*', cycle=False)
+                    await asyncio.sleep(2.0)
 
         except Exception as e:
             log.warning("[TOSLINK] iteration failed: %s", e)
@@ -1827,8 +1882,9 @@ async def main():
             await change_config(cdsp, CONFIG_DIR + '|*', cycle=False)
         else:
             await change_config(cdsp, CONFIG_DIR + '_*', cycle=False)
-    # TOSLINK mode: nothing to do at startup, last_source = None forces a
-    # first switch on the first iteration of monitor_tv_toslink.
+    # TOSLINK mode: nothing to do at startup, the config already in place is
+    # kept (its prefix _ or | drives the very first iteration of
+    # monitor_tv_toslink).
     if ENABLE_DISPLAY:
         display_volume_info()  # change_config returns early when the config is already active
 
@@ -1839,7 +1895,6 @@ async def main():
 
     if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_CONFIG_SWITCH or ENABLE_LMS_SYNC:
         # The periodic reader of volume / mute / title, shared through vol_state
-        # (monitor_tv_toslink still reads the title by itself)
         spawn("cdsp-poller", cdsp_poller)
     if ENABLE_AUTO_POWEROFF or ENABLE_DISPLAY or SWITCH_TOSLINK:
         # Single reader of the CamillaDSP levels, shared through `silent_now`
@@ -1858,8 +1913,7 @@ async def main():
         spawn("tv-gpio", monitor_tv_gpio)
     elif SWITCH_TOSLINK:
         spawn("tv-toslink", monitor_tv_toslink)
-    
-    # MODIFICATION ICI : On lance le watcher non bloquant au lieu de bloquer sur remote_events(remote) au démarrage
+
     if ENABLE_REMOTE:
         tasks.append(asyncio.create_task(remote_watcher()))
 
@@ -1867,7 +1921,6 @@ async def main():
         await asyncio.gather(*tasks)
     else:
         await asyncio.Event().wait()
-
 
 
 if __name__ == "__main__":

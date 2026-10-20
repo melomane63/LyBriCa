@@ -84,8 +84,8 @@ otg_mode=1
 
 [all]
 dtparam=audio=off
-dtoverlay=gpio-poweroff,gpiopin=21,active_low=1
-dtoverlay=gpio-shutdown,gpio_pin=20,active_low=0,gpio_pull=down
+dtoverlay=gpio-poweroff,gpiopin=26,active_low=1
+dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down
 enable_uart=1
 
 #installed-by-lybrica

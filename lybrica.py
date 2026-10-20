@@ -704,17 +704,7 @@ def find_remote():
 
 
 remote = None
-if ENABLE_REMOTE:
-    for attempt in range(HALT_DELAY * 3600):
-        remote = find_remote()
-        if remote:
-            break
-        log.info("'%s' not found. Retrying...", REMOTE_NAME)
-        time.sleep(1)
-    if remote is None:
-        log.info("'%s' not found after %s hours. Shutting down...", REMOTE_NAME, HALT_DELAY)
-        os.system("sudo poweroff")
-        sys.exit(0)
+
 
 # CamillaDSP
 cdsp = None
@@ -1051,6 +1041,37 @@ def send_lms_command(command):
     except Exception as e:
         log.error("LMS command failed: %s", e)
         return None
+
+# ========================== REMOTE =============================
+
+
+async def remote_watcher():
+    """Tâche de fond pour détecter et connecter/reconnecter la télécommande sans bloquer le boot."""
+    global remote
+    while ENABLE_REMOTE:
+        if remote is None:
+            remote = find_remote()
+            if remote:
+                log.info("'%s' connectée avec succès !", REMOTE_NAME)
+                # Lance l'écoute des événements de la télécommande en tâche de fond
+                asyncio.create_task(supervised("remote", lambda: remote_events(remote)))
+        await asyncio.sleep(5)  # Vérifie toutes les 5 secondes si absente
+
+
+async def remote_events_loop():
+    """Boucle asynchrone de lecture des appuis sur la télécommande."""
+    global remote
+    try:
+        # Utilisation d'async_read_loop pour lire les événements evdev en asynchrone
+        async for event in remote.async_read_loop():
+            # --- INSÉREZ ICI VOTRE LOGIQUE EXISTANTE DE TRAITEMENT DES TOUCHES ---
+            # Exemple : 
+            # if event.type == evdev.ecodes.EV_KEY:
+            #     ...
+            pass
+    except Exception as e:
+        log.error("Perte de connexion avec la télécommande : %r", e)
+        remote = None  # Déclenche la reconnexion via le remote_watcher
 
 
 # ====================== DSP CONFIGURATION ======================
@@ -1832,13 +1853,16 @@ async def main():
         spawn("tv-gpio", monitor_tv_gpio)
     elif SWITCH_TOSLINK:
         spawn("tv-toslink", monitor_tv_toslink)
+    
+    # MODIFICATION ICI : On lance le watcher non bloquant au lieu de bloquer sur remote_events(remote) au démarrage
     if ENABLE_REMOTE:
-        spawn("remote", lambda: remote_events(remote))
+        tasks.append(asyncio.create_task(remote_watcher()))
 
     if tasks:
         await asyncio.gather(*tasks)
     else:
         await asyncio.Event().wait()
+
 
 
 if __name__ == "__main__":

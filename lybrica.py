@@ -1145,6 +1145,11 @@ async def change_config(cdsp, config_pattern, cycle=True):
         settings["last_config"][group] = new_key
         write_settings()
 
+    # Wait until CamillaDSP has finished loading the new config, so that
+    # cdsp.config.title() returns the NEW title (or "" if it has none),
+    # not the previous one.
+    await asyncio.sleep(0.1)
+
     display_volume_info()
     return new_config_data.get("title")
 

@@ -530,53 +530,202 @@ install_bridge() {
             || fail "Pairing failed. Retry the pairing, then rerun this step."
     fi
 
-    # 4. start_bridge.sh
+    # 4. start_bridge.sh (start / --restart / --stop / --status, optional --repeat)
     say "Creating $HOME_DIR/start_bridge.sh..."
     cat > "$HOME_DIR/start_bridge.sh" << 'EOF'
 #!/bin/sh
+#
 # start_bridge.sh - Bluetooth BLE HID bridge for piCorePlayer
-# Logs [Xs] = seconds since boot (system clock is not synced yet at boot).
+#
+# Usage:
+#   start_bridge.sh                  start if not running (idempotent, used at boot)
+#   sudo start_bridge.sh --restart   stop any running instance, then start
+#   sudo start_bridge.sh --stop      stop the running instance, do not start
+#   start_bridge.sh --status         print state and exit (exit 0 = running)
+#
+#   Add --repeat to --start/--restart to enable key auto-repeat, e.g.:
+#   sudo ./start_bridge.sh --restart --repeat
+#
+# Note: the bridge runs as root (via sudo), so --restart and --stop require
+#       root too. --start and --status work as user tc.
+#
+# Logs uptime-based timestamps ([Xs] = seconds since boot) instead of
+# `date` output, because the system clock is not synced until NTP kicks
+# in (~30-60s after boot). /proc/uptime is reliable from the first second.
+#
 
-MAC="__MAC__"
 LOG=/home/tc/pcp_startup.log
-up() { cut -d' ' -f1 /proc/uptime; }
+BRIDGE=/home/tc/hid_ble_bridge.py
+BRIDGE_PAT='/home/tc/hid_ble_bridge\.py'   # matches only OUR instance, not the official service
+MAC="__MAC__"
+PIDFILE=/home/tc/hidbridge.pid
 
-echo "=====================================" >> $LOG
-echo "[$(up)s] Bridge script starting" >> $LOG
+# Helper: print elapsed seconds since boot
+up()  { cut -d' ' -f1 /proc/uptime; }
+log() { echo "[$(up)s] $*" >> "$LOG"; }
 
-# 1. Stop the official hidbridge service (only if running)
-if ps | grep -v grep | grep -q "hid_ble_bridge.py"; then
-    echo "[$(up)s] Official service active, stopping..." >> $LOG
-    /usr/local/etc/init.d/hidbridge stop "$MAC" 2>/dev/null
-    sudo -n pkill -f "hid_ble_bridge.py --device-mac" 2>/dev/null
-    for i in $(seq 1 10); do
-        ps | grep -v grep | grep -q "hid_ble_bridge.py" || break
-        sleep 1
-    done
-fi
-
-# 2. Wait for the Bluetooth controller (max 60s)
-echo "[$(up)s] Waiting for Bluetooth controller..." >> $LOG
-for i in $(seq 1 30); do
-    if bluetoothctl show 2>/dev/null | grep -q "Powered: yes"; then
-        echo "[$(up)s] Controller ready after $((i*2))s" >> $LOG
-        break
+# Return the PID of our running bridge (sudo or python), or nothing.
+# Uses /proc instead of kill -0: as user tc, kill -0 fails on root processes.
+running_pid() {
+    if [ -r "$PIDFILE" ]; then
+        p=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] \
+           && tr '\0' ' ' < "/proc/$p/cmdline" | grep -q "$BRIDGE_PAT"; then
+            echo "$p"; return
+        fi
     fi
-    sleep 2
+    pgrep -f "$BRIDGE_PAT" 2>/dev/null | head -1
+}
+
+stop_one() {  # $1 = pid (for the log); kills sudo AND the python child
+    log "Stopping BLE bridge (pid $1)..."
+    pkill -TERM -f "$BRIDGE_PAT" 2>/dev/null
+    i=0
+    while [ "$i" -lt 10 ]; do
+        if [ -z "$(pgrep -f "$BRIDGE_PAT" 2>/dev/null)" ]; then
+            rm -f "$PIDFILE"; log "BLE bridge stopped"; return 0
+        fi
+        i=$((i + 1)); sleep 1
+    done
+    log "SIGTERM ignored after 10s, sending SIGKILL"
+    pkill -KILL -f "$BRIDGE_PAT" 2>/dev/null
+    sleep 1
+    if [ -n "$(pgrep -f "$BRIDGE_PAT" 2>/dev/null)" ]; then
+        log "ERROR: BLE bridge still alive after SIGKILL"
+        return 1
+    fi
+    rm -f "$PIDFILE"
+    log "BLE bridge killed"
+    return 0
+}
+
+prepare() {
+    # 1. Stop the official hidbridge service (only if running).
+    #    Our own instance is already handled by the caller, so any remaining
+    #    hid_ble_bridge.py process here is the official one.
+    log "Checking for official hidbridge service..."
+    if ps | grep -v grep | grep -q "hid_ble_bridge.py"; then
+        log "Service active, stopping..."
+        /usr/local/etc/init.d/hidbridge stop $MAC 2>/dev/null
+        sudo -n pkill -f "hid_ble_bridge.py --device-mac" 2>/dev/null
+
+        for i in $(seq 1 10); do
+            if ! ps | grep -v grep | grep -q "hid_ble_bridge.py"; then
+                log "Processes stopped after ${i}s."
+                break
+            fi
+            sleep 1
+        done
+    else
+        log "No active hidbridge service."
+    fi
+
+    # 2. Wait for the Bluetooth controller to be ready (max 60s)
+    log "Waiting for Bluetooth controller..."
+    for i in $(seq 1 30); do
+        if bluetoothctl show 2>/dev/null | grep -q "Powered: yes"; then
+            log "Controller ready after $((i*2))s"
+            break
+        fi
+        sleep 2
+    done
+}
+
+start_one() {
+    prepare
+    # 3. Launch the patched bridge
+    log "Launching patched BLE bridge ${EXTRA:+(options: $EXTRA)}"
+    nohup sudo -n -E python3 -u "$BRIDGE" --device-mac "$MAC" -vv $EXTRA > /dev/null 2>&1 &
+    p=$!
+    echo "$p" > "$PIDFILE"
+    sleep 1
+    if [ -d "/proc/$p" ]; then
+        log "BLE bridge launched (pid $p)"
+        return 0
+    fi
+    rm -f "$PIDFILE"
+    log "ERROR: BLE bridge exited immediately after launch"
+    return 1
+}
+
+# --- argument parsing -----------------------------------------------------
+MODE="start"
+EXTRA=""    # extra options passed to hid_ble_bridge.py
+for a in "$@"; do
+    case "$a" in
+        --start)   MODE="start" ;;
+        --restart) MODE="restart" ;;
+        --stop)    MODE="stop" ;;
+        --status)  MODE="status" ;;
+        --repeat)  EXTRA="--repeat" ;;
+        *) echo "Usage: $0 [--restart|--stop|--status] [--repeat]" >&2; exit 2 ;;
+    esac
 done
 
-# 3. Launch the bridge
-nohup sudo -n -E python3 -u /home/tc/hid_ble_bridge.py --device-mac "$MAC" -vv > /dev/null 2>&1 &
-echo "[$(up)s] Bridge launched (pid $!)" >> $LOG
+# --restart and --stop require root (the bridge runs as root).
+case "$MODE" in
+    restart|stop)
+        if [ "$(id -u)" -ne 0 ]; then
+            echo "ERROR: --$MODE requires root (the bridge runs as root)." >&2
+            echo "       Try: sudo $0 --$MODE" >&2
+            exit 1
+        fi ;;
+esac
+
+# Log a header only for action modes (not for --status, a query).
+case "$MODE" in
+    start|restart|stop)
+        echo "=====================================" >> "$LOG"
+        log "Bluetooth bridge script: mode=$MODE"
+        ;;
+esac
+
+PID=$(running_pid)
+
+case "$MODE" in
+    status)
+        if [ -n "$PID" ]; then echo "BLE bridge running (pid $PID)"; exit 0
+        else                   echo "BLE bridge not running";        exit 1
+        fi ;;
+
+    stop)
+        if [ -z "$PID" ]; then log "Nothing to stop"; exit 0; fi
+        stop_one "$PID" || exit 1
+        exit 0 ;;
+
+    start)
+        if [ -n "$PID" ]; then
+            log "BLE bridge already running (pid $PID), exiting."
+            exit 0
+        fi
+        start_one || exit 1 ;;
+
+    restart)
+        if [ -n "$PID" ]; then
+            log "Restart requested, stopping pid $PID first."
+            stop_one "$PID" || exit 1
+        else
+            log "Restart requested, but nothing was running."
+        fi
+        start_one || exit 1 ;;
+esac
 EOF
     sed -i "s/__MAC__/$MAC/" "$HOME_DIR/start_bridge.sh"
     chmod 755 "$HOME_DIR/start_bridge.sh"
     sh -n "$HOME_DIR/start_bridge.sh" || fail "Syntax error in start_bridge.sh."
 
     # 5. bootlocal.sh (idempotent, placed BEFORE pcp_startup.sh)
-    LINE="$HOME_DIR/start_bridge.sh &"
+    LINE="$HOME_DIR/start_bridge.sh --repeat &"
     if grep -qF "$LINE" "$BOOTLOCAL"; then
         say "bootlocal.sh already contains the bridge line."
+    elif grep -q "^$HOME_DIR/start_bridge.sh" "$BOOTLOCAL"; then
+        # Older install: the line exists without --repeat, update it in place
+        say "Updating the bridge line in $BOOTLOCAL (adding --repeat)..."
+        TMP=/tmp/bootlocal.new
+        # (& is special in a sed replacement: escaped as \&)
+        sed "s|^$HOME_DIR/start_bridge.sh.*|$HOME_DIR/start_bridge.sh --repeat \\&|" "$BOOTLOCAL" > $TMP
+        sudo sh -c "cat $TMP > $BOOTLOCAL" || fail "Cannot write $BOOTLOCAL."
+        rm -f $TMP
     else
         say "Adding bridge to $BOOTLOCAL..."
         TMP=/tmp/bootlocal.new
@@ -600,6 +749,10 @@ EOF
     echo
     echo "Bridge installed. Startup log: tail /home/tc/pcp_startup.log"
     echo "Bridge log: /var/log/pcp_hidbridge-$MAC.log"
+    echo "Control:    ./start_bridge.sh --status"
+    echo "            sudo ./start_bridge.sh --restart --repeat"
+    echo "            sudo ./start_bridge.sh --stop"
+    echo "Key auto-repeat is enabled at boot (--repeat in $BOOTLOCAL)."
 }
 
 ###########################################################################

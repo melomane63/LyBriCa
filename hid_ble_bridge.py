@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 BLE HID Bridge with verified keyboard and mouse state handling.
-Run:  sudo -E python3 hid_ble_bridge.py --device-mac <MAC_ADDRESS>
- or:  sudo -E python3 hid_ble_bridge.py --device-name "HID Remote01"
+Optional key auto-repeat with --repeat (default: off, same behavior as before).
+Run:  sudo -E python3 hid_ble_bridge.py --device-mac <MAC_ADDRESS> [--repeat]
+ or:  sudo -E python3 hid_ble_bridge.py --device-name "HID Remote01" [--repeat]
 """
 
 import asyncio
@@ -114,6 +115,33 @@ report_ids_present = False  # set True if Report Map declares any Report IDs
 
 # Minimum hold duration in seconds before value 2 (hold/repeat) events are triggered
 MIN_HOLD_DURATION = 0.5  # 500ms - typical hold threshold
+
+# Auto-repeat (enabled by --repeat)
+repeat_enabled = False
+REPEAT_DELAY = 0.5      # seconds before the first repeat
+REPEAT_PERIOD = 0.04    # seconds between repeats (40 ms)
+repeat_tasks = {}       # keycode -> asyncio.Task
+
+async def _repeat_key(ui: UInput, keycode: int):
+    try:
+        await asyncio.sleep(REPEAT_DELAY)
+        while True:
+            ui.write(e.EV_KEY, keycode, 2)
+            ui.syn()
+            await asyncio.sleep(REPEAT_PERIOD)
+    except asyncio.CancelledError:
+        pass
+
+def start_repeat(ui: UInput, keycode: int):
+    if not repeat_enabled:
+        return
+    stop_repeat(keycode)
+    repeat_tasks[keycode] = asyncio.get_running_loop().create_task(_repeat_key(ui, keycode))
+
+def stop_repeat(keycode: int):
+    task = repeat_tasks.pop(keycode, None)
+    if task:
+        task.cancel()
 
 observed_mouse_lengths = {}  # source - set of seen mouse payload lengths
 MOUSE_MIN_MOVEMENT_THRESHOLD = 2  # ignore tiny/noise reports for length detection
@@ -940,7 +968,8 @@ def send_momentary_key(ui: UInput, keycode: int, modifiers: set = None):
             ui.syn()
 
 
-def press(ui: UInput, keycode: int):
+def press(ui: UInput, keycode: int, repeat: bool = True):
+    """Press a key. repeat=False for modifiers (a keyboard never repeats them)."""
     if ui is not None:
         # Check if this key has remapping with key_held=0 (pass-through mode)
         if (keycode, 0) in key_remappings:
@@ -954,6 +983,8 @@ def press(ui: UInput, keycode: int):
             ui.syn()
             # Track which modifiers are active for this remapped key
             remapped_active_modifiers[keycode] = modifiers
+            if repeat:
+                start_repeat(ui, remapped_keycode)
         # Check if key has hold-time-based remapping (key_held=1 or 2)
         elif (keycode, 1) in key_remappings or (keycode, 2) in key_remappings:
             # Track press time but don't inject yet - wait for release
@@ -962,6 +993,8 @@ def press(ui: UInput, keycode: int):
             # No remapping, send as-is
             ui.write(e.EV_KEY, keycode, 1)
             ui.syn()
+            if repeat:
+                start_repeat(ui, keycode)
 
 
 def release(ui: UInput, keycode: int):
@@ -969,6 +1002,7 @@ def release(ui: UInput, keycode: int):
         # Check if this key has remapping with key_held=0 (pass-through mode)
         if (keycode, 0) in key_remappings:
             remapped_keycode, modifiers = key_remappings[(keycode, 0)]
+            stop_repeat(remapped_keycode)
             # Release the remapped key
             ui.write(e.EV_KEY, remapped_keycode, 0)
             ui.syn()
@@ -998,6 +1032,7 @@ def release(ui: UInput, keycode: int):
                     send_momentary_key(ui, remapped_keycode, modifiers)
         else:
             # No remapping, send as-is
+            stop_repeat(keycode)
             ui.write(e.EV_KEY, keycode, 0)
             ui.syn()
 
@@ -1201,7 +1236,7 @@ async def decode_hid_report_and_inject(ui_kb: UInput, ui_mouse: UInput, source: 
                     if modifiers_byte & (1 << bit):
                         current_modifiers.add(keycode)
                         if keycode not in key_states:
-                            press(ui_kb, keycode)
+                            press(ui_kb, keycode, repeat=False)
                             key_states.add(keycode)
                             actions.append(f"{key_name(keycode)} Pressed")
                     elif keycode in key_states:
@@ -1333,6 +1368,10 @@ async def cleanup(client, tasks):
     global notification_tasks, key_states, media_pressed_by_source, system_pressed_by_source, current_modifiers, key_press_times, media_press_times, system_press_times
     notification_tasks.clear()
     
+    # Stop all running auto-repeats so nothing keeps repeating after a disconnect
+    for kc in list(repeat_tasks):
+        stop_repeat(kc)
+    
     # Reset key states to prevent stuck keys after disconnect
     key_states.clear()
     media_pressed_by_source.clear()
@@ -1364,13 +1403,17 @@ async def main():
     parser.add_argument("--logfile", type=str, default=None,
                        help="Path to log file (default: /var/log/pcp_hidbridge-<device-mac>.log)")
     
+    parser.add_argument("--repeat", action="store_true",
+                        help="Generate key auto-repeat for held keys.")
+    
     # Create mutually exclusive group for triggers and remapkeys
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--triggers", type=str, help="Path to triggerhappy-style configuration file for executing commands on key events.")
     mode_group.add_argument("--remapkeys", type=str, help="Path to key remapping configuration file. Format: SOURCE_KEY:DEST_KEY:KEY_HELD (one mapping per line).")
     args = parser.parse_args()
 
-    global stop_loop, triggers, key_remappings, report_definitions, report_ids_present
+    global stop_loop, triggers, key_remappings, report_definitions, report_ids_present, repeat_enabled
+    repeat_enabled = args.repeat
 
     # Initialize logging right after parsing args
     # If device_mac is provided, use it in the filename; otherwise use generic filename

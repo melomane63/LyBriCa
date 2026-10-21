@@ -334,425 +334,76 @@ install_bridge() {
     echo " BEFORE CONTINUING:"
     echo "  - Bluetooth must be installed and enabled in piCorePlayer"
     echo "    (web interface: Tweaks page, Bluetooth section)."
-    echo "  - Do NOT pair the remote from the pCP web interface:"
-    echo "    this step pairs it itself (le_auto_pair.py)."
+    echo "  - Pair the remote from the pCP web interface after this step."
     echo "-----------------------------------------------------------------"
     echo
 
     BRIDGE_URL="https://github.com/melomane63/LyBriCa/raw/refs/heads/main/hid_ble_bridge.py"
-    PAIR_URL="https://github.com/paul-1/pcp-ble-gatt/raw/refs/heads/main/le_auto_pair.py"
 
-    # 1. Dependencies
-    # bleak: the bridge itself; dbus-python + gobject: needed by le_auto_pair.py
-    say "Installing python3.11-bleak, dbus-python3.11, py3.11gobject-mini..."
-    tce-load -wi python3.11-bleak.tcz dbus-python3.11.tcz py3.11gobject-mini.tcz || fail "tce-load failed."
+    # 1. Dependency: only bleak is needed by the patched bridge.
+    say "Installing python3.11-bleak..."
+    tce-load -wi python3.11-bleak.tcz || fail "tce-load failed."
 
-    # 2. Download scripts
-    download_script() {  # $1=url  $2=dest
-        wget -q -O "$2" "$1" || fail "Download failed: $1"
-        head -1 "$2" | grep -q '^#!' || fail "$2 is not a script (wrong URL? use the raw link)."
-        chmod 755 "$2"
-    }
-    say "Downloading scripts..."
-    download_script "$BRIDGE_URL" "$HOME_DIR/hid_ble_bridge.py"
-    download_script "$PAIR_URL"   "$HOME_DIR/le_auto_pair.py"
+    # 2. Download the patched bridge script to /home/tc/ (persistent).
+    say "Downloading hid_ble_bridge.py..."
+    wget -q -O "$HOME_DIR/hid_ble_bridge.py" "$BRIDGE_URL" \
+        || fail "Download failed: $BRIDGE_URL"
+    head -1 "$HOME_DIR/hid_ble_bridge.py" | grep -q '^#!' \
+        || fail "$HOME_DIR/hid_ble_bridge.py is not a script (wrong URL? use the raw link)."
+    chmod 755 "$HOME_DIR/hid_ble_bridge.py"
 
-    MAC=""
-    NAME=""
+    # 3, 4, 5, 7: removed (scan / pairing / start_bridge.sh / init-script patch)
 
-    # Fresh install: the remote's MAC and name are unknown, so scan for it.
-    echo "The remote can be found automatically with a Bluetooth scan (15 s):"
-    echo "  1. Put the remote in pairing mode (see its manual)."
-    echo "  2. Place it right on the Raspberry Pi: the device with the strongest"
-    echo "     signal is taken as your remote."
-    echo "  3. Keep other Bluetooth devices (phones...) away if possible."
-    echo
-    printf "Search for the remote with a Bluetooth scan? [Y/n]: "
-    read -r ANS
-    case "$ANS" in
-        n|N) ;;
-        *)
-            echo "Remote in pairing mode and placed on the Raspberry Pi?"
-            echo "Press Enter to start the scan (15 s)..."
-            read -r _
-            SCAN_OUT=/tmp/ble_scan.out
-            DEV_NAMES=/tmp/ble_names.txt
-            DEV_RSSI=/tmp/ble_rssi.txt
-            DEVLIST=/tmp/ble_devices.txt
-            DEV_RAW=/tmp/ble_rssi_raw.txt
-            ESC=$(printf '\033')
-            : > "$DEV_RAW"
-            bluetoothctl power on > /dev/null 2>&1 || true
-
-            # --- 1) Warm-up scan: primes the BLE cache, output discarded -------
-            # BlueZ loses the first advertising reports of a cold StartDiscovery,
-            # so the very first scan after idle captures almost nothing (0-1 RSSI).
-            # A short throwaway scan fixes that: the real one then sees everything.
-            echo "Warming up Bluetooth scan (5 s)..."
-            bluetoothctl --timeout 5 scan on > /dev/null 2>&1
-
-            # --- 2) Real scan ---------------------------------------------------
-            echo "Scanning (15 s)..."
-            bluetoothctl --timeout 15 scan on > "$SCAN_OUT" 2>&1
-
-            # grep -c prints the count (0 included) but exits 1 when it is 0,
-            # so "|| true" avoids a second "0" being printed.
-            N_RSSI=$(grep -c "RSSI:" "$SCAN_OUT" 2>/dev/null || true)
-            echo ">>> ${N_RSSI:-0} RSSI captured"
-
-            # --- 3) Names (after the scan, no concurrent bluetoothctl) ---------
-            bluetoothctl devices 2>/dev/null \
-                | awk '$1=="Device" { mac=$2; $1=""; $2=""; sub(/^ +/,""); print mac "\t" $0 }' > "$DEV_NAMES"
-
-            # --- 4) Parse RSSI lines from the scan ------------------------------
-            # Handles both "RSSI: -52" and "RSSI: 0xffffffcc (-52)".
-            sed "s/${ESC}\[[0-9;]*[A-Za-z]//g; s/\r//g" "$SCAN_OUT" | awk '
-                /Device [0-9A-Fa-f:]+ RSSI:/ {
-                    mac=""
-                    for (i=1; i<=NF; i++) if ($i=="Device") { mac=$(i+1); break }
-                    if (!mac) next
-                    if      (match($0, /\(-?[0-9]+\)/))        v=substr($0, RSTART+1, RLENGTH-2)+0
-                    else if (match($0, /RSSI: -?[0-9]+/))      v=substr($0, RSTART+6, RLENGTH-6)+0
-                    else next
-                    if (v==0) next
-                    print mac "\t" v
-                }' > "$DEV_RAW"
-
-            # Strongest RSSI seen per device
-            awk -F'\t' '{ if (!($1 in best) || $2+0 > best[$1]+0) best[$1]=$2 }
-                        END { for (m in best) print m "\t" best[m] }' "$DEV_RAW" > "$DEV_RSSI"
-
-            # List format: RSSI<TAB>MAC<TAB>name, strongest signal first.
-            # Without any RSSI info: all known devices ("?"), named ones first.
-            if [ -s "$DEV_RSSI" ]; then
-                awk -F'\t' 'NR==FNR { rssi[$1]=$2; next } ($1 in rssi) { print rssi[$1] "\t" $1 "\t" $2 }' \
-                    "$DEV_RSSI" "$DEV_NAMES" | sort -n -r > "$DEVLIST"
-            else
-                awk -F'\t' '{
-                    g=$1; gsub(":","-",g)
-                    if ($2==g) u[++nu]="?\t" $1 "\t" $2; else k[++nk]="?\t" $1 "\t" $2
-                } END { for (i=1;i<=nk;i++) print k[i]; for (i=1;i<=nu;i++) print u[i] }' "$DEV_NAMES" > "$DEVLIST"
-            fi
-
-            if [ -s "$DEVLIST" ]; then
-                # Auto-detect: the strongest device is used if it is close
-                # (>= -60 dBm) and clearly stronger (>= 10 dB) than the next one.
-                BEST=$(sed -n 1p "$DEVLIST")
-                BEST_RSSI=$(echo "$BEST" | cut -f1)
-                NEXT_RSSI=$(sed -n 2p "$DEVLIST" | cut -f1)
-                case "$BEST_RSSI" in
-                    ''|'?'|*[!0-9-]*) ;;
-                    *)
-                        if [ "$BEST_RSSI" -ge -60 ] && { [ -z "$NEXT_RSSI" ] || [ $((BEST_RSSI - NEXT_RSSI)) -ge 10 ]; }; then
-                            echo "Closest device: $(echo "$BEST" | cut -f2)  $(echo "$BEST" | cut -f3-)  (${BEST_RSSI} dBm)"
-                            printf "Use it? [Y/n]: "
-                            read -r OK
-                            case "$OK" in
-                                n|N) ;;
-                                *)
-                                    MAC=$(echo "$BEST" | cut -f2)
-                                    NAME=$(echo "$BEST" | cut -f3-) ;;
-                            esac
-                        fi ;;
-                esac
-
-                # Otherwise: show the list, strongest signal first
-                if [ -z "$MAC" ]; then
-                    if [ "$BEST_RSSI" = "?" ]; then
-                        echo "Devices found (no signal info available; named devices first):"
-                    else
-                        echo "Devices found (strongest signal first):"
-                    fi
-                    awk -F'\t' '{ s = ($1=="?") ? "signal unknown" : $1 " dBm"; printf "  %d) %s  %s  (%s)\n", NR, $2, $3, s }' "$DEVLIST"
-                    printf "Number of your remote (Enter = enter MAC/name manually): "
-                    read -r SEL
-                    case "$SEL" in
-                        ''|*[!0-9]*) ;;
-                        *)
-                            LINE_SEL=$(sed -n "${SEL}p" "$DEVLIST")
-                            if [ -n "$LINE_SEL" ]; then
-                                MAC=$(echo "$LINE_SEL" | cut -f2)
-                                NAME=$(echo "$LINE_SEL" | cut -f3-)
-                            else
-                                echo "Invalid number."
-                            fi ;;
-                    esac
-                fi
-                [ -n "$MAC" ] && echo "Selected: $MAC  $NAME"
-            else
-                echo "No device found (is Bluetooth enabled? is the remote in pairing mode?)."
-            fi
-            rm -f "$SCAN_OUT" "$DEV_NAMES" "$DEV_RSSI" "$DEV_RAW" "$DEVLIST" ;;
-    esac
-
-    # Manual entry if still unknown: the MAC address OR the name is enough
-    # (le_auto_pair.py accepts --device-mac or --device-name).
-    if [ -z "$MAC" ] && [ -z "$NAME" ]; then
-        echo
-        echo "Manual entry: the MAC address (e.g. AA:BB:CC:DD:EE:FF) OR the device"
-        echo "name is enough. The beginning of the name is accepted (e.g. HID Remote)."
-        printf "Remote MAC address (Enter to use the device name instead): "
-        read -r MAC
-        if [ -z "$MAC" ]; then
-            printf "Device name (a prefix is enough): "
-            read -r NAME
-        fi
-    fi
-    [ -n "$MAC" ] || [ -n "$NAME" ] || fail "A MAC address or a device name is required."
-
-    # Find the MAC of a known device from its name (prefix match, as le_auto_pair.py does)
-    resolve_mac_from_name() {  # $1 = name prefix
-        bluetoothctl devices 2>/dev/null | awk -v n="$1" '
-            $1=="Device" { mac=$2; $1=""; $2=""; sub(/^ +/,""); if (index($0,n)==1) { print mac; exit } }'
-    }
-
-    # 3. Pair the remote (skipped if already bonded)
-    # Only the name known: try to find the MAC among the devices BlueZ already knows.
-    if [ -z "$MAC" ]; then
-        MAC=$(resolve_mac_from_name "$NAME")
-    fi
-    if [ -n "$MAC" ]; then
-        say "Checking pairing for $MAC..."
-    fi
-    if [ -n "$MAC" ] && bluetoothctl info "$MAC" 2>/dev/null | grep -q "Bonded: yes"; then
-        say "Already paired and bonded."
+    # 6. Insert the symlink commands at the START of /opt/bootlocal.sh
+    #    (right after the shebang, before #pCPstart).
+    #    /usr/local/ is a tmpfs on piCorePlayer and .tcz content is mounted
+    #    there at each boot, so the symlink must be recreated at every boot
+    #    to redirect the stock script to our persistent copy in /home/tc/.
+    #    Note: section 1 may have already inserted a line after the shebang
+    #    (camilladsp-start); the block here is inserted just after the
+    #    shebang, BEFORE that line. Order between the two blocks does not
+    #    matter: hidbridge starts later, inside the #pCPstart block.
+    SYMLINK_MARK="# hid_ble_bridge.py symlink (/usr/local -> /home/tc), do not remove"
+    if grep -qF "$SYMLINK_MARK" "$BOOTLOCAL"; then
+        say "$BOOTLOCAL already contains the symlink block."
     else
-        echo "Put the remote in pairing mode, then press Enter..."
-        read -r _
-        if [ -n "$MAC" ]; then
-            "$HOME_DIR/le_auto_pair.py" --device-mac "$MAC"
+        say "Adding symlink block at the start of $BOOTLOCAL..."
+        TMP=$(mktemp)
+        BLOCK=$(mktemp)
+        {
+            echo "$SYMLINK_MARK"
+            echo "sudo rm /usr/local/bin/hid_ble_bridge.py"
+            echo "sudo ln -s /home/tc/hid_ble_bridge.py /usr/local/bin/hid_ble_bridge.py"
+            echo ""
+        } > "$BLOCK"
+
+        if head -1 "$BOOTLOCAL" | grep -q '^#!'; then
+            # Preserve the shebang as line 1, insert the block just after
+            head -1 "$BOOTLOCAL" > "$TMP"
+            cat "$BLOCK" >> "$TMP"
+            tail -n +2 "$BOOTLOCAL" >> "$TMP"
         else
-            "$HOME_DIR/le_auto_pair.py" --device-name "$NAME"
-            MAC=$(resolve_mac_from_name "$NAME")
-            [ -n "$MAC" ] || fail "Could not find the MAC address of '$NAME' after pairing."
+            cat "$BLOCK" > "$TMP"
+            cat "$BOOTLOCAL" >> "$TMP"
         fi
-        bluetoothctl info "$MAC" 2>/dev/null | grep -q "Bonded: yes" \
-            || fail "Pairing failed. Retry the pairing, then rerun this step."
-    fi
 
-    # 4. start_bridge.sh (start / --restart / --stop / --status, optional --repeat)
-    say "Creating $HOME_DIR/start_bridge.sh..."
-    cat > "$HOME_DIR/start_bridge.sh" << 'EOF'
-#!/bin/sh
-#
-# start_bridge.sh - Bluetooth BLE HID bridge for piCorePlayer
-#
-# Usage:
-#   start_bridge.sh                  start if not running (idempotent, used at boot)
-#   sudo start_bridge.sh --restart   stop any running instance, then start
-#   sudo start_bridge.sh --stop      stop the running instance, do not start
-#   start_bridge.sh --status         print state and exit (exit 0 = running)
-#
-#   Add --repeat to --start/--restart to enable key auto-repeat, e.g.:
-#   sudo ./start_bridge.sh --restart --repeat
-#
-# Note: the bridge runs as root (via sudo), so --restart and --stop require
-#       root too. --start and --status work as user tc.
-#
-# Logs uptime-based timestamps ([Xs] = seconds since boot) instead of
-# `date` output, because the system clock is not synced until NTP kicks
-# in (~30-60s after boot). /proc/uptime is reliable from the first second.
-#
-
-LOG=/home/tc/pcp_startup.log
-BRIDGE=/home/tc/hid_ble_bridge.py
-BRIDGE_PAT='/home/tc/hid_ble_bridge\.py'   # matches only OUR instance, not the official service
-MAC="__MAC__"
-PIDFILE=/home/tc/hidbridge.pid
-
-# Helper: print elapsed seconds since boot
-up()  { cut -d' ' -f1 /proc/uptime; }
-log() { echo "[$(up)s] $*" >> "$LOG"; }
-
-# Return the PID of our running bridge (sudo or python), or nothing.
-# Uses /proc instead of kill -0: as user tc, kill -0 fails on root processes.
-running_pid() {
-    if [ -r "$PIDFILE" ]; then
-        p=$(cat "$PIDFILE" 2>/dev/null)
-        if [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] \
-           && tr '\0' ' ' < "/proc/$p/cmdline" | grep -q "$BRIDGE_PAT"; then
-            echo "$p"; return
-        fi
-    fi
-    pgrep -f "$BRIDGE_PAT" 2>/dev/null | head -1
-}
-
-stop_one() {  # $1 = pid (for the log); kills sudo AND the python child
-    log "Stopping BLE bridge (pid $1)..."
-    pkill -TERM -f "$BRIDGE_PAT" 2>/dev/null
-    i=0
-    while [ "$i" -lt 10 ]; do
-        if [ -z "$(pgrep -f "$BRIDGE_PAT" 2>/dev/null)" ]; then
-            rm -f "$PIDFILE"; log "BLE bridge stopped"; return 0
-        fi
-        i=$((i + 1)); sleep 1
-    done
-    log "SIGTERM ignored after 10s, sending SIGKILL"
-    pkill -KILL -f "$BRIDGE_PAT" 2>/dev/null
-    sleep 1
-    if [ -n "$(pgrep -f "$BRIDGE_PAT" 2>/dev/null)" ]; then
-        log "ERROR: BLE bridge still alive after SIGKILL"
-        return 1
-    fi
-    rm -f "$PIDFILE"
-    log "BLE bridge killed"
-    return 0
-}
-
-prepare() {
-    # 1. Stop the official hidbridge service (only if running).
-    #    Our own instance is already handled by the caller, so any remaining
-    #    hid_ble_bridge.py process here is the official one.
-    log "Checking for official hidbridge service..."
-    if ps | grep -v grep | grep -q "hid_ble_bridge.py"; then
-        log "Service active, stopping..."
-        /usr/local/etc/init.d/hidbridge stop $MAC 2>/dev/null
-        sudo -n pkill -f "hid_ble_bridge.py --device-mac" 2>/dev/null
-
-        for i in $(seq 1 10); do
-            if ! ps | grep -v grep | grep -q "hid_ble_bridge.py"; then
-                log "Processes stopped after ${i}s."
-                break
-            fi
-            sleep 1
-        done
-    else
-        log "No active hidbridge service."
-    fi
-
-    # 2. Wait for the Bluetooth controller to be ready (max 60s)
-    log "Waiting for Bluetooth controller..."
-    for i in $(seq 1 30); do
-        if bluetoothctl show 2>/dev/null | grep -q "Powered: yes"; then
-            log "Controller ready after $((i*2))s"
-            break
-        fi
-        sleep 2
-    done
-}
-
-start_one() {
-    prepare
-    # 3. Launch the patched bridge
-    log "Launching patched BLE bridge ${EXTRA:+(options: $EXTRA)}"
-    nohup sudo -n -E python3 -u "$BRIDGE" --device-mac "$MAC" -vv $EXTRA > /dev/null 2>&1 &
-    p=$!
-    echo "$p" > "$PIDFILE"
-    sleep 1
-    if [ -d "/proc/$p" ]; then
-        log "BLE bridge launched (pid $p)"
-        return 0
-    fi
-    rm -f "$PIDFILE"
-    log "ERROR: BLE bridge exited immediately after launch"
-    return 1
-}
-
-# --- argument parsing -----------------------------------------------------
-MODE="start"
-EXTRA=""    # extra options passed to hid_ble_bridge.py
-for a in "$@"; do
-    case "$a" in
-        --start)   MODE="start" ;;
-        --restart) MODE="restart" ;;
-        --stop)    MODE="stop" ;;
-        --status)  MODE="status" ;;
-        --repeat)  EXTRA="--repeat" ;;
-        *) echo "Usage: $0 [--restart|--stop|--status] [--repeat]" >&2; exit 2 ;;
-    esac
-done
-
-# --restart and --stop require root (the bridge runs as root).
-case "$MODE" in
-    restart|stop)
-        if [ "$(id -u)" -ne 0 ]; then
-            echo "ERROR: --$MODE requires root (the bridge runs as root)." >&2
-            echo "       Try: sudo $0 --$MODE" >&2
-            exit 1
-        fi ;;
-esac
-
-# Log a header only for action modes (not for --status, a query).
-case "$MODE" in
-    start|restart|stop)
-        echo "=====================================" >> "$LOG"
-        log "Bluetooth bridge script: mode=$MODE"
-        ;;
-esac
-
-PID=$(running_pid)
-
-case "$MODE" in
-    status)
-        if [ -n "$PID" ]; then echo "BLE bridge running (pid $PID)"; exit 0
-        else                   echo "BLE bridge not running";        exit 1
-        fi ;;
-
-    stop)
-        if [ -z "$PID" ]; then log "Nothing to stop"; exit 0; fi
-        stop_one "$PID" || exit 1
-        exit 0 ;;
-
-    start)
-        if [ -n "$PID" ]; then
-            log "BLE bridge already running (pid $PID), exiting."
-            exit 0
-        fi
-        start_one || exit 1 ;;
-
-    restart)
-        if [ -n "$PID" ]; then
-            log "Restart requested, stopping pid $PID first."
-            stop_one "$PID" || exit 1
-        else
-            log "Restart requested, but nothing was running."
-        fi
-        start_one || exit 1 ;;
-esac
-EOF
-    sed -i "s/__MAC__/$MAC/" "$HOME_DIR/start_bridge.sh"
-    chmod 755 "$HOME_DIR/start_bridge.sh"
-    sh -n "$HOME_DIR/start_bridge.sh" || fail "Syntax error in start_bridge.sh."
-
-    # 5. bootlocal.sh (idempotent, placed BEFORE pcp_startup.sh)
-    LINE="$HOME_DIR/start_bridge.sh --repeat &"
-    if grep -qF "$LINE" "$BOOTLOCAL"; then
-        say "bootlocal.sh already contains the bridge line."
-    elif grep -q "^$HOME_DIR/start_bridge.sh" "$BOOTLOCAL"; then
-        # Older install: the line exists without --repeat, update it in place
-        say "Updating the bridge line in $BOOTLOCAL (adding --repeat)..."
-        TMP=/tmp/bootlocal.new
-        # (& is special in a sed replacement: escaped as \&)
-        sed "s|^$HOME_DIR/start_bridge.sh.*|$HOME_DIR/start_bridge.sh --repeat \\&|" "$BOOTLOCAL" > $TMP
+        rm -f "$BLOCK"
         sudo sh -c "cat $TMP > $BOOTLOCAL" || fail "Cannot write $BOOTLOCAL."
-        rm -f $TMP
-    else
-        say "Adding bridge to $BOOTLOCAL..."
-        TMP=/tmp/bootlocal.new
-        N=$(grep -n '^#pCPstart' "$BOOTLOCAL" | head -1 | cut -d: -f1)
-        if [ -n "$N" ]; then
-            head -n $((N-1)) "$BOOTLOCAL" > $TMP
-            echo "$LINE" >> $TMP
-            tail -n +"$N" "$BOOTLOCAL" >> $TMP
-        else
-            cp "$BOOTLOCAL" $TMP
-            echo "$LINE" >> $TMP
-        fi
-        sudo sh -c "cat $TMP > $BOOTLOCAL" || fail "Cannot write $BOOTLOCAL."
-        rm -f $TMP
+        rm -f "$TMP"
+
+        grep -q "opt/bootlocal.sh" /opt/.filetool.lst \
+            || echo "opt/bootlocal.sh" >> /opt/.filetool.lst
     fi
 
-    # 6. Save
+    # 7. Save
     say "Saving with pcp bu..."
     pcp bu
 
     echo
-    echo "Bridge installed. Startup log: tail /home/tc/pcp_startup.log"
-    echo "Bridge log: /var/log/pcp_hidbridge-$MAC.log"
-    echo "Control:    ./start_bridge.sh --status"
-    echo "            sudo ./start_bridge.sh --restart --repeat"
-    echo "            sudo ./start_bridge.sh --stop"
-    echo "Key auto-repeat is enabled at boot (--repeat in $BOOTLOCAL)."
+    echo "Bridge installed."
+    echo "Reboot to activate the symlink:  pcp reboot"
+    echo "After reboot:"
+    echo "  /usr/local/bin/hid_ble_bridge.py -> /home/tc/hid_ble_bridge.py"
 }
 
 ###########################################################################

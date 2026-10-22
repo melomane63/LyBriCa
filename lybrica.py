@@ -615,9 +615,10 @@ def blank_display():
     clear_display()
     display_is_off = True
 
+
 def is_silent():
     """Silence detection: RMS threshold, then crest factor (peak vs RMS).
-    A steady noise floor has peak  ^i^h RMS; real audio does not."""
+    A steady noise floor has peak ≈ RMS; real audio does not."""
     RMS_DB = -80.0        # RMS below this -> silence
     CREST_MIN_DB = 2.0    # crest (peak - RMS) below this -> steady noise, not audio
 
@@ -857,6 +858,13 @@ def load_prev_values(saved=None):
         prev_values[key] = saved_prev.get(key, default)
 
 
+def is_complete_config(cfg):
+    """True si cfg a la section obligatoire 'devices' non vide.
+    CamillaDSP rejette toute config sans 'devices'."""
+    return (isinstance(cfg, dict)
+            and isinstance(cfg.get("devices"), dict)
+            and bool(cfg["devices"]))
+
 def init_tone():
     """Apply the saved tone of the config CamillaDSP started with."""
     global current_config_key
@@ -866,7 +874,7 @@ def init_tone():
     current_config_key = config_key(path)
     saved = settings["configs"].get(current_config_key)
     load_prev_values(saved)
-    if saved:
+    if saved and is_complete_config(config_active):
         filters = config_active.get("filters")
         apply_tone(filters if isinstance(filters, dict) else {}, saved)
         cdsp.config.set_active(config_active)
@@ -1204,7 +1212,7 @@ def resync_after_reconnect():
     current_config_key = config_key(path) if path else None
     saved = settings["configs"].get(current_config_key) if current_config_key else None
     load_prev_values(saved)
-    if TONE_ACTIVE and saved:
+    if TONE_ACTIVE and saved and is_complete_config(config_active):
         filters = config_active.get("filters")
         apply_tone(filters if isinstance(filters, dict) else {}, saved)
         cdsp.config.set_active(config_active)

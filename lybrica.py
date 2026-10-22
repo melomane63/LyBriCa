@@ -615,11 +615,26 @@ def blank_display():
     clear_display()
     display_is_off = True
 
-
 def is_silent():
-    levels = cdsp.levels.capture_rms()
-    values = list(levels.values()) if isinstance(levels, dict) else list(levels)
-    return bool(values) and all(float(v) <= -100.0 for v in values)
+    """Silence detection: RMS threshold, then crest factor (peak vs RMS).
+    A steady noise floor has peak  ^i^h RMS; real audio does not."""
+    RMS_DB = -80.0        # RMS below this -> silence
+    CREST_MIN_DB = 2.0    # crest (peak - RMS) below this -> steady noise, not audio
+
+    rms = cdsp.levels.capture_rms()
+    peak = cdsp.levels.capture_peak()
+    rms_vals = list(rms.values()) if isinstance(rms, dict) else list(rms)
+    peak_vals = list(peak.values()) if isinstance(peak, dict) else list(peak)
+    if not rms_vals or not peak_vals:
+        return True
+
+    rms_db = max(float(v) for v in rms_vals)
+    if rms_db <= RMS_DB:                            # below threshold: silence
+        return True
+
+    peak_db = max(float(v) for v in peak_vals)
+    return (peak_db - rms_db) < CREST_MIN_DB        # steady noise: silence
+
 
 def shutdown_system():
     """Cut the power relay (if managed) and halt the Raspberry Pi."""

@@ -3,6 +3,7 @@
 # install_pcp.sh - All-in-one installer for piCorePlayer (menu)
 #
 #   1) CamillaDSP 5.x + CamillaGUI  (Squeezelite -> loopback -> CamillaDSP -> DAC)
+#                                   installed as the piCoreCDSP.tcz extension
 #   2) Bridge BLE HID               (Bluetooth remote)
 #   3) LyBriCa                      (modules Python, daemon)
 #   4) ESP32C3                      (UART + GPIO overlays)
@@ -31,14 +32,23 @@ say()  { echo "==> $*"; }
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
 ###########################################################################
-# 1) CAMILLADSP
+# 1) CAMILLADSP  (extension version)
+#
+# Layout:
+#   piCoreCDSP.tcz (read-only, rebuilt at each run)
+#     /usr/local/bin/camilladsp
+#     /usr/local/camillagui/camillagui        (+ symlink config -> $BASE/camillagui/config)
+#     /usr/local/tce.installed/piCoreCDSP     (start script, run as root)
+#   /mnt/mmcblk0p2/tce/camilladsp (persistent data, outside the extension)
+#     configs/ coeffs/ default_config.yml camilladsp_statefile.yml
+#     camillagui/config/ (camillagui.yml, gui-config.yml)
 ###########################################################################
 install_camilladsp() {
 set -e
 
 ### ======================= CONFIG ==========================================
 CDSP_VER="5.0.0-beta.2"          # CamillaDSP version
-GUI_VER="5.0.0-beta.2"           # camillagui-backend version (bundle)
+GUI_VER="5.0.0-beta.2"           # camillagui-backend version
 DAC_FROM_PCP="yes"               # "yes": take the DAC from OUTPUT in pcp.cfg (read BEFORE it is switched to the loopback)
 DAC_DEVICE="null"                # fallback DAC: ALSA "null" output (silence); replace with the real DAC (e.g. hw:CARDNAME,0, see /proc/asound/cards)
 SAMPLERATE=48000                 # fixed pipeline sample rate
@@ -88,8 +98,8 @@ if [ "$DAC_FROM_PCP" = "yes" ] && [ -r "$PCP_CFG" ]; then
 fi
 
 BASE=/mnt/mmcblk0p2/tce/camilladsp
-GUI_DIR=$BASE/camillagui
 TMPDIR_CDSP=/tmp/install_camilladsp
+OPT=/etc/sysconfig/tcedir/optional
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -100,9 +110,7 @@ if [ "$AVAILABLE_MB" -le "$REQUIRED_MB" ]; then
     die "Not enough space (${AVAILABLE_MB} MB). Enlarge the partition: Main Page > Additional functions > Resize FS"
 fi
 
-if [ -f /etc/sysconfig/tcedir/optional/piCoreCDSP.tcz ]; then
-    die "The piCoreCDSP extension is installed: uninstall it and reboot before continuing."
-fi
+# (No more refusal if piCoreCDSP.tcz exists: it is simply replaced.)
 
 if [ -d "$TMPDIR_CDSP" ]; then
     die "Reboot before re-running ($TMPDIR_CDSP already exists)."
@@ -123,17 +131,30 @@ install_if_missing() {
     fi
 }
 
+# Same, but temporary: downloaded to /tmp, gone after the next reboot.
+install_temporarily_if_missing() {
+    if ! tce-status -i | grep -q "$1" ; then
+        pcp-load -wil -t /tmp "$1"
+    fi
+}
+
 set -v
 
 ### --- 1. Directories and CamillaDSP binary --------------------------------
-mkdir -p "$BASE/configs" "$BASE/coeffs"
-cd "$BASE"
+EXT="$TMPDIR_CDSP/ext"
+mkdir -p "$EXT/usr/local/bin" "$EXT/usr/local/camillagui" "$EXT/usr/local/tce.installed"
+CDSP_BIN="$EXT/usr/local/bin/camilladsp"
+
+# Persistent data (outside the extension)
+mkdir -p "$BASE/configs" "$BASE/coeffs" "$BASE/camillagui/config"
+
+cd "$TMPDIR_CDSP"
 wget -O camilladsp.tar.gz \
     "https://github.com/HEnquist/camilladsp/releases/download/v${CDSP_VER}/camilladsp-linux-${ARCH_SUFFIX}.tar.gz"
-tar -xzf camilladsp.tar.gz
+tar -xzf camilladsp.tar.gz -C "$EXT/usr/local/bin"
 rm -f camilladsp.tar.gz
-chmod +x "$BASE/camilladsp"
-"$BASE/camilladsp" --version
+chmod +x "$CDSP_BIN"
+"$CDSP_BIN" --version
 
 ### --- 2. Module ALSA loopback ---------------------------------------------
 if ! sudo modprobe snd-aloop 2>/dev/null; then
@@ -172,10 +193,11 @@ pipeline:
   - type: Filter
     channels: [0, 1]
     names: [gain0]
+title: Setup
 EOF
 cp "$BASE/configs/loopback.yml" "$BASE/default_config.yml"
 
-if "$BASE/camilladsp" -c "$BASE/configs/loopback.yml"; then
+if "$CDSP_BIN" -c "$BASE/configs/loopback.yml"; then
     echo ">>> Config loopback.yml: valid."
 else
     echo "!!! WARNING: CamillaDSP considers loopback.yml invalid (see message above)."
@@ -224,77 +246,106 @@ volume:
 - 0.0
 EOF
 
-### --- 4. CamillaGUI (self-contained bundle) -------------------------------
-# Upgrade: save the existing GUI config files before the folder is wiped.
-# (Fresh install: nothing exists yet, so nothing is saved.)
-if [ -d "$GUI_DIR" ]; then
-    OLD_FILES=$(find "$GUI_DIR" -type f \( -path '*/config/camillagui.yml' -o -path '*/config/gui-config.yml' \) 2>/dev/null || true)
-    if [ -n "$OLD_FILES" ]; then
-        GUI_BACKUP="$BASE/camillagui_backup_$(date +%Y%m%d-%H%M%S)"
-        mkdir -p "$GUI_BACKUP"
-        for f in $OLD_FILES; do cp "$f" "$GUI_BACKUP/"; done
-        echo ">>> Existing GUI config saved in $GUI_BACKUP"
-    fi
-fi
-
-rm -rf "$GUI_DIR"
-mkdir -p "$GUI_DIR"
-cd "$GUI_DIR"
-
+### --- 4. CamillaGUI (single executable) -----------------------------------
+GUI_BIN="$EXT/usr/local/camillagui/camillagui"
 case "$ARCH_SUFFIX" in
     aarch64) GUI_ARCH="aarch64" ;;
     *)       GUI_ARCH="armv7" ;;
 esac
-BUNDLE_URL="https://github.com/HEnquist/camillagui-backend/releases/download/v${GUI_VER}/camillagui_linux_${GUI_ARCH}.tar.gz"
+GUI_ASSET="camillagui_linux_${GUI_ARCH}.tar.gz"
+GUI_URL="https://github.com/HEnquist/camillagui-backend/releases/download/v${GUI_VER}/${GUI_ASSET}"
 
-echo ">>> Bundle: $BUNDLE_URL"
-wget -O camillagui_bundle.tar.gz "$BUNDLE_URL" || die "GUI bundle download failed: $BUNDLE_URL"
-tar -xzf camillagui_bundle.tar.gz
-rm -f camillagui_bundle.tar.gz
+echo ">>> GUI: $GUI_URL"
+GUI_TMP="$TMPDIR_CDSP/gui"
+mkdir -p "$GUI_TMP"
+wget -O "$TMPDIR_CDSP/camillagui.tar.gz" "$GUI_URL" || die "GUI download failed: $GUI_URL"
+tar -xzf "$TMPDIR_CDSP/camillagui.tar.gz" -C "$GUI_TMP"
+rm -f "$TMPDIR_CDSP/camillagui.tar.gz"
 
-GUI_BIN=$(find "$GUI_DIR" -type f -name camillagui | head -n 1)
-[ -n "$GUI_BIN" ] || die "camillagui executable not found in the bundle."
+GUI_FOUND=$(find "$GUI_TMP" -type f -name camillagui | head -n 1)
+[ -n "$GUI_FOUND" ] || die "camillagui executable not found in the archive."
+cp "$GUI_FOUND" "$GUI_BIN"
 chmod +x "$GUI_BIN"
-( cd "$(dirname "$GUI_BIN")" && ./camillagui --help > /dev/null ) \
-    || die "The bundle does not run on this system (glibc?)."
 
-GUI_ROOT=$(dirname "$GUI_BIN")
-GUI_CFG="$GUI_ROOT/config/camillagui.yml"
+# If the archive ships a default gui-config.yml, use it only when none exists yet
+GUI_CFG_FOUND=$(find "$GUI_TMP" -type f -name gui-config.yml | head -n 1)
+if [ -n "$GUI_CFG_FOUND" ] && [ ! -f "$BASE/camillagui/config/gui-config.yml" ]; then
+    cp "$GUI_CFG_FOUND" "$BASE/camillagui/config/gui-config.yml"
+fi
 
-# camillagui.yml and gui-config.yml shipped with the bundle are kept as-is.
+( cd "$BASE/camillagui" && "$GUI_BIN" --help > /dev/null ) \
+    || die "The GUI executable does not run on this system."
 
-### --- 5. Startup script ---------------------------------------------------
-cat > "$BASE/start_camilladsp.sh" <<EOF
+# camillagui.yml is rewritten each time (fixed paths).
+# gui-config.yml is NOT touched: the GUI settings survive an update.
+cat > "$BASE/camillagui/config/camillagui.yml" <<EOF
+---
+camilla_host: "127.0.0.1"
+camilla_port: 1234
+bind_address: "0.0.0.0"
+port: 5000
+ssl_certificate: null
+ssl_private_key: null
+gui_config_file: null
+config_dir: "$BASE/configs"
+coeff_dir: "$BASE/coeffs"
+default_config: "$BASE/default_config.yml"
+statefile_path: "$BASE/camilladsp_statefile.yml"
+log_file: "/tmp/camilladsp.log"
+on_set_active_config: null
+on_get_active_config: null
+supported_capture_types: ["Alsa", "Stdin"]
+supported_playback_types: ["Alsa"]
+EOF
+
+# Symlink inside the extension: works whether the GUI looks for config/
+# next to its executable or in the current directory.
+ln -s "$BASE/camillagui/config" "$EXT/usr/local/camillagui/config"
+
+### --- 5. Startup script (run as root when the extension is loaded) --------
+cat > "$EXT/usr/local/tce.installed/piCoreCDSP" <<'EOF'
 #!/bin/sh
-# Starts CamillaDSP then CamillaGUI (called from /opt/bootlocal.sh, as root)
+# Starts CamillaDSP then CamillaGUI (run as root by the extension loader)
 
 BASE=/mnt/mmcblk0p2/tce/camilladsp
 
 # Load the ALSA loopback module before Squeezelite starts
 modprobe snd-aloop
 
-# CamillaDSP: runs as root (inherited from bootlocal.sh) so that its audio
-# threads can get real-time priority (SCHED_FIFO).
-"\$BASE/camilladsp" \\
-    -w -p 1234 -a 0.0.0.0 \\
-    -o /tmp/camilladsp.log \\
-    -s "\$BASE/camilladsp_statefile.yml" &
+# CamillaDSP: runs as root so that its audio threads can get real-time
+# priority (SCHED_FIFO).
+/usr/local/bin/camilladsp \
+    -p 1234 -a 0.0.0.0 \
+    -o /tmp/camilladsp.log \
+    -s "$BASE/camilladsp_statefile.yml" &
 
-# CamillaGUI: no real-time priority needed, runs as tc from its own directory
-sudo -u tc sh -c "cd '\$BASE/camillagui' && ./camillagui" &
+# CamillaGUI: no real-time priority needed, runs as tc from the persistent folder
+sudo -u tc sh -c "cd '$BASE/camillagui' && /usr/local/camillagui/camillagui" &
 
 exit 0
 EOF
-chmod +x "$BASE/start_camilladsp.sh"
+chmod 775 "$EXT/usr/local/tce.installed/piCoreCDSP"
 
-### --- 6. Auto-start via bootlocal.sh --------------------------------------
-# snd-aloop must be loaded BEFORE Squeezelite starts: insert the line at the
-# top of the file (right after the shebang), once.
-MARK="# camilladsp-start"
-if ! grep -q "$MARK" /opt/bootlocal.sh; then
-    sudo sed -i "1a $BASE/start_camilladsp.sh $MARK" /opt/bootlocal.sh
+### --- 6. Build and register the extension ---------------------------------
+install_temporarily_if_missing squashfs-tools
+TCZ="$TMPDIR_CDSP/piCoreCDSP.tcz"
+mksquashfs "$EXT" "$TCZ" -noappend -all-root
+mv -f "$TCZ" "$OPT/piCoreCDSP.tcz"
+
+# Make sure the kernel modules (snd-aloop) are loaded before our script runs
+ALSA_EXT="alsa-modules-$(uname -r).tcz"
+if [ -f "$OPT/$ALSA_EXT" ]; then
+    echo "$ALSA_EXT" > "$OPT/piCoreCDSP.tcz.dep"
+else
+    echo "!!! WARNING: $OPT/$ALSA_EXT not found: no .dep written, check that snd-aloop is loaded early enough."
 fi
-grep -q "opt/bootlocal.sh" /opt/.filetool.lst || echo "opt/bootlocal.sh" >> /opt/.filetool.lst
+
+grep -qx "piCoreCDSP.tcz" /etc/sysconfig/tcedir/onboot.lst \
+    || echo "piCoreCDSP.tcz" >> /etc/sysconfig/tcedir/onboot.lst
+
+# Migration: remove the old bootlocal.sh start and the old loose files
+sudo sed -i '/# camilladsp-start/d' /opt/bootlocal.sh
+rm -f "$BASE/start_camilladsp.sh" "$BASE/camilladsp" "$BASE/camillagui/camillagui"
 
 ### --- 7. Squeezelite -> loopback ------------------------------------------
 # Replace VAR="value" if the key exists in pcp.cfg; otherwise warn
@@ -319,9 +370,11 @@ pcp backup
 
 set +v
 echo ""
-echo "CamillaDSP installed."
+echo "CamillaDSP extension installed (piCoreCDSP.tcz). Reboot to start it."
 echo "Web interface: http://pcp.local:5000/gui/index.html"
-echo "After reboot, check real-time priority with:"
+echo "After reboot, check:"
+echo "  tce-status -i | grep piCoreCDSP"
+echo "  pidof camilladsp camillagui"
 echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): \$(chrt -p \$(basename \$t) | head -1)\"; done"
 }
 
@@ -359,10 +412,6 @@ install_bridge() {
     #    /usr/local/ is a tmpfs on piCorePlayer and .tcz content is mounted
     #    there at each boot, so the symlink must be recreated at every boot
     #    to redirect the stock script to our persistent copy in /home/tc/.
-    #    Note: section 1 may have already inserted a line after the shebang
-    #    (camilladsp-start); the block here is inserted just after the
-    #    shebang, BEFORE that line. Order between the two blocks does not
-    #    matter: hidbridge starts later, inside the #pCPstart block.
     SYMLINK_MARK="# hid_ble_bridge.py symlink (/usr/local -> /home/tc), do not remove"
     if grep -qF "$SYMLINK_MARK" "$BOOTLOCAL"; then
         say "$BOOTLOCAL already contains the symlink block."

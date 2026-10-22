@@ -727,6 +727,7 @@ config_active = {}
 if NEED_CDSP:
     cdsp = CamillaClient(*CAMILLA_ADDR)
     cdsp.connect()
+    cdsp.general.reload()
     # Protection 1: never let config_active be None at startup
     config_active = cdsp.config.active() or {}
 

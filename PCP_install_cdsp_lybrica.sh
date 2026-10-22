@@ -315,7 +315,7 @@ modprobe snd-aloop
 # CamillaDSP: runs as root so that its audio threads can get real-time
 # priority (SCHED_FIFO).
 /usr/local/bin/camilladsp \
-    -p 1234 -a 0.0.0.0 \
+    -w -p 1234 -a 0.0.0.0 \
     -o /tmp/camilladsp.log \
     -s "$BASE/camilladsp_statefile.yml" &
 

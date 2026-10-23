@@ -804,6 +804,7 @@ EOF
     say "Configuring ESP32C3 (config.txt overlays)..."
     configure_esp32c3
     ESP_RC=$?
+    rm -f /home/tc/pcp-powerbutton.sh
     case "$ESP_RC" in
         0)                ESP32_STATUS="applied (reboot needed)" ;;
         "$SKIP_RC")       ESP32_STATUS="cancelled" ;;

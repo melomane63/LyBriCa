@@ -1052,10 +1052,10 @@ summary() {
 while true; do
     echo
     echo "=============================================="
-    echo "  piCorePlayer installer"
+    echo "  CamillaDSP installer for piCorePlayer "
     echo "=============================================="
     echo "  1) CamillaDSP + CamillaGUI"
-    echo "  2) LyBriCa + BLE HID bridge + ESP32C3 (remote)"
+    echo "  2) LyBriCa + ESP32C3 "
     echo "  R) Reboot now"
     echo "  Q) Quit"
     echo "----------------------------------------------"

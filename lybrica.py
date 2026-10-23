@@ -19,29 +19,24 @@ from camilladsp import CamillaClient
 # Each block can be switched off. A disabled block is never started, and the
 # hardware libraries it needs are neither imported nor required.
 
-ENABLE_LMS_SYNC      = True   # LMS <-> CamillaDSP volume bridge (asyncio task)
-ENABLE_AUTO_POWEROFF = True   # Power relay: off after silence, on with sound,
-                              # halt after HALT_DELAY, relay toggle on POWER long press
-ENABLE_REMOTE        = True   # Remote control (all keys: volume, mute, LMS, BACK,
-                              # HOMEPAGE, POWER). If False, no key works at all.
-ENABLE_DISPLAY       = True   # TM1637 display + ambient light sensor
-                              # (the tone / tilt / loudness keys need it)
-ENABLE_CONFIG_SWITCH = "toslink" # Auto config switching: False | "gpio" | "toslink"
-                              #   False     : disabled
-                              #   "gpio"    : TV GPIO (original logic)
-                              #   "toslink" : audio detection on the TOSLINK input
-                              # (BACK / HOMEPAGE keys do NOT depend on this)
+ENABLE_LMS_SYNC       = True   # LMS <-> CamillaDSP volume bridge (asyncio task)
+ENABLE_AUTO_POWEROFF  = True   # Power relay: off after silence, on with sound,
+                               # halt after HALT_DELAY, relay toggle on POWER long press
+ENABLE_REMOTE         = True   # Remote control (all keys: volume, mute, LMS, BACK,
+                               # HOMEPAGE, POWER). If False, no key works at all.
+ENABLE_DISPLAY        = True   # TM1637 display + ambient light sensor
+                               # (the tone / tilt / loudness keys need it)
+ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input
+                               # (BACK / HOMEPAGE keys do NOT depend on this)
 
-if ENABLE_CONFIG_SWITCH not in (False, "gpio", "toslink"):
-    raise ValueError(f"Invalid ENABLE_CONFIG_SWITCH: {ENABLE_CONFIG_SWITCH!r}")
+# At least one feature must be enabled, otherwise the script has nothing to do
+if not (ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_AUTO_POWEROFF
+        or ENABLE_TOSLINK_SWITCH or ENABLE_LMS_SYNC):
+    raise ValueError("No feature enabled: turn on at least one option in the FEATURES block")
 
 # Derived from the switches above (do not edit)
-SWITCH_GPIO    = ENABLE_CONFIG_SWITCH == "gpio"
-SWITCH_TOSLINK = ENABLE_CONFIG_SWITCH == "toslink"
-NEED_CDSP    = (ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_AUTO_POWEROFF
-                or bool(ENABLE_CONFIG_SWITCH) or ENABLE_LMS_SYNC)
-TONE_ACTIVE  = ENABLE_REMOTE or bool(ENABLE_CONFIG_SWITCH)   # tone is saved / restored per config
-USE_GPIO     = ENABLE_AUTO_POWEROFF or SWITCH_GPIO           # TOSLINK detection needs no GPIO
+TONE_ACTIVE = ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH   # tone is saved / restored per config
+USE_GPIO    = ENABLE_AUTO_POWEROFF                     # TOSLINK detection needs no GPIO
 
 
 if ENABLE_REMOTE:
@@ -51,7 +46,7 @@ if ENABLE_DISPLAY:
     from tm1637_lgpio import TM1637
 if USE_GPIO:
     import lgpio
-if SWITCH_TOSLINK:
+if ENABLE_TOSLINK_SWITCH:
     import alsaaudio
 
 
@@ -62,6 +57,77 @@ log = logging.getLogger("remote")
 # ========================= SETTINGS =========================
 # Everything you may want to change is here, grouped by topic.
 # (The on/off switches are in the FEATURES block above.)
+
+
+# ---------------------- CamillaDSP ----------------------
+CAMILLA_ADDR = ("127.0.0.1", 1234)  # CamillaDSP on this Pi (must stay local: loopback audio)
+
+# CamillaDSP polling: one shared reader (cdsp_poller) publishes into
+# `vol_state`; display/resync and the LMS bridge subscribe to it.
+POLL_INTERVAL_S = 0.25      # One read cycle of CamillaDSP (volume + mute)
+TITLE_EVERY = 2             # The config title is read every N cycles (2 -> every 0.5 s)
+CDSP_RECONNECT_DELAY_S = 2.0    # Seconds to wait before trying to reconnect to CamillaDSP after an error
+
+
+# ---------------------- Logitech Media Server ----------------------
+# LMS CLI (Command Line Interface). Default: same Pi, port 9090 (not the
+# web UI 9000, not SLIM 3483). Used by the volume bridge and by send_lms_command().
+LMS_ADDR = ("127.0.0.1", 9090)
+
+# LMS player to sync. "" = auto (MAC of the Pi's default network interface,
+# as Squeezelite announces it). Set manually if auto-detect picks the wrong
+# interface or LMS uses a different MAC. Format: raw lowercase MAC.
+LMS_PLAYER_MANUAL = ""
+
+LMS_SYNC_DEBUG = False           # Log every volume/mute change and the raw LMS notifications
+
+
+# ---------------------- LMS <-> CamillaDSP bridge ----------------------
+# These four settings only drive the volume-sync bridge (LmsBridge and
+# lms_bridge_task). They are ignored if ENABLE_LMS_SYNC is False.
+
+LMS_COALESCE_S = 0.05        # Merge bursts of LMS volume changes: at most one write
+                             # to CamillaDSP per this delay (0 = write immediately)
+LMS_RESTORE_WINDOW_S = 0.5   # After an unmute, LMS may briefly announce a wrong volume:
+                             # the bridge corrects it during this window (seconds)
+LMS_CONNECT_TIMEOUT_S = 5    # Timeout for connecting to the LMS CLI (seconds)
+LMS_RETRY_S = 5              # Delay before the bridge restarts after an error (seconds)
+
+
+# ---------------------- Power ----------------------
+
+POWER_GPIO = 4              # GPIO controlling the power relay
+POWER_OFF_DELAY = 2         # Minutes of silence before the power relay is switched off
+HALT_DELAY = 48             # Hours of silence (or without remote) before the Raspberry Pi shuts down
+
+
+# ---------------------- TOSLINK auto switching ----------------------
+# Automatic switch between the streamer config ("_*") and the TV config
+# ("|*"), based on what is actually playing:
+#
+#   "_*" active: TOSLINK audio detected -> switch to "|*" and pause LMS
+#   "|*" active: TOSLINK silent + loopback audio -> switch back to "_*"
+#
+# Capture params come from the first file of each group: all files in a
+# group must share the same capture input.
+
+TOSLINK_ON_DB  = -40.0   # TOSLINK peak level (dBFS) above which audio is considered present
+LOOPBACK_ON_DB = -50.0   # Loopback peak level (dBFS) above which Squeezelite is considered playing
+
+
+# ---------------------- Display ----------------------
+
+CLK, DIO = 23, 24           # TM1637 display pins
+SCREEN_RETURN_DELAY = 30    # Seconds without key press before returning to the volume screen
+POWER_MSG_DURATION = 1.5    # Seconds PW ON / PW OFF stays on the display
+
+
+# Ambient light sensor (ADC) -> display brightness
+SERIAL_PORT = "/dev/serial0"
+BAUD_RATE = 115200
+ADC_LEVELS = [80, 1000, 2500, 3500]
+BRIGHTNESS_LEVELS = [0, 1, 2, 3, 7]
+HYSTERESIS_RATIO = 0.03     # 3 % hysteresis between two brightness levels
 
 
 # ---------------------- Remote control ----------------------
@@ -117,77 +183,25 @@ VOLUME_SLOWDOWN = {
 }
 
 
-# ---------------------- Power ----------------------
-
-POWER_GPIO = 4              # GPIO controlling the power relay
-POWER_OFF_DELAY = 2         # Minutes of silence before the power relay is switched off
-HALT_DELAY = 48             # Hours of silence (or without remote) before the Raspberry Pi shuts down
-
-
 # ---------------------- Tone and loudness ----------------------
-
-TILT_DB_STEP = 2            # Real dB applied per displayed tilt step
-DEFAULT_LOUDNESS_REF = -20  # Loudness level restored by ENTER when no previous value is saved
-
 # Adjustment ranges (TONE_MAX_DB, PRESENCE_MAX_DB and TILT_MAX_STEPS: 9 at most, the display has 2 digits)
 TONE_MAX_DB = 9             # Bass / treble: -9 .. +9 dB
 PRESENCE_MAX_DB = 3         # Presence: -3 .. +3 dB
 TILT_MAX_STEPS = 3          # Tilt: -3 .. +3 displayed steps (TILT_DB_STEP dB each)
+TILT_DB_STEP = 2            # Real dB applied per displayed tilt step
 LOUDNESS_MIN, LOUDNESS_MAX = -50, -10   # Loudness reference level range in dB (stay above -100, which means "off")
 LOUDNESS_STEP = 5           # Loudness: dB per key press
-
-
-# ---------------------- Display ----------------------
-
-CLK, DIO = 23, 24           # TM1637 display pins
-SCREEN_RETURN_DELAY = 30    # Seconds without key press before returning to the volume screen
-POWER_MSG_DURATION = 1.5    # Seconds PW ON / PW OFF stays on the display
-
-# Ambient light sensor (ADC) -> display brightness
-SERIAL_PORT = "/dev/serial0"
-BAUD_RATE = 115200
-ADC_LEVELS = [80, 1000, 2500, 3500]
-BRIGHTNESS_LEVELS = [0, 1, 2, 3, 7]
-HYSTERESIS_RATIO = 0.03     # 3 % hysteresis between two brightness levels
-
-
-# ---------------------- CamillaDSP and config switching ----------------------
-
-CAMILLA_ADDR = ("127.0.0.1", 1234)
-
-PCP_DIR = "/mnt/mmcblk0p2/tce"   # exists only on PiCorePlayer
-BASE_DIR = PCP_DIR if os.path.isdir(PCP_DIR) else os.path.expanduser("~")
-CONFIG_DIR = BASE_DIR + "/camilladsp/configs/"
-
-POLL_INTERVAL_S = 0.25      # One read cycle of CamillaDSP (volume + mute)
-TITLE_EVERY = 2             # The config title is read every N cycles (2 -> every 0.5 s)
-CDSP_RECONNECT_DELAY_S = 2.0    # Seconds to wait before trying to reconnect to CamillaDSP after an error
-
-# ENABLE_CONFIG_SWITCH = "gpio"
-TV_GPIO = 12                # GPIO reading the TV state (0 = TV on)
-
-# ENABLE_CONFIG_SWITCH = "toslink"
-# NOTE: device / rate / channels are read at startup from the first "|*" YAML.
-TOSLINK_ON_DB           = -40.0   # TOSLINK free: peak level >= threshold -> TV
-LOOPBACK_ON_DB          = -50.0   # Loopback free: peak level >= threshold -> SQUEEZELITE
-
-# ---------------------- Robustness ----------------------
-
-TASK_RESTART_DELAY_S = 2.0  # Seconds before a background task that crashed is restarted
-
-
-# ---------------------- Logitech Media Server ----------------------
-
-LMS_ADDR = ("127.0.0.1", 9090)   # LMS CLI (the server runs on this Pi)
-LMS_PLAYER_MANUAL = ""           # "" = auto (MAC of the default interface); or e.g. "dc:a6:32:3c:1c:21" (raw, lowercase)
-LMS_SYNC_DEBUG = False           # Log every volume/mute change and the raw LMS notifications
-LMS_COALESCE_S = 0.05            # Bursts of volume changes coming from LMS are merged: one write to CamillaDSP per this delay (0 = write immediately)
-LMS_RESTORE_WINDOW_S = 0.5       # After an unmute, LMS may announce a wrong volume during this delay (seconds): the bridge corrects it
-LMS_CONNECT_TIMEOUT_S = 5        # Timeout when connecting to the LMS CLI (seconds)
-LMS_RETRY_S = 5                  # Seconds before the bridge restarts after an error
+DEFAULT_LOUDNESS_REF = -20  # Loudness level restored by ENTER when no previous value is saved
 
 
 # ===================== INTERNAL (do not edit) =====================
+
+TASK_RESTART_DELAY_S = 2.0  # Seconds before a background task that crashed is restarted
+
+# CamillaDSP configs: PiCorePlayer's persistent partition, or ~ elsewhere.
+PCP_DIR    = "/mnt/mmcblk0p2/tce"
+BASE_DIR   = PCP_DIR if os.path.isdir(PCP_DIR) else os.path.expanduser("~")
+CONFIG_DIR = BASE_DIR + "/camilladsp/configs/"
 
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
@@ -721,37 +735,33 @@ def find_remote():
 remote = None
 
 
-# CamillaDSP
-cdsp = None
+# CamillaDSP — always needed: the "at least one feature" check in the
+# FEATURES block guarantees that at least one option requires it.
+cdsp = CamillaClient(*CAMILLA_ADDR)
 config_active = {}
-if NEED_CDSP:
-    cdsp = CamillaClient(*CAMILLA_ADDR)
-    # Wait for CamillaDSP instead of crashing if it is not up yet.
-    # bootlocal.sh launches us in the background, so this loop never
-    # blocks the boot. It exits as soon as CamillaDSP answers.
-    while True:
-        try:
-            cdsp.connect()
-            cdsp.general.reload()
-            break
-        except Exception as e:
-            log.warning("CamillaDSP not reachable (%s), waiting %g s",
-                        e, CDSP_RECONNECT_DELAY_S)
-            time.sleep(CDSP_RECONNECT_DELAY_S)
-    # Protection 1: never let config_active be None at startup
-    config_active = cdsp.config.active() or {}
+# Wait for CamillaDSP instead of crashing if it is not up yet.
+# bootlocal.sh launches us in the background, so this loop never
+# blocks the boot. It exits as soon as CamillaDSP answers.
+while True:
+    try:
+        cdsp.connect()
+        cdsp.general.reload()
+        break
+    except Exception as e:
+        log.warning("CamillaDSP not reachable (%s), waiting %g s",
+                    e, CDSP_RECONNECT_DELAY_S)
+        time.sleep(CDSP_RECONNECT_DELAY_S)
+# Protection 1: never let config_active be None at startup
+config_active = cdsp.config.active() or {}
 
 
 # GPIO
 h = None
 if USE_GPIO:
     h = lgpio.gpiochip_open(0)
-    if ENABLE_AUTO_POWEROFF:
-        lgpio.gpio_claim_output(h, POWER_GPIO, 0)   # Initial level LOW: no LOW -> HIGH glitch on the relay
-        time.sleep(1)                   # Keep the relay off so the A70 can re-arm
-        lgpio.gpio_write(h, POWER_GPIO, 1)
-    if SWITCH_GPIO:
-        lgpio.gpio_claim_input(h, TV_GPIO, lgpio.SET_PULL_UP)
+    lgpio.gpio_claim_output(h, POWER_GPIO, 0)   # Initial level LOW: no LOW -> HIGH glitch on the relay
+    time.sleep(1)                   # Keep the relay off so the A70 can re-arm
+    lgpio.gpio_write(h, POWER_GPIO, 1)
 
 # TM1637 display
 tm = TM1637(clk=CLK, dio=DIO) if ENABLE_DISPLAY else NullDisplay()
@@ -1477,24 +1487,6 @@ async def auto_poweroff():
                 lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
 
 
-# ---------------------- Config switching: GPIO mode ----------------------
-
-async def monitor_tv_gpio():
-    """Watch the TV GPIO; a state change is validated once it stays stable for 1 second."""
-    last_state = lgpio.gpio_read(h, TV_GPIO)
-
-    while True:
-        current_state = lgpio.gpio_read(h, TV_GPIO)
-
-        if current_state != last_state:
-            await asyncio.sleep(1.0)
-            if lgpio.gpio_read(h, TV_GPIO) == current_state:
-                pattern = '|*' if current_state == 0 else '_*'  # 0 = TV on
-                await change_config(cdsp, CONFIG_DIR + pattern, cycle=False)
-                last_state = current_state
-
-        await asyncio.sleep(0.05)
-
 # --------------------- Config switching: TOSLINK mode ---------------------
 # The prefix of the currently active config (_ or |) is the single source of
 # truth, re-read every second from cdsp.config.file_path(). No internal state
@@ -1910,28 +1902,21 @@ signal.signal(signal.SIGTERM, exit_gracefully)
 
 
 async def main():
-    if SWITCH_GPIO:
-        # Load the config matching the TV state at startup
-        if lgpio.gpio_read(h, TV_GPIO) == 0:
-            log.info("TV detected ON at startup: loading ON config")
-            await change_config(cdsp, CONFIG_DIR + '|*', cycle=False)
-        else:
-            await change_config(cdsp, CONFIG_DIR + '_*', cycle=False)
     # TOSLINK mode: nothing to do at startup, the config already in place is
     # kept (its prefix _ or | drives the very first iteration of
     # monitor_tv_toslink).
     if ENABLE_DISPLAY:
-        display_volume_info()  # change_config returns early when the config is already active
+        display_volume_info()
 
     tasks = []
 
     def spawn(name, factory):
         tasks.append(asyncio.create_task(supervised(name, factory)))
 
-    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_CONFIG_SWITCH or ENABLE_LMS_SYNC:
+    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH or ENABLE_LMS_SYNC:
         # The periodic reader of volume / mute / title, shared through vol_state
         spawn("cdsp-poller", cdsp_poller)
-    if ENABLE_AUTO_POWEROFF or ENABLE_DISPLAY or SWITCH_TOSLINK:
+    if ENABLE_AUTO_POWEROFF or ENABLE_DISPLAY or ENABLE_TOSLINK_SWITCH:
         # Single reader of the CamillaDSP levels, shared through `silent_now`
         spawn("silence", silence_monitor)
     if ENABLE_AUTO_POWEROFF:
@@ -1939,23 +1924,18 @@ async def main():
     if ENABLE_DISPLAY:
         spawn("display", display_manager_loop)
         spawn("adc", adc_reader_loop)
-    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_CONFIG_SWITCH:
+    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH:
         # Redraws the display and resyncs config_active after an external change
         spawn("volume-watcher", volume_watcher_loop)
     if ENABLE_LMS_SYNC:
         spawn("lms-bridge", lms_bridge_task)
-    if SWITCH_GPIO:
-        spawn("tv-gpio", monitor_tv_gpio)
-    elif SWITCH_TOSLINK:
+    if ENABLE_TOSLINK_SWITCH:
         spawn("tv-toslink", monitor_tv_toslink)
 
     if ENABLE_REMOTE:
         tasks.append(asyncio.create_task(remote_watcher()))
 
-    if tasks:
-        await asyncio.gather(*tasks)
-    else:
-        await asyncio.Event().wait()
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

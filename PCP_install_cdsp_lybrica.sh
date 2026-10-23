@@ -4,16 +4,15 @@
 #
 #   1) CamillaDSP 5.x + CamillaGUI  (Squeezelite -> loopback -> CamillaDSP -> DAC)
 #                                   installed as the piCoreCDSP.tcz extension
-#   2) Bridge BLE HID               (Bluetooth remote)
-#   3) LyBriCa                      (modules Python, daemon)
-#   4) ESP32C3                      (UART + GPIO overlays)
+#   2) LyBriCa + BLE HID bridge     (TM1637 display, remote, LMS sync, BLE bridge)
+#   3) ESP32C3                      (UART + GPIO overlays)
 #
 # Usage (SSH, user tc):
 #   sh install_pcp.sh      -> interactive menu (no parameters)
 #
 # Each step runs in its own process: an error in one step does not stop
 # the menu, and nothing is saved (pcp bu) if that step fails.
-# Recommended order: 1, 2, 3, 4, then a single reboot at the end.
+# Recommended order: 1, 2, 3, then a single reboot at the end.
 # ---------------------------------------------------------------------------
 
 SELF="$0"
@@ -379,92 +378,40 @@ echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): 
 }
 
 ###########################################################################
-# 2) BRIDGE BLE HID
-###########################################################################
-install_bridge() {
-    echo
-    echo "-----------------------------------------------------------------"
-    echo " BEFORE CONTINUING:"
-    echo "  - Bluetooth must be installed and enabled in piCorePlayer"
-    echo "    (web interface: Tweaks page, Bluetooth section)."
-    echo "  - Pair the remote from the pCP web interface after this step."
-    echo "-----------------------------------------------------------------"
-    echo
-
-    BRIDGE_URL="https://github.com/melomane63/LyBriCa/raw/refs/heads/main/hid_ble_bridge.py"
-
-    # 1. Dependency: only bleak is needed by the patched bridge.
-    say "Installing python3.11-bleak..."
-    tce-load -wi python3.11-bleak.tcz || fail "tce-load failed."
-
-    # 2. Download the patched bridge script to /home/tc/ (persistent).
-    say "Downloading hid_ble_bridge.py..."
-    wget -q -O "$HOME_DIR/hid_ble_bridge.py" "$BRIDGE_URL" \
-        || fail "Download failed: $BRIDGE_URL"
-    head -1 "$HOME_DIR/hid_ble_bridge.py" | grep -q '^#!' \
-        || fail "$HOME_DIR/hid_ble_bridge.py is not a script (wrong URL? use the raw link)."
-    chmod 755 "$HOME_DIR/hid_ble_bridge.py"
-
-    # 3, 4, 5, 7: removed (scan / pairing / start_bridge.sh / init-script patch)
-
-    # 6. Insert the symlink commands at the START of /opt/bootlocal.sh
-    #    (right after the shebang, before #pCPstart).
-    #    /usr/local/ is a tmpfs on piCorePlayer and .tcz content is mounted
-    #    there at each boot, so the symlink must be recreated at every boot
-    #    to redirect the stock script to our persistent copy in /home/tc/.
-    SYMLINK_MARK="# hid_ble_bridge.py symlink (/usr/local -> /home/tc), do not remove"
-    if grep -qF "$SYMLINK_MARK" "$BOOTLOCAL"; then
-        say "$BOOTLOCAL already contains the symlink block."
-    else
-        say "Adding symlink block at the start of $BOOTLOCAL..."
-        TMP=$(mktemp)
-        BLOCK=$(mktemp)
-        {
-            echo "$SYMLINK_MARK"
-            echo "sudo rm /usr/local/bin/hid_ble_bridge.py"
-            echo "sudo ln -s /home/tc/hid_ble_bridge.py /usr/local/bin/hid_ble_bridge.py"
-            echo ""
-        } > "$BLOCK"
-
-        if head -1 "$BOOTLOCAL" | grep -q '^#!'; then
-            # Preserve the shebang as line 1, insert the block just after
-            head -1 "$BOOTLOCAL" > "$TMP"
-            cat "$BLOCK" >> "$TMP"
-            tail -n +2 "$BOOTLOCAL" >> "$TMP"
-        else
-            cat "$BLOCK" > "$TMP"
-            cat "$BOOTLOCAL" >> "$TMP"
-        fi
-
-        rm -f "$BLOCK"
-        sudo sh -c "cat $TMP > $BOOTLOCAL" || fail "Cannot write $BOOTLOCAL."
-        rm -f "$TMP"
-
-        grep -q "opt/bootlocal.sh" /opt/.filetool.lst \
-            || echo "opt/bootlocal.sh" >> /opt/.filetool.lst
-    fi
-
-    # 7. Save
-    say "Saving with pcp bu..."
-    pcp bu
-
-    echo
-    echo "Bridge installed."
-    echo "Reboot to activate the symlink:  pcp reboot"
-    echo "After reboot:"
-    echo "  /usr/local/bin/hid_ble_bridge.py -> /home/tc/hid_ble_bridge.py"
-}
-
-###########################################################################
-# 3) LYBRICA
+# 2) LYBRICA + BLE HID BRIDGE
+#
+# Layout:
+#   lybrica.tcz (read-only, rebuilt at each run)
+#     /usr/local/lib/python3.11/site-packages/
+#         camilladsp/ websocket/ serial/ lgpio/ alsaaudio/
+#         tm1637_lgpio.py
+#     /usr/local/bin/start_lybrica.sh
+#     /usr/local/bin/hid_ble_bridge.py      (read-only, from the extension)
+#     /usr/local/tce.installed/lybrica      (empty: bootlocal.sh launches it)
+#   /home/tc (persistent, updatable via wget)
+#     lybrica.py
+#     lybrica.log  pcp_startup.log  lybrica.pid
+#
+# Modules in /usr/local are visible to both tc and root without PYTHONPATH,
+# unlike the old pip --user install in /home/tc/.local.
 ###########################################################################
 install_lybrica() {
     PYCAMILLA_REF="next5"   # branch, tag or commit of pycamilladsp
     TM1637_URL="https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py"
-    # The TM1637 driver is installed in the user site-packages
-    PYVER_INST=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
-    TM1637_DIR="$HOME_DIR/.local/lib/python$PYVER_INST/site-packages"
     LYBRICA_URL="https://github.com/melomane63/LyBriCa/raw/refs/heads/main/lybrica.py"
+    BRIDGE_URL="https://github.com/melomane63/LyBriCa/raw/refs/heads/main/hid_ble_bridge.py"
+
+    OPT=/etc/sysconfig/tcedir/optional
+    TMPDIR_LY=/tmp/install_lybrica
+
+    if [ -d "$TMPDIR_LY" ]; then
+        fail "Reboot before re-running ($TMPDIR_LY already exists)."
+    fi
+
+    EXT="$TMPDIR_LY/ext"
+    PYVER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+    SP="$EXT/usr/local/lib/python$PYVER/site-packages"
+    mkdir -p "$SP" "$EXT/usr/local/bin" "$EXT/usr/local/tce.installed"
 
     download_page_check() {  # $1=url  $2=dest
         wget -q -O "$2" "$1" || fail "Download failed: $1"
@@ -473,37 +420,49 @@ install_lybrica() {
 
     # 1. Permanent extensions (stay in onboot.lst)
     say "Installing permanent extensions..."
-    tce-load -wi python3.11.tcz python3.11-evdev.tcz || fail "Permanent extensions failed."
+    tce-load -wi python3.11.tcz python3.11-evdev.tcz python3.11-bleak.tcz \
+        || fail "Permanent extensions failed."
 
     # 2. Temporary build tools (-w then -i: not meant for onboot.lst)
-    TOOLS="python3.11-pip.tcz git.tcz compiletc.tcz libasound-dev.tcz python3.11-dev.tcz"
+    TOOLS="python3.11-pip.tcz git.tcz compiletc.tcz libasound-dev.tcz python3.11-dev.tcz squashfs-tools.tcz"
     say "Installing temporary build tools..."
     tce-load -w $TOOLS || fail "Download of build tools failed."
     tce-load -i $TOOLS || fail "Install of build tools failed."
 
-    # 3. Python modules (pip --user, persistent)
+    # 3. Python modules (pip --target, into the extension, not --user)
     say "Installing pycamilladsp ($PYCAMILLA_REF)..."
-    python3 -m pip install --user --no-cache-dir --force-reinstall \
+    python3 -m pip install --target "$SP" --no-cache-dir --force-reinstall \
         "git+https://github.com/HEnquist/pycamilladsp.git@$PYCAMILLA_REF" \
         || fail "pycamilladsp install failed."
 
     for pkg in websocket_client pyserial lgpio pyalsaaudio; do
         say "Installing $pkg..."
-        python3 -m pip install --user --no-cache-dir "$pkg" || fail "$pkg install failed."
+        python3 -m pip install --target "$SP" --no-cache-dir "$pkg" \
+            || fail "$pkg install failed."
     done
 
-    # 4. TM1637 driver
-    say "Downloading TM1637 driver to $TM1637_DIR..."
-    mkdir -p "$TM1637_DIR" || fail "Cannot create $TM1637_DIR."
-    download_page_check "$TM1637_URL" "$TM1637_DIR/tm1637_lgpio.py"
+    # 4. TM1637 driver (into the extension, not in /home/tc)
+    say "Downloading TM1637 driver..."
+    download_page_check "$TM1637_URL" "$SP/tm1637_lgpio.py"
 
-    # 5. LyBriCa
-    say "Downloading lybrica.py..."
+    # 5a. LyBriCa script (stays in /home/tc: wget-updatable)
+    #     One installer backup per day, identified by ".installer-bak." + date.
+    [ -f "$HOME_DIR/lybrica.py" ] && \
+        cp "$HOME_DIR/lybrica.py" "$HOME_DIR/lybrica.py.installer-bak.$(date +%Y%m%d)"
+    say "Downloading lybrica.py to $HOME_DIR..."
     download_page_check "$LYBRICA_URL" "$HOME_DIR/lybrica.py"
     chmod 755 "$HOME_DIR/lybrica.py"
 
-    say "Creating $HOME_DIR/start_lybrica.sh..."
-    cat > "$HOME_DIR/start_lybrica.sh" << 'EOF'
+    # 5b. hid_ble_bridge.py -> inside the extension (read-only)
+    say "Downloading hid_ble_bridge.py into the extension..."
+    download_page_check "$BRIDGE_URL" "$EXT/usr/local/bin/hid_ble_bridge.py"
+    chmod 755 "$EXT/usr/local/bin/hid_ble_bridge.py"
+
+    # 6. start_lybrica.sh -> in the extension (/usr/local/bin)
+    #    PYTHONPATH export removed: modules are in /usr/local, visible to root
+    #    and to tc without any extra environment variable.
+    say "Creating start_lybrica.sh (in the extension)..."
+    cat > "$EXT/usr/local/bin/start_lybrica.sh" << 'EOF'
 #!/bin/sh
 #
 # start_lybrica.sh - Launch LyBriCa (TOSLINK/LMS/volume sync daemon)
@@ -526,27 +485,21 @@ PYTHON3=/usr/local/bin/python3
 LYBRICA=/home/tc/lybrica.py
 PIDFILE=/home/tc/lybrica.pid
 
-# bootlocal.sh runs as root, which does not see /home/tc/.local on its own.
-PYVER=$("$PYTHON3" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
-export PYTHONPATH=/home/tc/.local/lib/python$PYVER/site-packages
+# Modules are in /usr/local/lib/python3.11/site-packages (from lybrica.tcz),
+# visible to both tc and root without PYTHONPATH.
 
 up()  { cut -d' ' -f1 /proc/uptime; }
 log() { echo "[$(up)s] $*" >> "$LOG"; }
 
-# Return the PID of the running lybrica.py, or nothing.
 running_pid() {
-    # Prefer the pidfile (exact PID)...
     if [ -r "$PIDFILE" ]; then
         p=$(cat "$PIDFILE" 2>/dev/null)
         if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
-            # Verify the PID is really lybrica.py (PID may have been reused).
             if [ -r "/proc/$p/cmdline" ] && tr '\0' ' ' < "/proc/$p/cmdline" | grep -q 'lybrica\.py'; then
                 echo "$p"; return
             fi
         fi
     fi
-    # ...otherwise fall back to pgrep, which also finds instances started
-    # by a previous version of this script (no pidfile).
     pgrep -f "python.*lybrica\.py" 2>/dev/null | head -1
 }
 
@@ -586,7 +539,6 @@ start_one() {
     return 1
 }
 
-# --- argument parsing -----------------------------------------------------
 case "$1" in
     ""|--start) MODE="start" ;;
     --restart)  MODE="restart" ;;
@@ -595,7 +547,6 @@ case "$1" in
     *) echo "Usage: $0 [--restart|--stop|--status]" >&2; exit 2 ;;
 esac
 
-# --restart and --stop require root (lybrica.py runs as root).
 case "$MODE" in
     restart|stop)
         if [ "$(id -u)" -ne 0 ]; then
@@ -605,7 +556,6 @@ case "$MODE" in
         fi ;;
 esac
 
-# Log a header only for action modes (not for --status, a query).
 case "$MODE" in
     start|restart|stop)
         echo "=====================================" >> "$LOG"
@@ -643,46 +593,86 @@ case "$MODE" in
         start_one || exit 1 ;;
 esac
 EOF
-    chmod 755 "$HOME_DIR/start_lybrica.sh"
-    sh -n "$HOME_DIR/start_lybrica.sh" || fail "Syntax error in start_lybrica.sh."
+    chmod 755 "$EXT/usr/local/bin/start_lybrica.sh"
+    sh -n "$EXT/usr/local/bin/start_lybrica.sh" || fail "Syntax error in start_lybrica.sh."
 
-    # 6. bootlocal.sh (idempotent, placed AFTER the pcp_startup.sh block)
-    LINE="$HOME_DIR/start_lybrica.sh &"
-    if grep -qF "$LINE" "$BOOTLOCAL"; then
-        say "bootlocal.sh already contains the LyBriCa line."
+    # 7. Empty tce.installed (nothing to launch at boot: bootlocal.sh does it)
+    : > "$EXT/usr/local/tce.installed/lybrica"
+
+    # 8. Build and register the extension
+    say "Building lybrica.tcz..."
+    TCZ="$TMPDIR_LY/lybrica.tcz"
+    mksquashfs "$EXT" "$TCZ" -noappend -all-root || fail "mksquashfs failed."
+    mv -f "$TCZ" "$OPT/lybrica.tcz"
+
+    # Dependencies: Python, evdev, bleak, and piCoreCDSP if present
+    {
+        echo "python3.11.tcz"
+        echo "python3.11-evdev.tcz"
+        echo "python3.11-bleak.tcz"
+        [ -f "$OPT/piCoreCDSP.tcz" ] && echo "piCoreCDSP.tcz"
+    } > "$OPT/lybrica.tcz.dep"
+
+    grep -qx "lybrica.tcz" /etc/sysconfig/tcedir/onboot.lst \
+        || echo "lybrica.tcz" >> /etc/sysconfig/tcedir/onboot.lst
+
+    # 9. Migration from the old --user install
+    say "Migrating from the old --user install..."
+    rm -rf "$HOME_DIR/.local/lib/python$PYVER/site-packages"
+    rm -f  "$HOME_DIR/start_lybrica.sh"
+    rm -rf "$HOME_DIR/.cache/pip"
+
+    # 10. Update bootlocal.sh: replace old path, ensure new one is present
+    NEW_LINE="/usr/local/bin/start_lybrica.sh &"
+    OLD_LINE="$HOME_DIR/start_lybrica.sh &"
+    if grep -qxF "$NEW_LINE" "$BOOTLOCAL" && ! grep -qxF "$OLD_LINE" "$BOOTLOCAL"; then
+        say "bootlocal.sh already points to $NEW_LINE"
     else
-        say "Adding LyBriCa to $BOOTLOCAL..."
-        TMP=/tmp/bootlocal.new
-        N=$(grep -n '^#pCPstop' "$BOOTLOCAL" | head -1 | cut -d: -f1)
+        say "Updating $BOOTLOCAL..."
+        TMP=$(mktemp)
+        grep -vxF "$OLD_LINE" "$BOOTLOCAL" | grep -vxF "$NEW_LINE" > "$TMP" || true
+        N=$(grep -n '^#pCPstop' "$TMP" | head -1 | cut -d: -f1)
         if [ -n "$N" ]; then
-            head -n "$N" "$BOOTLOCAL" > $TMP
-            echo "$LINE" >> $TMP
-            tail -n +$((N+1)) "$BOOTLOCAL" >> $TMP
+            TMP2=$(mktemp)
+            head -n "$N" "$TMP" > "$TMP2"
+            echo "$NEW_LINE" >> "$TMP2"
+            tail -n +$((N+1)) "$TMP" >> "$TMP2"
+            mv "$TMP2" "$TMP"
         else
-            cp "$BOOTLOCAL" $TMP
-            echo "$LINE" >> $TMP
+            echo "$NEW_LINE" >> "$TMP"
         fi
         sudo sh -c "cat $TMP > $BOOTLOCAL" || fail "Cannot write $BOOTLOCAL."
-        rm -f $TMP
+        rm -f "$TMP"
     fi
 
-    # 7. Check imports, cleanup, save
-    say "Checking imports..."
-    python3 -c "import camilladsp, websocket, serial, lgpio, alsaaudio, evdev" \
-        || fail "A module cannot be imported."
+    # 11. Check imports from the build dir (proves both tc and root see them)
+    say "Checking imports from the build dir (tc)..."
+    PYTHONPATH="$SP" python3 -c \
+        "import camilladsp, websocket, serial, lgpio, alsaaudio, evdev, tm1637_lgpio, bleak" \
+        || fail "A module cannot be imported from the build dir (tc)."
+    say "Checking imports from the build dir (root)..."
+    sudo PYTHONPATH="$SP" python3 -c \
+        "import camilladsp, websocket, serial, lgpio, alsaaudio, evdev, tm1637_lgpio, bleak" \
+        || fail "A module cannot be imported from the build dir (root)."
 
-    rm -rf "$HOME_DIR/.cache/pip"
+    # 12. Save
     say "Saving with pcp bu..."
     pcp bu
 
+    rm -rf "$TMPDIR_LY"
+
     echo
-    echo "LyBriCa installed. The temporary build tools disappear at the next reboot."
+    echo "LyBriCa + BLE bridge installed as lybrica.tcz. The temporary build"
+    echo "tools disappear at the next reboot."
+    echo "  /usr/local/bin/start_lybrica.sh   (launcher, from the extension)"
+    echo "  /usr/local/bin/hid_ble_bridge.py  (bridge, from the extension, read-only)"
+    echo "  /home/tc/lybrica.py               (persistent, updatable via wget)"
+    echo "Reboot to activate:  pcp reboot"
     echo "Logs: /home/tc/pcp_startup.log  /home/tc/lybrica.log"
-    echo "Note: modules in /home/tc/.local are NOT visible to scripts run with sudo."
 }
 
 ###########################################################################
-# 4) ESP32C3 (UART + GPIO overlays)
+# 3) ESP32C3 (UART + GPIO overlays)
 ###########################################################################
 install_esp32c3() {
     echo
@@ -821,7 +811,6 @@ GPIO_SCRIPT_EOF
 if [ "$1" = "--run" ]; then
     case "$2" in
         camilla) install_camilladsp ;;
-        bridge)  install_bridge ;;
         lybrica) install_lybrica ;;
         esp32c3) install_esp32c3 ;;
         *) fail "Unknown step: $2" ;;
@@ -833,7 +822,7 @@ fi
 
 DONE=""
 
-run_step() {  # $1 = camilla|bridge|lybrica|esp32c3
+run_step() {  # $1 = camilla|lybrica|esp32c3
     echo
     echo "############################################################"
     echo "# Step: $1"
@@ -864,9 +853,8 @@ run_choice() {
     for c in "$@"; do
         case "$c" in
             1|camilla) run_step camilla ;;
-            2|bridge)  run_step bridge ;;
-            3|lybrica) run_step lybrica ;;
-            4|esp32c3) run_step esp32c3 ;;
+            2|lybrica) run_step lybrica ;;
+            3|esp32c3) run_step esp32c3 ;;
             r|R)       do_reboot ;;
             q|Q)       return 1 ;;
             *) echo "Unknown choice: $c" ;;
@@ -890,13 +878,12 @@ while true; do
     echo "  piCorePlayer installer"
     echo "=============================================="
     echo "  1) CamillaDSP + CamillaGUI"
-    echo "  2) BLE HID bridge (remote)"
-    echo "  3) LyBriCa (Python modules, TM1637, daemon)"
-    echo "  4) ESP32C3 (UART + GPIO overlays)"
+    echo "  2) LyBriCa + BLE HID bridge (remote)"
+    echo "  3) ESP32C3 (UART + GPIO overlays)"
     echo "  R) Reboot now"
     echo "  Q) Quit"
     echo "----------------------------------------------"
-    printf "Choice (several allowed, e.g. 1 3): "
+    printf "Choice (several allowed, e.g. 1 2): "
     read -r CHOICES || break
     [ -z "$CHOICES" ] && continue
     # shellcheck disable=SC2086

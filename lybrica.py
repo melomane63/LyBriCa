@@ -1090,15 +1090,14 @@ def send_lms_command(command):
 
 
 async def remote_watcher():
-    """Background task: detect and reconnect the remote without blocking boot."""
     global remote
-    while ENABLE_REMOTE:
-        if remote is None:
-            remote = find_remote()
-            if remote:
-                log.info("'%s' connected successfully!", REMOTE_NAME)
-                asyncio.create_task(supervised("remote", lambda: remote_events(remote)))
-        await asyncio.sleep(5)
+    while remote is None:
+        remote = find_remote()
+        if remote:
+            log.info("'%s' connected successfully!", REMOTE_NAME)
+            asyncio.create_task(supervised("remote", lambda: remote_events(remote)))
+            return
+        await asyncio.sleep(1)
 
 
 # ====================== DSP CONFIGURATION ======================

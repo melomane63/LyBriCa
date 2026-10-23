@@ -625,6 +625,8 @@ case "$MODE" in
 Usage: lybrica [command] [args]
 
 Commands:
+  help            Show this help.
+  
   start           Start LyBriCa if not already running (root required).
                   Idempotent: does nothing if already running. Used at boot.
 
@@ -643,12 +645,7 @@ Commands:
                   shipped in the tcz. Creates the file if missing, asks
                   for confirmation before overwriting an existing file.
                   No root required.
-
-  help            Show this help.
-
-The "--" prefix is optional: "lybrica --status" == "lybrica status".
-Short aliases: "lybrica -h" and "lybrica --help" both work.
-
+                  
 Override workflow:
   1. lybrica reset               create or restore /home/tc/lybrica-mod.py
   2. vi /home/tc/lybrica-mod.py  edit it

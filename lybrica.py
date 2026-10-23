@@ -726,10 +726,21 @@ cdsp = None
 config_active = {}
 if NEED_CDSP:
     cdsp = CamillaClient(*CAMILLA_ADDR)
-    cdsp.connect()
-    cdsp.general.reload()
+    # Wait for CamillaDSP instead of crashing if it is not up yet.
+    # bootlocal.sh launches us in the background, so this loop never
+    # blocks the boot. It exits as soon as CamillaDSP answers.
+    while True:
+        try:
+            cdsp.connect()
+            cdsp.general.reload()
+            break
+        except Exception as e:
+            log.warning("CamillaDSP not reachable (%s), waiting %g s",
+                        e, CDSP_RECONNECT_DELAY_S)
+            time.sleep(CDSP_RECONNECT_DELAY_S)
     # Protection 1: never let config_active be None at startup
     config_active = cdsp.config.active() or {}
+
 
 # GPIO
 h = None

@@ -3,16 +3,16 @@
 # install_pcp.sh - All-in-one installer for piCorePlayer (menu)
 #
 #   1) CamillaDSP 5.x + CamillaGUI  (Squeezelite -> loopback -> CamillaDSP -> DAC)
-#                                   installed as the piCoreCDSP.tcz extension
+#                                   installed as the CDSPpiCore.tcz extension
 #   2) LyBriCa + BLE HID bridge     (TM1637 display, remote, LMS sync, BLE bridge)
-#   3) ESP32C3                      (UART + GPIO overlays)
+#      + ESP32C3                    (UART + GPIO overlays in config.txt)
 #
 # Usage (SSH, user tc):
 #   sh install_pcp.sh      -> interactive menu (no parameters)
 #
 # Each step runs in its own process: an error in one step does not stop
 # the menu, and nothing is saved (pcp bu) if that step fails.
-# Recommended order: 1, 2, 3, then a single reboot at the end.
+# Recommended order: 1, 2, then a single reboot at the end.
 # ---------------------------------------------------------------------------
 
 SELF="$0"
@@ -34,10 +34,10 @@ fail() { echo "ERROR: $*" >&2; exit 1; }
 # 1) CAMILLADSP  (extension version)
 #
 # Layout:
-#   piCoreCDSP.tcz (read-only, rebuilt at each run)
+#   CDSPpiCore.tcz (read-only, rebuilt at each run)
 #     /usr/local/bin/camilladsp
 #     /usr/local/camillagui/camillagui        (+ symlink config -> $BASE/camillagui/config)
-#     /usr/local/tce.installed/piCoreCDSP     (start script, run as root)
+#     /usr/local/tce.installed/CDSPpiCore     (start script, run as root)
 #   /mnt/mmcblk0p2/tce/camilladsp (persistent data, outside the extension)
 #     configs/ coeffs/ default_config.yml camilladsp_statefile.yml
 #     camillagui/config/ (camillagui.yml, gui-config.yml)
@@ -109,7 +109,7 @@ if [ "$AVAILABLE_MB" -le "$REQUIRED_MB" ]; then
     die "Not enough space (${AVAILABLE_MB} MB). Enlarge the partition: Main Page > Additional functions > Resize FS"
 fi
 
-# (No more refusal if piCoreCDSP.tcz exists: it is simply replaced.)
+# (No more refusal if CDSPpiCore.tcz exists: it is simply replaced.)
 
 if [ -d "$TMPDIR_CDSP" ]; then
     die "Reboot before re-running ($TMPDIR_CDSP already exists)."
@@ -302,7 +302,7 @@ EOF
 ln -s "$BASE/camillagui/config" "$EXT/usr/local/camillagui/config"
 
 ### --- 5. Startup script (run as root when the extension is loaded) --------
-cat > "$EXT/usr/local/tce.installed/piCoreCDSP" <<'EOF'
+cat > "$EXT/usr/local/tce.installed/CDSPpiCore" <<'EOF'
 #!/bin/sh
 # Starts CamillaDSP then CamillaGUI (run as root by the extension loader)
 
@@ -323,24 +323,24 @@ sudo -u tc sh -c "cd '$BASE/camillagui' && /usr/local/camillagui/camillagui" &
 
 exit 0
 EOF
-chmod 775 "$EXT/usr/local/tce.installed/piCoreCDSP"
+chmod 775 "$EXT/usr/local/tce.installed/CDSPpiCore"
 
 ### --- 6. Build and register the extension ---------------------------------
 install_temporarily_if_missing squashfs-tools
-TCZ="$TMPDIR_CDSP/piCoreCDSP.tcz"
+TCZ="$TMPDIR_CDSP/CDSPpiCore.tcz"
 mksquashfs "$EXT" "$TCZ" -noappend -all-root
-mv -f "$TCZ" "$OPT/piCoreCDSP.tcz"
+mv -f "$TCZ" "$OPT/CDSPpiCore.tcz"
 
 # Make sure the kernel modules (snd-aloop) are loaded before our script runs
 ALSA_EXT="alsa-modules-$(uname -r).tcz"
 if [ -f "$OPT/$ALSA_EXT" ]; then
-    echo "$ALSA_EXT" > "$OPT/piCoreCDSP.tcz.dep"
+    echo "$ALSA_EXT" > "$OPT/CDSPpiCore.tcz.dep"
 else
     echo "!!! WARNING: $OPT/$ALSA_EXT not found: no .dep written, check that snd-aloop is loaded early enough."
 fi
 
-grep -qx "piCoreCDSP.tcz" /etc/sysconfig/tcedir/onboot.lst \
-    || echo "piCoreCDSP.tcz" >> /etc/sysconfig/tcedir/onboot.lst
+grep -qx "CDSPpiCore.tcz" /etc/sysconfig/tcedir/onboot.lst \
+    || echo "CDSPpiCore.tcz" >> /etc/sysconfig/tcedir/onboot.lst
 
 # Migration: remove the old bootlocal.sh start and the old loose files
 sudo sed -i '/# camilladsp-start/d' /opt/bootlocal.sh
@@ -369,16 +369,16 @@ pcp backup
 
 set +v
 echo ""
-echo "CamillaDSP extension installed (piCoreCDSP.tcz). Reboot to start it."
+echo "CamillaDSP extension installed (CDSPpiCore.tcz). Reboot to start it."
 echo "Web interface: http://pcp.local:5000/gui/index.html"
 echo "After reboot, check:"
-echo "  tce-status -i | grep piCoreCDSP"
+echo "  tce-status -i | grep CDSPpiCore"
 echo "  pidof camilladsp camillagui"
 echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): \$(chrt -p \$(basename \$t) | head -1)\"; done"
 }
 
 ###########################################################################
-# 2) LYBRICA + BLE HID BRIDGE
+# 2) LYBRICA + BLE HID BRIDGE  (+ ESP32C3 UART/GPIO overlays, merged)
 #
 # Layout:
 #   lybrica.tcz (read-only, rebuilt at each run)
@@ -394,6 +394,11 @@ echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): 
 #
 # Modules in /usr/local are visible to both tc and root without PYTHONPATH,
 # unlike the old pip --user install in /home/tc/.local.
+#
+# ESP32C3 (was step 3): edits config.txt on the FAT partition to add the
+# gpio-poweroff (GPIO 26) / gpio-shutdown (GPIO 16) overlays and enable the
+# UART. Interactive: the user can cancel it; a cancel or a "no change"
+# does NOT fail this step.
 ###########################################################################
 install_lybrica() {
     PYCAMILLA_REF="next5"   # branch, tag or commit of pycamilladsp
@@ -605,12 +610,12 @@ EOF
     mksquashfs "$EXT" "$TCZ" -noappend -all-root || fail "mksquashfs failed."
     mv -f "$TCZ" "$OPT/lybrica.tcz"
 
-    # Dependencies: Python, evdev, bleak, and piCoreCDSP if present
+    # Dependencies: Python, evdev, bleak, and CDSPpiCore if present
     {
         echo "python3.11.tcz"
         echo "python3.11-evdev.tcz"
         echo "python3.11-bleak.tcz"
-        [ -f "$OPT/piCoreCDSP.tcz" ] && echo "piCoreCDSP.tcz"
+        [ -f "$OPT/CDSPpiCore.tcz" ] && echo "CDSPpiCore.tcz"
     } > "$OPT/lybrica.tcz.dep"
 
     grep -qx "lybrica.tcz" /etc/sysconfig/tcedir/onboot.lst \
@@ -655,7 +660,23 @@ EOF
         "import camilladsp, websocket, serial, lgpio, alsaaudio, evdev, tm1637_lgpio, bleak" \
         || fail "A module cannot be imported from the build dir (root)."
 
-    # 12. Save
+    # 12. ESP32C3 overlays (merged from old step 3, interactive)
+    #
+    # A cancel (SKIP_RC) or a "no change" (UNCHANGED_RC) must NOT fail this
+    # step: LyBriCa is already installed and pcp bu must still run.
+    ESP32_STATUS="unknown"
+    say "Configuring ESP32C3 (config.txt overlays)..."
+    configure_esp32c3
+    ESP_RC=$?
+    case "$ESP_RC" in
+        0)                ESP32_STATUS="applied (reboot needed)" ;;
+        "$SKIP_RC")       ESP32_STATUS="cancelled" ;;
+        "$UNCHANGED_RC")  ESP32_STATUS="already up to date" ;;
+        *)                ESP32_STATUS="FAILED (see messages above)" ;;
+    esac
+    say "ESP32C3: $ESP32_STATUS"
+
+    # 13. Save
     say "Saving with pcp bu..."
     pcp bu
 
@@ -667,14 +688,27 @@ EOF
     echo "  /usr/local/bin/start_lybrica.sh   (launcher, from the extension)"
     echo "  /usr/local/bin/hid_ble_bridge.py  (bridge, from the extension, read-only)"
     echo "  /home/tc/lybrica.py               (persistent, updatable via wget)"
+    echo "ESP32C3 config.txt: $ESP32_STATUS"
     echo "Reboot to activate:  pcp reboot"
     echo "Logs: /home/tc/pcp_startup.log  /home/tc/lybrica.log"
 }
 
 ###########################################################################
-# 3) ESP32C3 (UART + GPIO overlays)
+# ESP32C3 helper (called from install_lybrica, formerly a standalone step)
+#
+# Edits config.txt (FAT partition, /mnt/mmcblk0p1) to add, under [all],
+# the lines that are not already there:
+#   dtoverlay=gpio-poweroff,gpiopin=26,active_low=1
+#   dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down
+#   enable_uart=1
+#
+# Return codes:
+#   0              config.txt updated (reboot required)
+#   SKIP_RC        user cancelled (config.txt unchanged)
+#   UNCHANGED_RC   every line already present (no change, no reboot)
+#   other          error (do not exit the parent step)
 ###########################################################################
-install_esp32c3() {
+configure_esp32c3() {
     echo
     echo '-----------------------------------------------------------------'
     echo ' ESP32C3 microcontroller support'
@@ -797,11 +831,14 @@ GPIO_SCRIPT_EOF
     case "$ESP_RC" in
         0)
             say "config.txt updated."
-            echo ">>> Reboot required to apply:  pcp reboot" ;;
+            echo ">>> Reboot required to apply:  pcp reboot"
+            return 0 ;;
         "$UNCHANGED_RC")
-            say "config.txt already up to date, no reboot needed." ;;
+            say "config.txt already up to date, no reboot needed."
+            return "$UNCHANGED_RC" ;;
         *)
-            fail "config.txt update failed (see above)." ;;
+            echo "ERROR: config.txt update failed (see above)." >&2
+            return 1 ;;
     esac
 }
 
@@ -812,7 +849,6 @@ if [ "$1" = "--run" ]; then
     case "$2" in
         camilla) install_camilladsp ;;
         lybrica) install_lybrica ;;
-        esp32c3) install_esp32c3 ;;
         *) fail "Unknown step: $2" ;;
     esac
     exit $?
@@ -822,7 +858,7 @@ fi
 
 DONE=""
 
-run_step() {  # $1 = camilla|lybrica|esp32c3
+run_step() {  # $1 = camilla|lybrica
     echo
     echo "############################################################"
     echo "# Step: $1"
@@ -854,7 +890,6 @@ run_choice() {
         case "$c" in
             1|camilla) run_step camilla ;;
             2|lybrica) run_step lybrica ;;
-            3|esp32c3) run_step esp32c3 ;;
             r|R)       do_reboot ;;
             q|Q)       return 1 ;;
             *) echo "Unknown choice: $c" ;;
@@ -878,8 +913,7 @@ while true; do
     echo "  piCorePlayer installer"
     echo "=============================================="
     echo "  1) CamillaDSP + CamillaGUI"
-    echo "  2) LyBriCa + BLE HID bridge (remote)"
-    echo "  3) ESP32C3 (UART + GPIO overlays)"
+    echo "  2) LyBriCa + BLE HID bridge + ESP32C3 (remote)"
     echo "  R) Reboot now"
     echo "  Q) Quit"
     echo "----------------------------------------------"

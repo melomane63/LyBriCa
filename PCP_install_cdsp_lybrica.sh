@@ -385,11 +385,15 @@ echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): 
 #     /usr/local/lib/python3.11/site-packages/
 #         camilladsp/ websocket/ serial/ lgpio/ alsaaudio/
 #         tm1637_lgpio.py
-#     /usr/local/bin/start_lybrica.sh
+#     /usr/local/bin/lybrica.py             (read-only, factory copy)
+#     /usr/local/bin/start_lybrica.sh       (launcher, applies the override)
+#     /usr/local/bin/lybrica                (symlink -> start_lybrica.sh)
 #     /usr/local/bin/hid_ble_bridge.py      (read-only, from the extension)
 #     /usr/local/tce.installed/lybrica      (empty: bootlocal.sh launches it)
-#   /home/tc (persistent, updatable via wget)
-#     lybrica.py
+#   /home/tc (persistent)
+#     lybrica-mod.py                    (OPTIONAL editable copy of lybrica.py;
+#                                        not created by this installer, run
+#                                        "lybrica reset" to create it)
 #     lybrica.log  pcp_startup.log  lybrica.pid
 #
 # Modules in /usr/local are visible to both tc and root without PYTHONPATH,
@@ -450,36 +454,42 @@ install_lybrica() {
     say "Downloading TM1637 driver..."
     download_page_check "$TM1637_URL" "$SP/tm1637_lgpio.py"
 
-    # 5a. LyBriCa script (stays in /home/tc: wget-updatable)
-    #     One installer backup per day, identified by ".installer-bak." + date.
-    [ -f "$HOME_DIR/lybrica.py" ] && \
-        cp "$HOME_DIR/lybrica.py" "$HOME_DIR/lybrica.py.installer-bak.$(date +%Y%m%d)"
-    say "Downloading lybrica.py to $HOME_DIR..."
-    download_page_check "$LYBRICA_URL" "$HOME_DIR/lybrica.py"
-    chmod 755 "$HOME_DIR/lybrica.py"
+    # 5a. LyBriCa script -> inside the extension (read-only, factory copy).
+    #     No editable copy is created in /home/tc here: the user creates it
+    #     on demand with "lybrica reset", edits it, then "sudo lybrica restart".
+    say "Downloading lybrica.py into the extension..."
+    download_page_check "$LYBRICA_URL" "$EXT/usr/local/bin/lybrica.py"
 
     # 5b. hid_ble_bridge.py -> inside the extension (read-only)
     say "Downloading hid_ble_bridge.py into the extension..."
     download_page_check "$BRIDGE_URL" "$EXT/usr/local/bin/hid_ble_bridge.py"
-    chmod 755 "$EXT/usr/local/bin/hid_ble_bridge.py"
 
     # 6. start_lybrica.sh -> in the extension (/usr/local/bin)
     #    PYTHONPATH export removed: modules are in /usr/local, visible to root
     #    and to tc without any extra environment variable.
+    #
+    #    Modes accept both "start" and "--start", so a "lybrica status"
+    #    symlink (created below) works without typing the dashes.
     say "Creating start_lybrica.sh (in the extension)..."
     cat > "$EXT/usr/local/bin/start_lybrica.sh" << 'EOF'
 #!/bin/sh
 #
 # start_lybrica.sh - Launch LyBriCa (TOSLINK/LMS/volume sync daemon)
 #
-# Usage:
+# Usage (also available as the "lybrica" symlink, see "lybrica help"):
 #   start_lybrica.sh                  start if not running (idempotent, used at boot)
 #   sudo start_lybrica.sh --restart   stop any running instance, then start
 #   sudo start_lybrica.sh --stop      stop the running instance, do not start
 #   start_lybrica.sh --status         print state and exit (exit 0 = running)
+#   start_lybrica.sh --log [N]        follow the log (default: last 50 lines)
+#   start_lybrica.sh --reset          restore lybrica-mod.py from the factory copy
+#   start_lybrica.sh --help           list all commands
 #
-# Note: lybrica.py runs as root, so --restart and --stop require root too.
-#       --start and --status work as user tc.
+# The "--" prefix is optional: "lybrica status" == "start_lybrica.sh --status".
+#
+# Note: --start, --restart and --stop require root: they write to
+#       /usr/local/bin (override copy) and to root-owned log files.
+#       --status, --log, --reset and --help work as tc.
 #
 # Logs use uptime-based timestamps ([Xs] = seconds since boot).
 #
@@ -487,7 +497,9 @@ install_lybrica() {
 LOG=/home/tc/pcp_startup.log
 LYBRICA_LOG=/home/tc/lybrica.log
 PYTHON3=/usr/local/bin/python3
-LYBRICA=/home/tc/lybrica.py
+LYBRICA=/usr/local/bin/lybrica.py
+MOD=/home/tc/lybrica-mod.py
+FACTORY=/tmp/tcloop/lybrica/usr/local/bin/lybrica.py
 PIDFILE=/home/tc/lybrica.pid
 
 # Modules are in /usr/local/lib/python3.11/site-packages (from lybrica.tcz),
@@ -530,6 +542,40 @@ stop_one() {  # $1 = pid
 }
 
 start_one() {
+    # Local override: if /home/tc/lybrica-mod.py exists, copy it over the
+    # tcz version before launching.
+    #
+    # piCore mounts extensions in linkfs mode: $LYBRICA is a symlink to
+    # /tmp/tcloop/lybrica/... which lives on a read-only squashfs, so a
+    # plain "cp" would follow the link and fail with "Read-only file system".
+    # The copy therefore goes to $LYBRICA.new first (an ordinary file in the
+    # tmpfs), then the symlink is removed and replaced by the new file with
+    # an atomic "mv" in the same directory.
+    #
+    # A failed copy (e.g. no root) is not fatal: the symlink to the tcz copy
+    # is left untouched and the daemon still starts.
+    if [ -f "$MOD" ]; then
+        if cp "$MOD" "$LYBRICA.new" 2>>"$LYBRICA_LOG"; then
+            rm -f "$LYBRICA"
+            mv "$LYBRICA.new" "$LYBRICA"
+            log "Override: $MOD copied to $LYBRICA"
+        else
+            rm -f "$LYBRICA.new"
+            log "WARNING: cannot copy $MOD to $LYBRICA, using the existing copy"
+        fi
+    elif [ ! -L "$LYBRICA" ]; then
+        # No mod: make sure $LYBRICA is the tcz symlink again. If a previous
+        # run left a regular file here (e.g. a broken mod), restore the link
+        # so the factory version is used.
+        rm -f "$LYBRICA"
+        if [ -e "$FACTORY" ]; then
+            ln -s "$FACTORY" "$LYBRICA"
+            log "No mod: $LYBRICA restored to the tcz symlink"
+        else
+            log "ERROR: no mod and $FACTORY missing (tcz not mounted?), cannot restore $LYBRICA"
+            return 1
+        fi
+    fi
     log "Launching lybrica.py"
     nohup "$PYTHON3" "$LYBRICA" >> "$LYBRICA_LOG" 2>&1 &
     p=$!
@@ -545,18 +591,21 @@ start_one() {
 }
 
 case "$1" in
-    ""|--start) MODE="start" ;;
-    --restart)  MODE="restart" ;;
-    --stop)     MODE="stop" ;;
-    --status)   MODE="status" ;;
-    *) echo "Usage: $0 [--restart|--stop|--status]" >&2; exit 2 ;;
+    ""|--start|start)     MODE="start" ;;
+    --restart|restart)    MODE="restart" ;;
+    --stop|stop)          MODE="stop" ;;
+    --status|status)      MODE="status" ;;
+    --log|log)            MODE="log" ;;
+    --reset|reset)        MODE="reset" ;;
+    --help|-h|help)       MODE="help" ;;
+    *) echo "Usage: $0 [start|restart|stop|status|log [N]|reset|help]" >&2; exit 2 ;;
 esac
 
 case "$MODE" in
-    restart|stop)
+    start|restart|stop)
         if [ "$(id -u)" -ne 0 ]; then
-            echo "ERROR: --$MODE requires root (lybrica.py runs as root)." >&2
-            echo "       Try: sudo $0 --$MODE" >&2
+            echo "ERROR: $MODE requires root (writes to /usr/local/bin and to root-owned logs)." >&2
+            echo "       Try: sudo $0 $MODE" >&2
             exit 1
         fi ;;
 esac
@@ -571,9 +620,102 @@ esac
 PID=$(running_pid)
 
 case "$MODE" in
+    help)
+        cat <<'HELP'
+Usage: lybrica [command] [args]
+
+Commands:
+  start           Start LyBriCa if not already running (root required).
+                  Idempotent: does nothing if already running. Used at boot.
+
+  restart         Stop any running instance, then start (root required).
+                  Use this after editing /home/tc/lybrica-mod.py.
+
+  stop            Stop the running instance (root required).
+
+  status          Show which launcher would be used and whether the
+                  daemon is running (no root required).
+
+  log [N]         Follow /home/tc/lybrica.log (default: last 50 lines).
+                  No root required. Ctrl+C to stop following.
+
+  reset           Restore /home/tc/lybrica-mod.py from the factory copy
+                  shipped in the tcz. Creates the file if missing, asks
+                  for confirmation before overwriting an existing file.
+                  No root required.
+
+  help            Show this help.
+
+The "--" prefix is optional: "lybrica --status" == "lybrica status".
+Short aliases: "lybrica -h" and "lybrica --help" both work.
+
+Override workflow:
+  1. lybrica reset               create or restore /home/tc/lybrica-mod.py
+  2. vi /home/tc/lybrica-mod.py  edit it
+  3. sudo lybrica restart        apply the new version
+  4. pcp bu                      persist across reboots
+
+Without /home/tc/lybrica-mod.py, the factory version from the tcz runs
+(read-only, cannot be edited in place). Deleting the file falls back to
+that factory version on the next start.
+
+Files:
+  /home/tc/lybrica-mod.py     Editable override (optional, not created by install)
+  /home/tc/lybrica.log        Python output (follow with: lybrica log)
+  /home/tc/pcp_startup.log    Launcher trace (starts, stops, overrides)
+  /home/tc/lybrica.pid        Current process id
+
+Shortcut: /usr/local/bin/lybrica is a symlink to start_lybrica.sh.
+HELP
+        exit 0 ;;
+
     status)
+        if [ -f "$MOD" ]; then
+            echo "launcher: $MOD (copied to $LYBRICA at start)"
+        else
+            echo "launcher: $LYBRICA (tcz version, no local copy)"
+        fi
         if [ -n "$PID" ]; then echo "lybrica.py running (pid $PID)"; exit 0
         else                   echo "lybrica.py not running";        exit 1
+        fi ;;
+
+    log)
+        [ -r "$LYBRICA_LOG" ] || { echo "No log file yet: $LYBRICA_LOG" >&2; exit 1; }
+        LINES=${2:-50}
+        exec tail -n "$LINES" -f "$LYBRICA_LOG" ;;
+
+    reset)
+        # Restore /home/tc/lybrica-mod.py from the factory copy shipped in
+        # the extension. Reads /tmp/tcloop/... directly, never
+        # /usr/local/bin/lybrica.py, because that file may currently hold
+        # a previous mod (a broken one, for example).
+        if [ ! -e "$FACTORY" ]; then
+            echo "ERROR: factory copy not found: $FACTORY" >&2
+            echo "       Is lybrica.tcz mounted? Check: tce-status -i | grep lybrica" >&2
+            exit 1
+        fi
+        if [ -f "$MOD" ] && cmp -s "$MOD" "$FACTORY"; then
+            echo "$MOD already matches the factory copy, nothing to do."
+            exit 0
+        fi
+        if [ -f "$MOD" ]; then
+            echo "About to overwrite $MOD with the factory copy."
+            echo "  current : $(wc -c < "$MOD") bytes"
+            echo "  factory : $(wc -c < "$FACTORY") bytes"
+            printf "Continue? [y/N]: "
+            read -r ANSWER
+            case "$ANSWER" in
+                y|Y) ;;
+                *) echo "Cancelled, $MOD unchanged."; exit 0 ;;
+            esac
+        fi
+        rm -f "$MOD"
+        if cp "$FACTORY" "$MOD"; then
+            echo "Restored: $MOD (from the factory copy)"
+            echo "Apply it now with:  sudo lybrica restart"
+        else
+            echo "ERROR: cannot create $MOD" >&2
+            exit 1
         fi ;;
 
     stop)
@@ -601,6 +743,10 @@ EOF
     chmod 755 "$EXT/usr/local/bin/start_lybrica.sh"
     sh -n "$EXT/usr/local/bin/start_lybrica.sh" || fail "Syntax error in start_lybrica.sh."
 
+    # Shortcut: "lybrica status" instead of "start_lybrica.sh --status".
+    # Relative symlink, resolved inside the mounted tcz.
+    ln -s start_lybrica.sh "$EXT/usr/local/bin/lybrica"
+
     # 7. Empty tce.installed (nothing to launch at boot: bootlocal.sh does it)
     : > "$EXT/usr/local/tce.installed/lybrica"
 
@@ -621,21 +767,14 @@ EOF
     grep -qx "lybrica.tcz" /etc/sysconfig/tcedir/onboot.lst \
         || echo "lybrica.tcz" >> /etc/sysconfig/tcedir/onboot.lst
 
-    # 9. Migration from the old --user install
-    say "Migrating from the old --user install..."
-    rm -rf "$HOME_DIR/.local/lib/python$PYVER/site-packages"
-    rm -f  "$HOME_DIR/start_lybrica.sh"
-    rm -rf "$HOME_DIR/.cache/pip"
-
-    # 10. Update bootlocal.sh: replace old path, ensure new one is present
+    # 9. Update bootlocal.sh: ensure the launcher is present
     NEW_LINE="/usr/local/bin/start_lybrica.sh &"
-    OLD_LINE="$HOME_DIR/start_lybrica.sh &"
-    if grep -qxF "$NEW_LINE" "$BOOTLOCAL" && ! grep -qxF "$OLD_LINE" "$BOOTLOCAL"; then
+    if grep -qxF "$NEW_LINE" "$BOOTLOCAL"; then
         say "bootlocal.sh already points to $NEW_LINE"
     else
         say "Updating $BOOTLOCAL..."
         TMP=$(mktemp)
-        grep -vxF "$OLD_LINE" "$BOOTLOCAL" | grep -vxF "$NEW_LINE" > "$TMP" || true
+        grep -vxF "$NEW_LINE" "$BOOTLOCAL" > "$TMP" || true
         N=$(grep -n '^#pCPstop' "$TMP" | head -1 | cut -d: -f1)
         if [ -n "$N" ]; then
             TMP2=$(mktemp)
@@ -650,7 +789,7 @@ EOF
         rm -f "$TMP"
     fi
 
-    # 11. Check imports from the build dir (proves both tc and root see them)
+    # 10. Check imports from the build dir (proves both tc and root see them)
     say "Checking imports from the build dir (tc)..."
     PYTHONPATH="$SP" python3 -c \
         "import camilladsp, websocket, serial, lgpio, alsaaudio, evdev, tm1637_lgpio, bleak" \
@@ -660,7 +799,7 @@ EOF
         "import camilladsp, websocket, serial, lgpio, alsaaudio, evdev, tm1637_lgpio, bleak" \
         || fail "A module cannot be imported from the build dir (root)."
 
-    # 12. ESP32C3 overlays (merged from old step 3, interactive)
+    # 11. ESP32C3 overlays (merged from old step 3, interactive)
     #
     # A cancel (SKIP_RC) or a "no change" (UNCHANGED_RC) must NOT fail this
     # step: LyBriCa is already installed and pcp bu must still run.
@@ -676,7 +815,7 @@ EOF
     esac
     say "ESP32C3: $ESP32_STATUS"
 
-    # 13. Save
+    # 12. Save
     say "Saving with pcp bu..."
     pcp bu
 
@@ -686,11 +825,14 @@ EOF
     echo "LyBriCa + BLE bridge installed as lybrica.tcz. The temporary build"
     echo "tools disappear at the next reboot."
     echo "  /usr/local/bin/start_lybrica.sh   (launcher, from the extension)"
+    echo "  /usr/local/bin/lybrica            (symlink, e.g. 'lybrica help')"
+    echo "  /usr/local/bin/lybrica.py         (from the extension, read-only)"
     echo "  /usr/local/bin/hid_ble_bridge.py  (bridge, from the extension, read-only)"
-    echo "  /home/tc/lybrica.py               (persistent, updatable via wget)"
+    echo "  /home/tc/lybrica-mod.py           (optional, create with 'lybrica reset')"
     echo "ESP32C3 config.txt: $ESP32_STATUS"
     echo "Reboot to activate:  pcp reboot"
     echo "Logs: /home/tc/pcp_startup.log  /home/tc/lybrica.log"
+    echo "Commands: lybrica help"
 }
 
 ###########################################################################

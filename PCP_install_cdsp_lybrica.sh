@@ -4,7 +4,7 @@
 #
 #   1) CamillaDSP 5.x + CamillaGUI  (Squeezelite -> loopback -> CamillaDSP -> DAC)
 #                                   installed as the CDSPpiCore.tcz extension
-#   2) LyBriCa + BLE HID bridge     (TM1637 display, remote, LMS sync, BLE bridge)
+#   2) LyBriCa + BLE HID bridge     (TM1637 display, remote, LMS sync; patches pcp-bt.tcz)
 #   3) ESP32C3                      (UART + GPIO overlays, pcp.cfg, shutdown monitor)
 #
 # Usage (SSH, user tc):
@@ -378,7 +378,7 @@ echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): 
 }
 
 ###########################################################################
-# 2) LYBRICA + BLE HID BRIDGE
+# 2) LYBRICA + BLE HID BRIDGE (patched pcp-bt.tcz)
 #
 # Layout:
 #   lybrica.tcz (read-only, rebuilt at each run)
@@ -388,7 +388,6 @@ echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): 
 #     /usr/local/bin/lybrica.py             (read-only, factory copy)
 #     /usr/local/bin/start_lybrica.sh       (launcher, applies the override)
 #     /usr/local/bin/lybrica                (symlink -> start_lybrica.sh)
-#     /usr/local/bin/hid_ble_bridge.py      (read-only, from the extension)
 #     /usr/local/tce.installed/lybrica      (empty: bootlocal.sh launches it)
 #   /home/tc (persistent)
 #     lybrica-mod.py                    (OPTIONAL editable copy of lybrica.py;
@@ -403,7 +402,6 @@ install_lybrica() {
     PYCAMILLA_REF="next5"   # branch, tag or commit of pycamilladsp
     TM1637_URL="https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py"
     LYBRICA_URL="https://github.com/melomane63/LyBriCa/raw/refs/heads/main/lybrica.py"
-    BRIDGE_URL="https://github.com/melomane63/LyBriCa/raw/refs/heads/main/hid_ble_bridge.py"
 
     OPT=/etc/sysconfig/tcedir/optional
     TMPDIR_LY=/tmp/install_lybrica
@@ -454,10 +452,6 @@ install_lybrica() {
     #     on demand with "lybrica reset", edits it, then "sudo lybrica restart".
     say "Downloading lybrica.py into the extension..."
     download_page_check "$LYBRICA_URL" "$EXT/usr/local/bin/lybrica.py"
-
-    # 5b. hid_ble_bridge.py -> inside the extension (read-only)
-    say "Downloading hid_ble_bridge.py into the extension..."
-    download_page_check "$BRIDGE_URL" "$EXT/usr/local/bin/hid_ble_bridge.py"
 
     # 6. start_lybrica.sh -> in the extension (/usr/local/bin)
     #    PYTHONPATH export removed: modules are in /usr/local, visible to root
@@ -759,6 +753,12 @@ EOF
     grep -qx "lybrica.tcz" /etc/sysconfig/tcedir/onboot.lst \
         || echo "lybrica.tcz" >> /etc/sysconfig/tcedir/onboot.lst
 
+    # 8b. BLE HID bridge: rebuild pcp-bt.tcz with the patched hid_ble_bridge.py
+    #     and hidbridge (see patch_pcp_bt). A failure here only warns: LyBriCa
+    #     itself is already installed and pcp bu must still run.
+    say "Patching pcp-bt.tcz (BLE HID bridge)..."
+    patch_pcp_bt || echo "!!! WARNING: pcp-bt.tcz was not patched (see messages above)."
+
     # 9. Update bootlocal.sh: ensure the launcher is present
     NEW_LINE="/usr/local/bin/start_lybrica.sh &"
     if grep -qxF "$NEW_LINE" "$BOOTLOCAL"; then
@@ -798,16 +798,99 @@ EOF
     rm -rf "$TMPDIR_LY"
 
     echo
-    echo "LyBriCa + BLE bridge installed as lybrica.tcz. The temporary build"
+    echo "LyBriCa installed as lybrica.tcz. The temporary build"
     echo "tools disappear at the next reboot."
     echo "  /usr/local/bin/start_lybrica.sh   (launcher, from the extension)"
     echo "  /usr/local/bin/lybrica            (symlink, e.g. 'lybrica help')"
     echo "  /usr/local/bin/lybrica.py         (from the extension, read-only)"
-    echo "  /usr/local/bin/hid_ble_bridge.py  (bridge, from the extension, read-only)"
+    echo "  pcp-bt.tcz                        (rebuilt with the patched hid_ble_bridge.py + hidbridge)"
     echo "  /home/tc/lybrica-mod.py           (optional, create with 'lybrica reset')"
     echo "Reboot to activate:  pcp reboot"
     echo "Logs: /home/tc/pcp_startup.log  /home/tc/lybrica.log"
     echo "Commands: lybrica help"
+}
+
+###########################################################################
+# BLE HID bridge: patch pcp-bt.tcz
+#
+# pCP's own pcp-bt.tcz ships hid_ble_bridge.py and the "hidbridge" init
+# script. This replaces both with the versions from
+#   https://github.com/melomane63/pcp-ble-gatt
+# by unpacking pcp-bt.tcz, swapping the two files, rebuilding the squashfs
+# and putting it back. The result takes effect at the next reboot.
+#
+# - Idempotent: nothing is rebuilt if the extension already has these files.
+# - Safe: both files are downloaded and checked BEFORE anything is touched.
+# - Not fatal: returns non-zero with a message, the caller only warns.
+#
+# Uses OPT and TMPDIR_LY from install_lybrica; needs unsquashfs / mksquashfs
+# (squashfs-tools.tcz, already loaded with the temporary build tools).
+###########################################################################
+patch_pcp_bt() {
+    PB_URL="https://raw.githubusercontent.com/melomane63/pcp-ble-gatt/refs/heads/main"
+    PB_TCZ="$OPT/pcp-bt.tcz"
+    PB_TMP="$TMPDIR_LY/pcp-bt"
+    PB_EXT="$PB_TMP/ext"
+
+    if [ ! -f "$PB_TCZ" ]; then
+        echo "!!! pcp-bt.tcz not found in $OPT."
+        echo "    Install Bluetooth from the pCP web interface first, then re-run this step."
+        return 1
+    fi
+    if ! command -v unsquashfs >/dev/null 2>&1; then
+        echo "!!! unsquashfs not found (squashfs-tools.tcz not loaded?)"
+        return 1
+    fi
+
+    mkdir -p "$PB_TMP"
+
+    # 1. Download and check both files before touching anything
+    wget -q -O "$PB_TMP/hid_ble_bridge.py" "$PB_URL/hid_ble_bridge.py" \
+        || { echo "!!! Download failed: $PB_URL/hid_ble_bridge.py"; return 1; }
+    wget -q -O "$PB_TMP/hidbridge" "$PB_URL/hidbridge" \
+        || { echo "!!! Download failed: $PB_URL/hidbridge"; return 1; }
+    for f in hid_ble_bridge.py hidbridge; do
+        if head -c 300 "$PB_TMP/$f" | grep -qiE '<!doctype|<html'; then
+            echo "!!! $f is a web page (use the raw URL)."
+            return 1
+        fi
+    done
+    python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$PB_TMP/hid_ble_bridge.py" \
+        || { echo "!!! hid_ble_bridge.py is not valid Python"; return 1; }
+    sh -n "$PB_TMP/hidbridge" \
+        || { echo "!!! hidbridge has a syntax error"; return 1; }
+
+    # 2. Unpack the current pcp-bt.tcz
+    unsquashfs -f -d "$PB_EXT" "$PB_TCZ" > /dev/null \
+        || { echo "!!! unsquashfs failed on $PB_TCZ"; return 1; }
+    for d in usr/local/bin usr/local/etc/init.d; do
+        [ -d "$PB_EXT/$d" ] || { echo "!!! $d missing in pcp-bt.tcz: unexpected layout"; return 1; }
+    done
+
+    # 3. Already patched? Then there is nothing to rebuild
+    if cmp -s "$PB_TMP/hid_ble_bridge.py" "$PB_EXT/usr/local/bin/hid_ble_bridge.py" \
+       && cmp -s "$PB_TMP/hidbridge" "$PB_EXT/usr/local/etc/init.d/hidbridge"; then
+        echo ">>> pcp-bt.tcz already contains these two files: nothing to do."
+        return 0
+    fi
+
+    # 4. Swap the two files
+    cp "$PB_TMP/hid_ble_bridge.py" "$PB_EXT/usr/local/bin/hid_ble_bridge.py"
+    cp "$PB_TMP/hidbridge"         "$PB_EXT/usr/local/etc/init.d/hidbridge"
+    chmod 755 "$PB_EXT/usr/local/bin/hid_ble_bridge.py" "$PB_EXT/usr/local/etc/init.d/hidbridge"
+
+    # 5. Rebuild and put it back
+    mksquashfs "$PB_EXT" "$PB_TMP/pcp-bt.tcz" -noappend -all-root > /dev/null \
+        || { echo "!!! mksquashfs failed"; return 1; }
+
+    # The original md5 no longer matches the rebuilt file: keep it as .orig
+    if [ -f "$OPT/pcp-bt.tcz.md5.txt" ]; then
+        [ -f "$OPT/pcp-bt.tcz.md5.txt.orig" ] || cp "$OPT/pcp-bt.tcz.md5.txt" "$OPT/pcp-bt.tcz.md5.txt.orig"
+        rm -f "$OPT/pcp-bt.tcz.md5.txt"
+    fi
+    mv -f "$PB_TMP/pcp-bt.tcz" "$PB_TCZ"
+    echo ">>> pcp-bt.tcz rebuilt with the patched hid_ble_bridge.py and hidbridge (active after reboot)."
+    return 0
 }
 
 ###########################################################################
@@ -1085,7 +1168,7 @@ while true; do
     echo "  CamillaDSP installer for piCorePlayer "
     echo "=============================================="
     echo "  1) CamillaDSP + CamillaGUI"
-    echo "  2) LyBriCa + BLE bridge"
+    echo "  2) LyBriCa + BLE HID bridge (patches pcp-bt.tcz)"
     echo "  3) ESP32C3 (GPIO overlays, shutdown monitor)"
     echo "  R) Reboot now"
     echo "  Q) Quit"

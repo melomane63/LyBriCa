@@ -5,14 +5,14 @@
 #   1) CamillaDSP 5.x + CamillaGUI  (Squeezelite -> loopback -> CamillaDSP -> DAC)
 #                                   installed as the CDSPpiCore.tcz extension
 #   2) LyBriCa + BLE HID bridge     (TM1637 display, remote, LMS sync, BLE bridge)
-#      + ESP32C3                    (UART + GPIO overlays in config.txt)
+#   3) ESP32C3                      (UART + GPIO overlays, pcp.cfg, shutdown monitor)
 #
 # Usage (SSH, user tc):
 #   sh install_pcp.sh      -> interactive menu (no parameters)
 #
 # Each step runs in its own process: an error in one step does not stop
 # the menu, and nothing is saved (pcp bu) if that step fails.
-# Recommended order: 1, 2, then a single reboot at the end.
+# Recommended order: 1, 2, 3, then a single reboot at the end.
 # ---------------------------------------------------------------------------
 
 SELF="$0"
@@ -378,7 +378,7 @@ echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): 
 }
 
 ###########################################################################
-# 2) LYBRICA + BLE HID BRIDGE  (+ ESP32C3 UART/GPIO overlays, merged)
+# 2) LYBRICA + BLE HID BRIDGE
 #
 # Layout:
 #   lybrica.tcz (read-only, rebuilt at each run)
@@ -398,11 +398,6 @@ echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): 
 #
 # Modules in /usr/local are visible to both tc and root without PYTHONPATH,
 # unlike the old pip --user install in /home/tc/.local.
-#
-# ESP32C3 (was step 3): edits config.txt on the FAT partition to add the
-# gpio-poweroff (GPIO 26) / gpio-shutdown (GPIO 16) overlays and enable the
-# UART. Interactive: the user can cancel it; a cancel or a "no change"
-# does NOT fail this step.
 ###########################################################################
 install_lybrica() {
     PYCAMILLA_REF="next5"   # branch, tag or commit of pycamilladsp
@@ -626,7 +621,7 @@ Usage: lybrica [command] [args]
 
 Commands:
   help            Show this help.
-  
+
   start           Start LyBriCa if not already running (root required).
                   Idempotent: does nothing if already running. Used at boot.
 
@@ -645,7 +640,7 @@ Commands:
                   shipped in the tcz. Creates the file if missing, asks
                   for confirmation before overwriting an existing file.
                   No root required.
-                  
+
 Override workflow:
   1. lybrica reset               create or restore /home/tc/lybrica-mod.py
   2. vi /home/tc/lybrica-mod.py  edit it
@@ -796,24 +791,7 @@ EOF
         "import camilladsp, websocket, serial, lgpio, alsaaudio, evdev, tm1637_lgpio, bleak" \
         || fail "A module cannot be imported from the build dir (root)."
 
-    # 11. ESP32C3 overlays (merged from old step 3, interactive)
-    #
-    # A cancel (SKIP_RC) or a "no change" (UNCHANGED_RC) must NOT fail this
-    # step: LyBriCa is already installed and pcp bu must still run.
-    ESP32_STATUS="unknown"
-    say "Configuring ESP32C3 (config.txt overlays)..."
-    configure_esp32c3
-    ESP_RC=$?
-    rm -f /home/tc/pcp-powerbutton.sh
-    case "$ESP_RC" in
-        0)                ESP32_STATUS="applied (reboot needed)" ;;
-        "$SKIP_RC")       ESP32_STATUS="cancelled" ;;
-        "$UNCHANGED_RC")  ESP32_STATUS="already up to date" ;;
-        *)                ESP32_STATUS="FAILED (see messages above)" ;;
-    esac
-    say "ESP32C3: $ESP32_STATUS"
-
-    # 12. Save
+    # 11. Save
     say "Saving with pcp bu..."
     pcp bu
 
@@ -827,20 +805,21 @@ EOF
     echo "  /usr/local/bin/lybrica.py         (from the extension, read-only)"
     echo "  /usr/local/bin/hid_ble_bridge.py  (bridge, from the extension, read-only)"
     echo "  /home/tc/lybrica-mod.py           (optional, create with 'lybrica reset')"
-    echo "ESP32C3 config.txt: $ESP32_STATUS"
     echo "Reboot to activate:  pcp reboot"
     echo "Logs: /home/tc/pcp_startup.log  /home/tc/lybrica.log"
     echo "Commands: lybrica help"
 }
 
 ###########################################################################
-# ESP32C3 helper (called from install_lybrica, formerly a standalone step)
+# ESP32C3 helper (called from install_esp32)
 #
 # Edits config.txt (FAT partition, /mnt/mmcblk0p1) to add, under [all],
 # the lines that are not already there:
 #   dtoverlay=gpio-poweroff,gpiopin=26,active_low=1
 #   dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down
 #   enable_uart=1
+# Then sets the matching GPIO options in pcp.cfg and installs
+# shutdown-monitor.tcz.
 #
 # Return codes:
 #   0              config.txt updated (reboot required)
@@ -873,6 +852,10 @@ configure_esp32c3() {
     echo '   3. The Pi shuts down and signals it (GPIO 26); the ESP32 then cuts'
     echo '      the power with a relay.'
     echo '   4. Pressing the button again: the ESP32 closes the relay and the Pi boots.'
+    echo ''
+    echo ' It also sets the matching GPIO options in pcp.cfg (so the pCP web'
+    echo ' interface does not overwrite them) and installs shutdown-monitor.tcz'
+    echo ' (REQUIRED for GPIO 16 to actually shut the Pi down).'
     echo ''
     echo ' A backup is kept as config.txt.bak (created once, never overwritten).'
     echo ' A reboot is required to apply the changes.'
@@ -987,8 +970,12 @@ GPIO_SCRIPT_EOF
         set_pcp_cfg GPIOSHUTDOWN_GPIO "16"
         set_pcp_cfg GPIOSHUTDOWN_HI   "yes"
         set_pcp_cfg GPIOSHUTDOWN_PU   "down"
+
+        say "Installing the shutdown monitor..."
+        pcp-load -wil shutdown-monitor.tcz \
+            || echo "!!! WARNING: shutdown-monitor.tcz install failed: GPIO 16 will not shut the Pi down."
     fi
-    
+
     case "$ESP_RC" in
         0)
             say "config.txt updated."
@@ -1004,12 +991,35 @@ GPIO_SCRIPT_EOF
 }
 
 ###########################################################################
+# 3) ESP32C3 (standalone step)
+#
+# Runs configure_esp32c3, then saves with pcp bu. "Already up to date" is
+# not an error here: pcp.cfg may still have been corrected, so we save.
+###########################################################################
+install_esp32() {
+    configure_esp32c3
+    rc=$?
+    rm -f /home/tc/pcp-powerbutton.sh
+    case "$rc" in
+        0|"$UNCHANGED_RC")
+            say "Saving with pcp bu..."
+            pcp bu
+            return 0 ;;
+        "$SKIP_RC")
+            return "$SKIP_RC" ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+###########################################################################
 # DISPATCH: one step = one process (sh "$SELF" --run <step>)
 ###########################################################################
 if [ "$1" = "--run" ]; then
     case "$2" in
         camilla) install_camilladsp ;;
         lybrica) install_lybrica ;;
+        esp32)   install_esp32 ;;
         *) fail "Unknown step: $2" ;;
     esac
     exit $?
@@ -1019,7 +1029,7 @@ fi
 
 DONE=""
 
-run_step() {  # $1 = camilla|lybrica
+run_step() {  # $1 = camilla|lybrica|esp32
     echo
     echo "############################################################"
     echo "# Step: $1"
@@ -1051,6 +1061,7 @@ run_choice() {
         case "$c" in
             1|camilla) run_step camilla ;;
             2|lybrica) run_step lybrica ;;
+            3|esp32)   run_step esp32 ;;
             r|R)       do_reboot ;;
             q|Q)       return 1 ;;
             *) echo "Unknown choice: $c" ;;
@@ -1074,11 +1085,12 @@ while true; do
     echo "  CamillaDSP installer for piCorePlayer "
     echo "=============================================="
     echo "  1) CamillaDSP + CamillaGUI"
-    echo "  2) LyBriCa + ESP32C3 "
+    echo "  2) LyBriCa + BLE bridge"
+    echo "  3) ESP32C3 (GPIO overlays, shutdown monitor)"
     echo "  R) Reboot now"
     echo "  Q) Quit"
     echo "----------------------------------------------"
-    printf "Choice (several allowed, e.g. 1 2): "
+    printf "Choice (several allowed, e.g. 1 2 3): "
     read -r CHOICES || break
     [ -z "$CHOICES" ] && continue
     # shellcheck disable=SC2086

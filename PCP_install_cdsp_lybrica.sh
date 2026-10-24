@@ -968,6 +968,27 @@ GPIO_SCRIPT_EOF
     sudo sh "$ESP_SCRIPT"
     ESP_RC=$?
     rm -f "$ESP_SCRIPT"
+
+    if [ "$ESP_RC" -eq 0 ] || [ "$ESP_RC" -eq "$UNCHANGED_RC" ]; then
+        PCP_CFG=/usr/local/etc/pcp/pcp.cfg
+        set_pcp_cfg() {
+            if grep -q "^$1=" "$PCP_CFG"; then
+                sed "s|^$1=.*|$1=\"$2\"|" -i "$PCP_CFG"
+                echo ">>> pcp.cfg: $1=\"$2\""
+            else
+                echo "$1=\"$2\"" >> "$PCP_CFG"
+                echo ">>> pcp.cfg: $1=\"$2\" (added)"
+            fi
+        }
+        set_pcp_cfg GPIOPOWEROFF      "yes"
+        set_pcp_cfg GPIOPOWEROFF_GPIO "26"
+        set_pcp_cfg GPIOPOWEROFF_HI   "no"
+        set_pcp_cfg GPIOSHUTDOWN      "yes"
+        set_pcp_cfg GPIOSHUTDOWN_GPIO "16"
+        set_pcp_cfg GPIOSHUTDOWN_HI   "yes"
+        set_pcp_cfg GPIOSHUTDOWN_PU   "down"
+    fi
+    
     case "$ESP_RC" in
         0)
             say "config.txt updated."

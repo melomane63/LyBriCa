@@ -140,9 +140,62 @@ EOL
     # -------------------------------------------------------------------------
     # 4. Download scripts
     # -------------------------------------------------------------------------
+    # Reinstall: remember the REMOTE_NAME of the existing lybrica.py (set by the pairing option)
+    SAVED_REMOTE_NAME=""
+    if [ -f "$HOME/scripts/lybrica.py" ]; then
+        SAVED_REMOTE_NAME=$(/opt/venv/bin/python3 - "$HOME/scripts/lybrica.py" <<'EOF' || true
+import ast
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    text = f.read()
+
+m = re.search(
+    r"""^REMOTE_NAME\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')""",
+    text,
+    re.MULTILINE,
+)
+if m:
+    print(ast.literal_eval(m.group(1)))
+EOF
+)
+    fi
+
     echo "📥 Downloading lybrica.py and tm1637_lgpio.py from GitHub..."
     mkdir -p "$HOME/scripts"
     wget -q https://raw.githubusercontent.com/melomane63/LyBriCa/main/lybrica.py -O "$HOME/scripts/lybrica.py"
+
+    # Reinstall: put the saved REMOTE_NAME back into the freshly downloaded file
+    if [ -n "$SAVED_REMOTE_NAME" ]; then
+        if /opt/venv/bin/python3 - "$HOME/scripts/lybrica.py" "$SAVED_REMOTE_NAME" <<'EOF'
+import json
+import re
+import sys
+
+script, name = sys.argv[1], sys.argv[2]
+with open(script, encoding="utf-8") as f:
+    text = f.read()
+
+pattern = re.compile(
+    r"""^(REMOTE_NAME\s*=\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')""",
+    re.MULTILINE,
+)
+new_text, count = pattern.subn(
+    lambda m: m.group(1) + json.dumps(name, ensure_ascii=False), text, count=1
+)
+if count == 0:
+    sys.exit(1)
+
+with open(script, "w", encoding="utf-8") as f:
+    f.write(new_text)
+EOF
+        then
+            echo "✅ REMOTE_NAME \"$SAVED_REMOTE_NAME\" kept from the previous lybrica.py."
+        else
+            echo "⚠  Could not restore REMOTE_NAME \"$SAVED_REMOTE_NAME\": run option 7 (Pair Bluetooth Remote)."
+        fi
+    fi
 
     PYVER=$(/opt/venv/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     wget -q https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py -O /tmp/tm1637_lgpio.py
@@ -533,10 +586,10 @@ while true; do
     echo "5) Configure Sound Levels (alsamixer)"
     echo "6) Install Lybrica (Remote, Display, Trigger, Autoconfig...)"
     echo "7) Pair Bluetooth Remote"
-    echo "Q) Shutdown System"
+    echo "S) Shutdown System"
     echo "E) Exit"
     echo "=================================="
-    read -p "Choose an option [1-7, Q, E]: " option
+    read -p "Choose an option [1-7, S, E]: " option
 
     case $option in
         1) upgrade_system ;;
@@ -546,7 +599,7 @@ while true; do
         5) set_sound_card ;;
         6) install_lybrica ;;
         7) pair_bluetooth_remote ;;
-        Q|q) shutdown_now ;;
+        S|s) shutdown_now ;;
         E|e) echo "Exiting..."; exit 0 ;;
         *) echo "Invalid option. Please try again." ;;
     esac

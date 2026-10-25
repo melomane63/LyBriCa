@@ -4,12 +4,18 @@
 set -e
 
 # =============================================================================
+# Global download URLs
+# =============================================================================
+CDSP_URL="https://github.com/HEnquist/camilladsp/releases/download/v5.0.0-beta.2/camilladsp-linux-aarch64.tar.gz"
+GUI_URL="https://github.com/HEnquist/camillagui-backend/releases/download/v5.0.0-beta.2/camillagui_linux_aarch64.tar.gz"
+PYCAMILLADSP_URL="git+https://github.com/HEnquist/pycamilladsp.git@next5"
+
+# =============================================================================
 # Function to update and upgrade the system
 # =============================================================================
 upgrade_system() {
     echo "🔄 Updating and upgrading system..."
     sudo apt update && sudo apt upgrade -y
-    ###sudo apt install -y git wget curl python3-pip python3-venv python3-dev build-essential systemd libasound2-dev
     sudo apt install -y wget systemd
 }
 
@@ -142,7 +148,7 @@ EOL
     # 3. Dependencies
     # -------------------------------------------------------------------------
     sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5 pyalsaaudio
-    sudo /opt/venv/bin/pip install "git+https://github.com/HEnquist/pycamilladsp.git@next5"
+    sudo /opt/venv/bin/pip install "$PYCAMILLADSP_URL"
 
     # -------------------------------------------------------------------------
     # 4. Download scripts
@@ -260,7 +266,6 @@ install_camilladsp() {
     mkdir -p ~/camilladsp ~/camilladsp/coeffs ~/camilladsp/configs
 
     # --- CamillaDSP v5.0.0-beta.2 (aarch64) --------------------------------
-    CDSP_URL="https://github.com/HEnquist/camilladsp/releases/download/v5.0.0-beta.2/camilladsp-linux-aarch64.tar.gz"
     echo "📥 CamillaDSP : $CDSP_URL"
     wget "$CDSP_URL" -O ~/camilladsp/camilladsp-linux-aarch64.tar.gz \
         || { echo "❌ Téléchargement CamillaDSP échoué"; return 1; }
@@ -294,7 +299,6 @@ EOL
 
 
     echo "🖥️ Installing CamillaGUI (aarch64, v5.0.0-beta.2)..."
-    GUI_URL="https://github.com/HEnquist/camillagui-backend/releases/download/v5.0.0-beta.2/camillagui_linux_aarch64.tar.gz"
     echo "📥 CamillaGUI : $GUI_URL"
     wget "$GUI_URL" -O /tmp/camillagui_linux_aarch64.tar.gz \
         || { echo "❌ Téléchargement CamillaGUI échoué"; return 1; }

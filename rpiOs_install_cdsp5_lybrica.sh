@@ -55,8 +55,16 @@ write_service_protected() {
         return 1
     fi
 
+    # Backup with timestamp before overwriting
+    local backup_file="${service_file}.$(date +%Y%m%d-%H%M%S).bak"
+    echo "💾 Backing up to ${backup_file}..."
+    sudo cp "$service_file" "$backup_file"
+
+    # Keep only the 5 most recent backups for this service
+    sudo bash -c "ls -t '${service_file}'.*.bak 2>/dev/null | tail -n +6 | xargs -r rm -f"
+
     echo "$service_content" | sudo tee "$service_file" > /dev/null
-    echo "✅ ${service_name} overwritten."
+    echo "✅ ${service_name} overwritten (backup: ${backup_file})."
     return 0
 }
 
@@ -214,6 +222,15 @@ if m:
     print(ast.literal_eval(m.group(1)))
 EOF
 )
+    fi
+
+    # Backup existing lybrica.py before re-downloading
+    if [ -f "$HOME/scripts/lybrica.py" ]; then
+        BACKUP_LYBRICA="$HOME/scripts/lybrica.py.$(date +%Y%m%d-%H%M%S).bak"
+        echo "💾 Backing up existing lybrica.py to ${BACKUP_LYBRICA}..."
+        cp "$HOME/scripts/lybrica.py" "$BACKUP_LYBRICA"
+        # Keep only the 5 most recent backups
+        ls -t "$HOME/scripts"/lybrica.py.*.bak 2>/dev/null | tail -n +6 | xargs -r rm -f
     fi
 
     echo "📥 Downloading lybrica.py from GitHub..."
@@ -426,8 +443,9 @@ EOL
         echo "⚠  statefile.yml exists but differs from the script's version."
         read -p "Overwrite statefile.yml? (y/n): " confirm
         if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+            cp "$STATEFILE" "${STATEFILE}.$(date +%Y%m%d-%H%M%S).bak"
             echo "$STATEFILE_CONTENT" > "$STATEFILE"
-            echo "✅ statefile.yml overwritten."
+            echo "✅ statefile.yml overwritten (backup saved)."
         else
             echo "↩  Keeping existing statefile.yml (manual edits preserved)."
         fi
@@ -464,8 +482,9 @@ EOL
         echo "⚠  _Setup.yml exists but differs from the script's version."
         read -p "Overwrite _Setup.yml? (y/n): " confirm
         if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+            cp "$SETUPFILE" "${SETUPFILE}.$(date +%Y%m%d-%H%M%S).bak"
             echo "$SETUPFILE_CONTENT" > "$SETUPFILE"
-            echo "✅ _Setup.yml overwritten."
+            echo "✅ _Setup.yml overwritten (backup saved)."
         else
             echo "↩  Keeping existing _Setup.yml (manual edits preserved)."
         fi

@@ -29,11 +29,40 @@ upgrade_system() {
 }
 
 # =============================================================================
+# Helper: write a systemd service file, protecting manual edits
+# =============================================================================
+write_service_protected() {
+    local service_name="$1"
+    local service_file="$2"
+    local service_content="$3"
+
+    if [ ! -f "$service_file" ]; then
+        echo "📝 Creating ${service_name}..."
+        echo "$service_content" | sudo tee "$service_file" > /dev/null
+        echo "✅ ${service_name} written."
+        return 0
+    fi
+
+    if [ "$(sudo cat "$service_file")" = "$service_content" ]; then
+        echo "✅ ${service_name} already up to date, skipping."
+        return 0
+    fi
+
+    echo "⚠  ${service_name} exists but differs from the script's version."
+    read -p "Overwrite ${service_name}? (y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo "↩  Keeping existing ${service_name} (manual edits preserved)."
+        return 1
+    fi
+
+    echo "$service_content" | sudo tee "$service_file" > /dev/null
+    echo "✅ ${service_name} overwritten."
+    return 0
+}
+
+# =============================================================================
 # Function to install Lybrica
 # (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)
-#  - rewrites /boot/firmware/config.txt
-#  - sets up venv + dependencies
-#  - installs and starts systemd service
 # =============================================================================
 install_lybrica() {
     echo "🎮 Installing Lybrica (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)..."
@@ -51,14 +80,11 @@ install_lybrica() {
 
     CONFIG_FILE="/boot/firmware/config.txt"
 
-    # Check if already installed by lybrica
     if sudo grep -q "^#installed-by-lybrica" "$CONFIG_FILE" 2>/dev/null; then
         echo "ℹ  Lybrica already installed (found #installed-by-lybrica in config.txt). Skipping config.txt rewrite."
     else
-        # Backup before modifying
         sudo cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
 
-        # Overwrite config.txt with new content
         sudo tee "$CONFIG_FILE" > /dev/null <<'EOL'
 # For more options and information see
 # http://rptl.io/configtxt
@@ -116,7 +142,6 @@ EOL
         echo "✅ /boot/firmware/config.txt rewritten!"
     fi
 
-    # Clean serial console in cmdline.txt (always applied if needed)
     CMDLINE_FILE="/boot/firmware/cmdline.txt"
     if [ -f "$CMDLINE_FILE" ]; then
         if ! sudo grep -q "console=serial0" "$CMDLINE_FILE"; then
@@ -134,7 +159,7 @@ EOL
     sudo usermod -aG dialout,gpio,input,spi,i2c,audio "$USER"
 
     # -------------------------------------------------------------------------
-    # 2b. Sudoers rule for passwordless shutdown (used by lybrica.py)
+    # 2b. Sudoers rule (no protection, trivial content)
     # -------------------------------------------------------------------------
     echo "🔐 Adding sudoers rule for passwordless shutdown..."
     SUDOERS_TMP=$(mktemp)
@@ -157,12 +182,19 @@ EOL
     # 3. Dependencies
     # -------------------------------------------------------------------------
     sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5 pyalsaaudio
-    sudo /opt/venv/bin/pip install "$PYCAMILLADSP_URL"
+
+    INSTALL_TM1637=false
+    if /opt/venv/bin/pip show camilladsp &> /dev/null; then
+        echo "✅ camilladsp (pycamilladsp) already installed, skipping."
+    else
+        echo "📦 Installing camilladsp from $PYCAMILLADSP_URL..."
+        sudo /opt/venv/bin/pip install "$PYCAMILLADSP_URL"
+        INSTALL_TM1637=true
+    fi
 
     # -------------------------------------------------------------------------
     # 4. Download scripts
     # -------------------------------------------------------------------------
-    # Reinstall: remember the REMOTE_NAME of the existing lybrica.py (set by the pairing option)
     SAVED_REMOTE_NAME=""
     if [ -f "$HOME/scripts/lybrica.py" ]; then
         SAVED_REMOTE_NAME=$(/opt/venv/bin/python3 - "$HOME/scripts/lybrica.py" <<'EOF' || true
@@ -184,11 +216,10 @@ EOF
 )
     fi
 
-    echo "📥 Downloading lybrica.py and tm1637_lgpio.py from GitHub..."
+    echo "📥 Downloading lybrica.py from GitHub..."
     mkdir -p "$HOME/scripts"
     wget -q https://raw.githubusercontent.com/melomane63/LyBriCa/main/lybrica.py -O "$HOME/scripts/lybrica.py"
 
-    # Reinstall: put the saved REMOTE_NAME back into the freshly downloaded file
     if [ -n "$SAVED_REMOTE_NAME" ]; then
         if /opt/venv/bin/python3 - "$HOME/scripts/lybrica.py" "$SAVED_REMOTE_NAME" <<'EOF'
 import json
@@ -219,15 +250,21 @@ EOF
         fi
     fi
 
-    PYVER=$(/opt/venv/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    wget -q https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py -O /tmp/tm1637_lgpio.py
-    sudo cp /tmp/tm1637_lgpio.py "/opt/venv/lib/python${PYVER}/site-packages/tm1637_lgpio.py"
-    rm -f /tmp/tm1637_lgpio.py
+    if $INSTALL_TM1637; then
+        PYVER=$(/opt/venv/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+        echo "📥 Downloading tm1637_lgpio.py from GitHub..."
+        wget -q https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py -O /tmp/tm1637_lgpio.py
+        sudo cp /tmp/tm1637_lgpio.py "/opt/venv/lib/python${PYVER}/site-packages/tm1637_lgpio.py"
+        rm -f /tmp/tm1637_lgpio.py
+    else
+        echo "✅ tm1637_lgpio.py already installed (with camilladsp), skipping."
+    fi
 
     # -------------------------------------------------------------------------
-    # 5. systemd service
+    # 5. systemd service (protected)
     # -------------------------------------------------------------------------
-    sudo tee /etc/systemd/system/lybrica.service > /dev/null <<EOL
+    SERVICE_FILE="/etc/systemd/system/lybrica.service"
+    SERVICE_CONTENT=$(cat <<EOL
 [Unit]
 Description=Lybrica (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)
 After=default.target
@@ -249,40 +286,77 @@ SyslogIdentifier=lybrica
 [Install]
 WantedBy=default.target
 EOL
+)
+
+    write_service_protected "lybrica.service" "$SERVICE_FILE" "$SERVICE_CONTENT" || true
 
     sudo systemctl daemon-reload
     sudo systemctl enable lybrica.service
-    sudo systemctl start lybrica.service
-    echo "✅ Lybrica service configured and started with /opt/venv/bin/python3 !"
+    sudo systemctl restart lybrica.service
+    echo "✅ Lybrica service configured and restarted with /opt/venv/bin/python3 !"
 }
 
 # =============================================================================
 # Function to install CamillaDSP & CamillaGUI (64-bit / aarch64, v5)
-#  - CamillaDSP v5.0.0-beta.2 dans /usr/local/bin/
-#  - CamillaGUI v5.0.0-beta.2 (binaire unique) dans /opt/camillagui_backend/
 # =============================================================================
 install_camilladsp() {
-    echo "🎛 Installing CamillaDSP (aarch64, v5.0.0-beta.2)..."
+    echo "🎛 Installing CamillaDSP (aarch64, v${CDSP_VERSION})..."
 
-    # --- Vérification architecture 64 bits ---------------------------------
     if [ "$(uname -m)" != "aarch64" ]; then
         echo "❌ Ce script ne fournit que des binaires aarch64 (64 bits)."
         echo "   Architecture détectée : $(uname -m). Utilise un OS Raspberry Pi OS 64 bits."
         return 1
     fi
 
-    # --- Dossiers ----------------------------------------------------------
     mkdir -p ~/camilladsp ~/camilladsp/coeffs ~/camilladsp/configs
 
-    # --- CamillaDSP v5.0.0-beta.2 (aarch64) --------------------------------
+    # --- CamillaDSP installed? --------------------------------------------
+    if command -v camilladsp &> /dev/null; then
+        CDSP_INSTALLED=$(camilladsp --version 2>/dev/null | awk '{print $2}')
+
+        if dpkg --compare-versions "$CDSP_INSTALLED" eq "$CDSP_VERSION" 2>/dev/null; then
+            VER_STATE="same as"
+        elif dpkg --compare-versions "$CDSP_INSTALLED" lt "$CDSP_VERSION" 2>/dev/null; then
+            VER_STATE="older than"
+        else
+            VER_STATE="newer than"
+        fi
+
+        echo "ℹ  CamillaDSP is already installed: v${CDSP_INSTALLED} (${VER_STATE} target v${CDSP_VERSION})."
+        read -p "Reinstall CamillaDSP & CamillaGUI? (y/n): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo "↩  Cancelled."
+            return 1
+        fi
+    fi
+
+    # --- CamillaDSP binary -------------------------------------------------
     echo "📥 CamillaDSP : $CDSP_URL"
     wget "$CDSP_URL" -O ~/camilladsp/camilladsp-linux-aarch64.tar.gz \
         || { echo "❌ Téléchargement CamillaDSP échoué"; return 1; }
     sudo tar -xvf ~/camilladsp/camilladsp-linux-aarch64.tar.gz -C /usr/local/bin/
     rm -f ~/camilladsp/camilladsp-linux-aarch64.tar.gz
 
-    # --- Service systemd CamillaDSP ----------------------------------------
-    sudo tee /etc/systemd/system/camilladsp.service > /dev/null <<EOL
+    # --- CamillaGUI binary -------------------------------------------------
+    echo "🖥️  Installing CamillaGUI (aarch64, v${CDSP_VERSION})..."
+    echo "📥 CamillaGUI : $GUI_URL"
+    wget "$GUI_URL" -O /tmp/camillagui_linux_aarch64.tar.gz \
+        || { echo "❌ Téléchargement CamillaGUI échoué"; return 1; }
+
+    sudo mkdir -p /opt/camillagui_backend
+    sudo tar -xzf /tmp/camillagui_linux_aarch64.tar.gz -C /opt/camillagui_backend/
+    rm -f /tmp/camillagui_linux_aarch64.tar.gz
+
+    if [ ! -f /opt/camillagui_backend/camillagui ]; then
+        echo "❌ Binaire 'camillagui' introuvable dans /opt/camillagui_backend/."
+        return 1
+    fi
+    sudo chmod +x /opt/camillagui_backend/camillagui
+    sudo chown -R "$USER":"$USER" /opt/camillagui_backend 2>/dev/null || true
+
+    # --- Service systemd CamillaDSP (protected) ---------------------------
+    CDSP_SERVICE_FILE="/etc/systemd/system/camilladsp.service"
+    CDSP_SERVICE_CONTENT=$(cat <<EOL
 [Unit]
 Description=CamillaDSP
 After=default.target
@@ -305,30 +379,13 @@ CPUSchedulingPriority=10
 [Install]
 WantedBy=default.target
 EOL
+)
 
+    write_service_protected "camilladsp.service" "$CDSP_SERVICE_FILE" "$CDSP_SERVICE_CONTENT" || true
 
-    echo "🖥️ Installing CamillaGUI (aarch64, v5.0.0-beta.2)..."
-    echo "📥 CamillaGUI : $GUI_URL"
-    wget "$GUI_URL" -O /tmp/camillagui_linux_aarch64.tar.gz \
-        || { echo "❌ Téléchargement CamillaGUI échoué"; return 1; }
-
-    # Extraction complète de l'archive dans le dossier de destination
-    ###sudo rm -rf /opt/camillagui_backend
-    sudo mkdir -p /opt/camillagui_backend
-    sudo tar -xzf /tmp/camillagui_linux_aarch64.tar.gz -C /opt/camillagui_backend/
-    rm -f /tmp/camillagui_linux_aarch64.tar.gz
-
-    if [ ! -f /opt/camillagui_backend/camillagui ]; then
-        echo "❌ Binaire 'camillagui' introuvable dans /opt/camillagui_backend/."
-        return 1
-    fi
-    sudo chmod +x /opt/camillagui_backend/camillagui
-
-    sudo chown -R "$USER":"$USER" /opt/camillagui_backend 2>/dev/null || true
-
-
-    # --- Service systemd CamillaGUI (pointe sur le binaire directement) ----
-    sudo tee /etc/systemd/system/camillagui.service > /dev/null <<EOL
+    # --- Service systemd CamillaGUI (protected) ---------------------------
+    GUI_SERVICE_FILE="/etc/systemd/system/camillagui.service"
+    GUI_SERVICE_CONTENT=$(cat <<EOL
 [Unit]
 Description=CamillaDSP Backend and GUI
 After=default.target
@@ -342,9 +399,13 @@ ExecStart=/opt/camillagui_backend/camillagui
 [Install]
 WantedBy=default.target
 EOL
+)
 
-    # --- Statefile CamillaDSP (format v5 : mute/volume en listes) ----------
-    cat > ~/camilladsp/statefile.yml <<EOL
+    write_service_protected "camillagui.service" "$GUI_SERVICE_FILE" "$GUI_SERVICE_CONTENT" || true
+
+    # --- Statefile CamillaDSP (protected) ---------------------------------
+    STATEFILE="$HOME/camilladsp/statefile.yml"
+    STATEFILE_CONTENT=$(cat <<EOL
 config_path: "/home/$USER/camilladsp/configs/_Setup.yml"
 mute:
 - false
@@ -353,9 +414,28 @@ volume:
 - -40.0
 - 0.0
 EOL
+)
 
-    # --- Config par défaut CamillaDSP --------------------------------------
-    cat > ~/camilladsp/configs/_Setup.yml <<EOL
+    if [ ! -f "$STATEFILE" ]; then
+        echo "📝 Creating statefile.yml..."
+        echo "$STATEFILE_CONTENT" > "$STATEFILE"
+        echo "✅ statefile.yml created."
+    elif [ "$(cat "$STATEFILE")" = "$STATEFILE_CONTENT" ]; then
+        echo "✅ statefile.yml already up to date, skipping."
+    else
+        echo "⚠  statefile.yml exists but differs from the script's version."
+        read -p "Overwrite statefile.yml? (y/n): " confirm
+        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+            echo "$STATEFILE_CONTENT" > "$STATEFILE"
+            echo "✅ statefile.yml overwritten."
+        else
+            echo "↩  Keeping existing statefile.yml (manual edits preserved)."
+        fi
+    fi
+
+    # --- Config par défaut CamillaDSP (protected) -------------------------
+    SETUPFILE="$HOME/camilladsp/configs/_Setup.yml"
+    SETUPFILE_CONTENT=$(cat <<EOL
 devices:
   samplerate: 48000
   chunksize: 512
@@ -372,6 +452,24 @@ devices:
     format: S16_LE
 title: Setup
 EOL
+)
+
+    if [ ! -f "$SETUPFILE" ]; then
+        echo "📝 Creating _Setup.yml..."
+        echo "$SETUPFILE_CONTENT" > "$SETUPFILE"
+        echo "✅ _Setup.yml created."
+    elif [ "$(cat "$SETUPFILE")" = "$SETUPFILE_CONTENT" ]; then
+        echo "✅ _Setup.yml already up to date, skipping."
+    else
+        echo "⚠  _Setup.yml exists but differs from the script's version."
+        read -p "Overwrite _Setup.yml? (y/n): " confirm
+        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+            echo "$SETUPFILE_CONTENT" > "$SETUPFILE"
+            echo "✅ _Setup.yml overwritten."
+        else
+            echo "↩  Keeping existing _Setup.yml (manual edits preserved)."
+        fi
+    fi
 
     # --- Module ALSA loopback ----------------------------------------------
     if ! grep -q "^snd-aloop" /etc/modules-load.d/snd-aloop.conf 2>/dev/null; then
@@ -379,20 +477,37 @@ EOL
     fi
     sudo modprobe snd-aloop
 
-
     # --- Activation et démarrage -------------------------------------------
     sudo systemctl daemon-reload
     sudo systemctl enable camilladsp camillagui
-    sudo systemctl start camilladsp camillagui
+    sudo systemctl restart camilladsp camillagui
 
-    echo "✅ CamillaDSP v5.0.0-beta.2 (~/camilladsp) et CamillaGUI v5.0.0-beta.2 (/opt/camillagui_backend/camillagui) installés et démarrés !"
-
+    echo "✅ CamillaDSP v${CDSP_VERSION} (~/camilladsp) et CamillaGUI v${CDSP_VERSION} (/opt/camillagui_backend/camillagui) configurés et redémarrés !"
 }
 
 # =============================================================================
 # Function to install Lyrion Media Server
 # =============================================================================
 install_lyrion() {
+    INSTALLED=$(dpkg-query -W -f='${Version}' lyrionmusicserver 2>/dev/null || true)
+
+    if [ -z "$INSTALLED" ]; then
+        echo "🎵 Lyrion Media Server not installed, installing v${LMS_VERSION}..."
+    else
+        if dpkg --compare-versions "$INSTALLED" eq "$LMS_VERSION" 2>/dev/null; then
+            echo "ℹ  Lyrion Media Server v${INSTALLED} is already installed (same as target)."
+        elif dpkg --compare-versions "$INSTALLED" lt "$LMS_VERSION" 2>/dev/null; then
+            echo "ℹ  Installed version (v${INSTALLED}) is OLDER than target (v${LMS_VERSION})."
+        else
+            echo "⚠  Installed version (v${INSTALLED}) is NEWER than target (v${LMS_VERSION})."
+        fi
+        read -p "Reinstall with v${LMS_VERSION}? (y/n): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo "↩  Cancelled, keeping v${INSTALLED}."
+            return 1
+        fi
+    fi
+
     echo "🎵 Installing Lyrion Media Server (v${LMS_VERSION})..."
     wget "$LMS_URL" -O ~/lyrionmusicserver_arm.deb
     sudo dpkg -i ~/lyrionmusicserver_arm.deb || sudo apt --fix-broken install -y
@@ -406,7 +521,6 @@ install_squeezelite() {
     echo "🔊 Installing Squeezelite..."
     sudo apt install -y squeezelite
 
-    # Safely update Squeezelite output device
     sudo sed -i '/^SL_OPTIONS=/d;/^SL_SOUNDCARD=/d;/^SB_EXTRA_ARGS=/d' /etc/default/squeezelite
     echo -e 'SL_SOUNDCARD="hw:Loopback,0"\nSB_EXTRA_ARGS="-W -C 5 -r 48000-48000 -R hLE"' | sudo tee -a /etc/default/squeezelite > /dev/null
 
@@ -639,7 +753,6 @@ while true; do
         continue
     fi
 
-    # --- Validate all entries first (strict mode) -------------------------
     for option in "${choices[@]}"; do
         case $option in
             1|2|3|4|5|6|7|8) ;;
@@ -648,10 +761,8 @@ while true; do
         esac
     done
 
-    # --- Sort numeric choices (unique + ascending) ------------------------
     mapfile -t sorted_numeric < <(printf '%s\n' "${choices[@]}" | grep -E '^[1-8]$' | sort -n -u)
 
-    # --- Detect S / Q presence --------------------------------------------
     has_shutdown=false
     has_quit=false
     for option in "${choices[@]}"; do
@@ -661,21 +772,19 @@ while true; do
         esac
     done
 
-    # --- Execute numeric actions first, in numeric order ------------------
     for option in "${sorted_numeric[@]}"; do
         case $option in
-            1) upgrade_system ;;
-            2) install_camilladsp ;;
-            3) install_lyrion ;;
-            4) install_squeezelite ;;
-            5) set_sound_card ;;
-            6) mount_usb_drive ;;
-            7) install_lybrica ;;
-            8) pair_bluetooth_remote ;;
+            1) upgrade_system || true ;;
+            2) install_camilladsp || true ;;
+            3) install_lyrion || true ;;
+            4) install_squeezelite || true ;;
+            5) set_sound_card || true ;;
+            6) mount_usb_drive || true ;;
+            7) install_lybrica || true ;;
+            8) pair_bluetooth_remote || true ;;
         esac
     done
 
-    # --- Then handle S / Q with confirmation (S takes priority) -----------
     if $has_shutdown; then
         shutdown_now && exit 0
     fi

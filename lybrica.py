@@ -53,6 +53,9 @@ if ENABLE_TOSLINK_SWITCH:
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("remote")
 
+# PiCorePlayer persistent partition: also tells us whether we run on pCP
+PCP_DIR = "/mnt/mmcblk0p2/tce"
+
 
 # ========================= SETTINGS =========================
 # Everything you may want to change is here, grouped by topic.
@@ -132,7 +135,12 @@ HYSTERESIS_RATIO = 0.03     # 3 % hysteresis between two brightness levels
 
 # ---------------------- Remote control ----------------------
 
-REMOTE_NAME = "pCP BLE HID Keyboard"
+# Name of the remote on Debian (rewritten by the installer, option 7).
+# On PiCorePlayer the name is fixed (REMOTE_NAME_PCP) and the Debian value is ignored.
+REMOTE_NAME = "HID Remote01 Keyboard"
+REMOTE_NAME_PCP = "pCP BLE HID Keyboard"
+if os.path.isdir(PCP_DIR):
+    REMOTE_NAME = REMOTE_NAME_PCP
 
 # Keys (all require ENABLE_REMOTE = True)
 KEY_BINDINGS = {
@@ -198,8 +206,7 @@ DEFAULT_LOUDNESS_REF = -20  # Loudness level restored by ENTER when no previous 
 
 TASK_RESTART_DELAY_S = 2.0  # Seconds before a background task that crashed is restarted
 
-# CamillaDSP configs: PiCorePlayer's persistent partition, or ~ elsewhere.
-PCP_DIR    = "/mnt/mmcblk0p2/tce"
+# CamillaDSP configs: PiCorePlayer's persistent partition (PCP_DIR), or ~ elsewhere.
 BASE_DIR   = PCP_DIR if os.path.isdir(PCP_DIR) else os.path.expanduser("~")
 CONFIG_DIR = BASE_DIR + "/camilladsp/configs/"
 

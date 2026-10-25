@@ -9,7 +9,8 @@ set -e
 upgrade_system() {
     echo "🔄 Updating and upgrading system..."
     sudo apt update && sudo apt upgrade -y
-    sudo apt install -y git wget curl python3-pip python3-venv python3-dev build-essential systemd libasound2-dev
+    ###sudo apt install -y git wget curl python3-pip python3-venv python3-dev build-essential systemd libasound2-dev
+    sudo apt install -y wget systemd
 }
 
 # =============================================================================
@@ -21,6 +22,12 @@ upgrade_system() {
 # =============================================================================
 install_lybrica() {
     echo "🎮 Installing Lybrica (Remote, Display, Trigger, Autoconfig for CamillaDSP <-> LMS volume sync)..."
+
+    # -------------------------------------------------------------------------
+    # 0. Lybrica-specific dependencies
+    # -------------------------------------------------------------------------
+    echo "📦 Installing Lybrica dependencies..."
+    sudo apt install -y git curl python3-pip python3-venv python3-dev build-essential libasound2-dev
 
     # -------------------------------------------------------------------------
     # 1. Configure /boot/firmware/config.txt and cmdline.txt

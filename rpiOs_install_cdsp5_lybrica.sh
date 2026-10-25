@@ -626,14 +626,13 @@ while true; do
     echo "4) Install Squeezelite"
     echo "5) Configure Sound Levels (alsamixer)"
     echo "6) Mount USB Drive"
-    echo "7) Install Lybrica (Remote, Display, Trigger, Autoconfig...)"
+    echo "7) Install Lybrica (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)"
     echo "8) Pair Bluetooth Remote"
     echo "S) Shutdown System"
     echo "Q) Quit"
     echo "=================================="
-    echo "Tip: you can chain several actions, e.g. '2 6 S' (install CamillaDSP + mount USB + shutdown)."
-    echo "     Numeric actions run first in numeric order; S is asked last (with confirmation)."
-    read -p "Choose an option [1-8, S, Q] (space-separated for multiple): " -a choices
+    echo "Tip: chain actions with spaces: '2 6 S' = '6 S 2' (numbers ascending, then S, then Q)."
+    read -p "Choose an option [1-8, S, Q] : " -a choices
 
     if [ "${#choices[@]}" -eq 0 ]; then
         echo "⚠  No option entered."

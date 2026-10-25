@@ -31,6 +31,45 @@ say()  { echo "==> $*"; }
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
 ###########################################################################
+# CENTRALIZED URLS AND VERSIONS
+# All remote resources fetched by this script are listed here.
+# To upgrade a component, change ONLY the matching variable below.
+###########################################################################
+
+# --- 1) CamillaDSP + CamillaGUI -----------------------------------------
+CDSP_VER="5.0.0-beta.2"          # CamillaDSP release tag
+GUI_VER="5.0.0-beta.2"           # camillagui-backend release tag
+
+# Binary archives (arch suffix is appended at runtime: aarch64|armv7)
+CDSP_URL_BASE="https://github.com/HEnquist/camilladsp/releases/download/v${CDSP_VER}"
+CDSP_URL_ARCH="camilladsp-linux-%s.tar.gz"      # %s = aarch64|armv7
+
+GUI_URL_BASE="https://github.com/HEnquist/camillagui-backend/releases/download/v${GUI_VER}"
+GUI_URL_ARCH="camillagui_linux_%s.tar.gz"       # %s = aarch64|armv7
+
+# --- 2) LyBriCa + BLE HID bridge ----------------------------------------
+PYCAMILLA_REF="next5"            # branch, tag or commit of pycamilladsp
+PYCAMILLA_URL="git+https://github.com/HEnquist/pycamilladsp.git@${PYCAMILLA_REF}"
+
+TM1637_URL="https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py"
+LYBRICA_URL="https://github.com/melomane63/LyBriCa/raw/refs/heads/main/lybrica.py"
+
+# Patched BLE HID bridge files (raw URLs, no HTML)
+PCP_BT_RAW_BASE="https://raw.githubusercontent.com/melomane63/pcp-ble-gatt/refs/heads/main"
+PCP_BT_HID_BLE_BRIDGE_URL="${PCP_BT_RAW_BASE}/hid_ble_bridge.py"
+PCP_BT_HIDBRIDGE_URL="${PCP_BT_RAW_BASE}/hidbridge"
+
+# --- 3) ESP32C3 ---------------------------------------------------------
+# No remote URL: only local pCP files (config.txt, pcp.cfg) and
+# shutdown-monitor.tcz from the pCP repository.
+
+# --- pCP extension names (for reference) --------------------------------
+EXT_CDSP="CDSPpiCore.tcz"
+EXT_LYBRICA="lybrica.tcz"
+EXT_PCP_BT="pcp-bt.tcz"
+EXT_SHUTDOWN_MONITOR="shutdown-monitor.tcz"
+
+###########################################################################
 # 1) CAMILLADSP  (extension version)
 #
 # Layout:
@@ -46,8 +85,7 @@ install_camilladsp() {
 set -e
 
 ### ======================= CONFIG ==========================================
-CDSP_VER="5.0.0-beta.2"          # CamillaDSP version
-GUI_VER="5.0.0-beta.2"           # camillagui-backend version
+# CDSP_VER and GUI_VER are defined globally at the top of this file.
 DAC_FROM_PCP="yes"               # "yes": take the DAC from OUTPUT in pcp.cfg (read BEFORE it is switched to the loopback)
 DAC_DEVICE="null"                # fallback DAC: ALSA "null" output (silence); replace with the real DAC (e.g. hw:CARDNAME,0, see /proc/asound/cards)
 SAMPLERATE=48000                 # fixed pipeline sample rate
@@ -148,8 +186,10 @@ CDSP_BIN="$EXT/usr/local/bin/camilladsp"
 mkdir -p "$BASE/configs" "$BASE/coeffs" "$BASE/camillagui/config"
 
 cd "$TMPDIR_CDSP"
-wget -O camilladsp.tar.gz \
-    "https://github.com/HEnquist/camilladsp/releases/download/v${CDSP_VER}/camilladsp-linux-${ARCH_SUFFIX}.tar.gz"
+CDSP_ASSET=$(printf "$CDSP_URL_ARCH" "$ARCH_SUFFIX")
+CDSP_URL="${CDSP_URL_BASE}/${CDSP_ASSET}"
+echo ">>> CamillaDSP: $CDSP_URL"
+wget -O camilladsp.tar.gz "$CDSP_URL"
 tar -xzf camilladsp.tar.gz -C "$EXT/usr/local/bin"
 rm -f camilladsp.tar.gz
 chmod +x "$CDSP_BIN"
@@ -251,8 +291,8 @@ case "$ARCH_SUFFIX" in
     aarch64) GUI_ARCH="aarch64" ;;
     *)       GUI_ARCH="armv7" ;;
 esac
-GUI_ASSET="camillagui_linux_${GUI_ARCH}.tar.gz"
-GUI_URL="https://github.com/HEnquist/camillagui-backend/releases/download/v${GUI_VER}/${GUI_ASSET}"
+GUI_ASSET=$(printf "$GUI_URL_ARCH" "$GUI_ARCH")
+GUI_URL="${GUI_URL_BASE}/${GUI_ASSET}"
 
 echo ">>> GUI: $GUI_URL"
 GUI_TMP="$TMPDIR_CDSP/gui"
@@ -327,20 +367,20 @@ chmod 775 "$EXT/usr/local/tce.installed/CDSPpiCore"
 
 ### --- 6. Build and register the extension ---------------------------------
 install_temporarily_if_missing squashfs-tools
-TCZ="$TMPDIR_CDSP/CDSPpiCore.tcz"
+TCZ="$TMPDIR_CDSP/$EXT_CDSP"
 mksquashfs "$EXT" "$TCZ" -noappend -all-root
-mv -f "$TCZ" "$OPT/CDSPpiCore.tcz"
+mv -f "$TCZ" "$OPT/$EXT_CDSP"
 
 # Make sure the kernel modules (snd-aloop) are loaded before our script runs
 ALSA_EXT="alsa-modules-$(uname -r).tcz"
 if [ -f "$OPT/$ALSA_EXT" ]; then
-    echo "$ALSA_EXT" > "$OPT/CDSPpiCore.tcz.dep"
+    echo "$ALSA_EXT" > "$OPT/$EXT_CDSP.dep"
 else
     echo "!!! WARNING: $OPT/$ALSA_EXT not found: no .dep written, check that snd-aloop is loaded early enough."
 fi
 
-grep -qx "CDSPpiCore.tcz" /etc/sysconfig/tcedir/onboot.lst \
-    || echo "CDSPpiCore.tcz" >> /etc/sysconfig/tcedir/onboot.lst
+grep -qx "$EXT_CDSP" /etc/sysconfig/tcedir/onboot.lst \
+    || echo "$EXT_CDSP" >> /etc/sysconfig/tcedir/onboot.lst
 
 # Migration: remove the old bootlocal.sh start and the old loose files
 sudo sed -i '/# camilladsp-start/d' /opt/bootlocal.sh
@@ -369,7 +409,7 @@ pcp backup
 
 set +v
 echo ""
-echo "CamillaDSP extension installed (CDSPpiCore.tcz). Reboot to start it."
+echo "CamillaDSP extension installed ($EXT_CDSP). Reboot to start it."
 echo "Web interface: http://pcp.local:5000/gui/index.html"
 echo "After reboot, check:"
 echo "  tce-status -i | grep CDSPpiCore"
@@ -399,9 +439,8 @@ echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): 
 # unlike the old pip --user install in /home/tc/.local.
 ###########################################################################
 install_lybrica() {
-    PYCAMILLA_REF="next5"   # branch, tag or commit of pycamilladsp
-    TM1637_URL="https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py"
-    LYBRICA_URL="https://github.com/melomane63/LyBriCa/raw/refs/heads/main/lybrica.py"
+    # PYCAMILLA_REF, PYCAMILLA_URL, TM1637_URL, LYBRICA_URL,
+    # PCP_BT_HID_BLE_BRIDGE_URL and PCP_BT_HIDBRIDGE_URL are defined globally.
 
     OPT=/etc/sysconfig/tcedir/optional
     TMPDIR_LY=/tmp/install_lybrica
@@ -434,8 +473,8 @@ install_lybrica() {
     # 3. Python modules (pip --target, into the extension, not --user)
     say "Installing pycamilladsp ($PYCAMILLA_REF)..."
     python3 -m pip install --target "$SP" --no-cache-dir --force-reinstall \
-        "git+https://github.com/HEnquist/pycamilladsp.git@$PYCAMILLA_REF" \
-        || fail "pycamilladsp install failed."
+        "$PYCAMILLA_URL" \
+        || fail "pycamilladsp install failed ($PYCAMILLA_URL)."
 
     for pkg in websocket_client pyserial lgpio pyalsaaudio; do
         say "Installing $pkg..."
@@ -617,567 +656,4 @@ Commands:
   help            Show this help.
 
   start           Start LyBriCa if not already running (root required).
-                  Idempotent: does nothing if already running. Used at boot.
-
-  restart         Stop any running instance, then start (root required).
-                  Use this after editing /home/tc/lybrica-mod.py.
-
-  stop            Stop the running instance (root required).
-
-  status          Show which launcher would be used and whether the
-                  daemon is running (no root required).
-
-  log [N]         Follow /home/tc/lybrica.log (default: last 50 lines).
-                  No root required. Ctrl+C to stop following.
-
-  reset           Restore /home/tc/lybrica-mod.py from the factory copy
-                  shipped in the tcz. Creates the file if missing, asks
-                  for confirmation before overwriting an existing file.
-                  No root required.
-
-Override workflow:
-  1. lybrica reset               create or restore /home/tc/lybrica-mod.py
-  2. vi /home/tc/lybrica-mod.py  edit it
-  3. sudo lybrica restart        apply the new version
-  4. pcp bu                      persist across reboots
-
-Without /home/tc/lybrica-mod.py, the factory version from the tcz runs
-(read-only, cannot be edited in place). Deleting the file falls back to
-that factory version on the next start.
-
-Files:
-  /home/tc/lybrica-mod.py     Editable override (optional, not created by install)
-  /home/tc/lybrica.log        Python output (follow with: lybrica log)
-  /home/tc/pcp_startup.log    Launcher trace (starts, stops, overrides)
-  /home/tc/lybrica.pid        Current process id
-
-Shortcut: /usr/local/bin/lybrica is a symlink to start_lybrica.sh.
-HELP
-        exit 0 ;;
-
-    status)
-        if [ -f "$MOD" ]; then
-            echo "launcher: $MOD (copied to $LYBRICA at start)"
-        else
-            echo "launcher: $LYBRICA (tcz version, no local copy)"
-        fi
-        if [ -n "$PID" ]; then echo "lybrica.py running (pid $PID)"; exit 0
-        else                   echo "lybrica.py not running";        exit 1
-        fi ;;
-
-    log)
-        [ -r "$LYBRICA_LOG" ] || { echo "No log file yet: $LYBRICA_LOG" >&2; exit 1; }
-        LINES=${2:-50}
-        exec tail -n "$LINES" -f "$LYBRICA_LOG" ;;
-
-    reset)
-        # Restore /home/tc/lybrica-mod.py from the factory copy shipped in
-        # the extension. Reads /tmp/tcloop/... directly, never
-        # /usr/local/bin/lybrica.py, because that file may currently hold
-        # a previous mod (a broken one, for example).
-        if [ ! -e "$FACTORY" ]; then
-            echo "ERROR: factory copy not found: $FACTORY" >&2
-            echo "       Is lybrica.tcz mounted? Check: tce-status -i | grep lybrica" >&2
-            exit 1
-        fi
-        if [ -f "$MOD" ] && cmp -s "$MOD" "$FACTORY"; then
-            echo "$MOD already matches the factory copy, nothing to do."
-            exit 0
-        fi
-        if [ -f "$MOD" ]; then
-            echo "About to overwrite $MOD with the factory copy."
-            echo "  current : $(wc -c < "$MOD") bytes"
-            echo "  factory : $(wc -c < "$FACTORY") bytes"
-            printf "Continue? [y/N]: "
-            read -r ANSWER
-            case "$ANSWER" in
-                y|Y) ;;
-                *) echo "Cancelled, $MOD unchanged."; exit 0 ;;
-            esac
-        fi
-        rm -f "$MOD"
-        if cp "$FACTORY" "$MOD"; then
-            echo "Restored: $MOD (from the factory copy)"
-            echo "Apply it now with:  sudo lybrica restart"
-        else
-            echo "ERROR: cannot create $MOD" >&2
-            exit 1
-        fi ;;
-
-    stop)
-        if [ -z "$PID" ]; then log "Nothing to stop"; exit 0; fi
-        stop_one "$PID" || exit 1
-        exit 0 ;;
-
-    start)
-        if [ -n "$PID" ]; then
-            log "lybrica.py already running (pid $PID), exiting."
-            exit 0
-        fi
-        start_one || exit 1 ;;
-
-    restart)
-        if [ -n "$PID" ]; then
-            log "Restart requested, stopping pid $PID first."
-            stop_one "$PID" || exit 1
-        else
-            log "Restart requested, but nothing was running."
-        fi
-        start_one || exit 1 ;;
-esac
-EOF
-    chmod 755 "$EXT/usr/local/bin/start_lybrica.sh"
-    sh -n "$EXT/usr/local/bin/start_lybrica.sh" || fail "Syntax error in start_lybrica.sh."
-
-    # Shortcut: "lybrica status" instead of "start_lybrica.sh --status".
-    # Relative symlink, resolved inside the mounted tcz.
-    ln -s start_lybrica.sh "$EXT/usr/local/bin/lybrica"
-
-    # 7. Empty tce.installed (nothing to launch at boot: bootlocal.sh does it)
-    : > "$EXT/usr/local/tce.installed/lybrica"
-
-    # 8. Build and register the extension
-    say "Building lybrica.tcz..."
-    TCZ="$TMPDIR_LY/lybrica.tcz"
-    mksquashfs "$EXT" "$TCZ" -noappend -all-root || fail "mksquashfs failed."
-    mv -f "$TCZ" "$OPT/lybrica.tcz"
-
-    # Dependencies: Python, evdev, bleak, and CDSPpiCore if present
-    {
-        echo "python3.11.tcz"
-        echo "python3.11-evdev.tcz"
-        echo "python3.11-bleak.tcz"
-        [ -f "$OPT/CDSPpiCore.tcz" ] && echo "CDSPpiCore.tcz"
-    } > "$OPT/lybrica.tcz.dep"
-
-    grep -qx "lybrica.tcz" /etc/sysconfig/tcedir/onboot.lst \
-        || echo "lybrica.tcz" >> /etc/sysconfig/tcedir/onboot.lst
-
-    # 8b. BLE HID bridge: rebuild pcp-bt.tcz with the patched hid_ble_bridge.py
-    #     and hidbridge (see patch_pcp_bt). A failure here only warns: LyBriCa
-    #     itself is already installed and pcp bu must still run.
-    say "Patching pcp-bt.tcz (BLE HID bridge)..."
-    patch_pcp_bt || echo "!!! WARNING: pcp-bt.tcz was not patched (see messages above)."
-
-    # 9. Update bootlocal.sh: ensure the launcher is present
-    NEW_LINE="/usr/local/bin/start_lybrica.sh &"
-    if grep -qxF "$NEW_LINE" "$BOOTLOCAL"; then
-        say "bootlocal.sh already points to $NEW_LINE"
-    else
-        say "Updating $BOOTLOCAL..."
-        TMP=$(mktemp)
-        grep -vxF "$NEW_LINE" "$BOOTLOCAL" > "$TMP" || true
-        N=$(grep -n '^#pCPstop' "$TMP" | head -1 | cut -d: -f1)
-        if [ -n "$N" ]; then
-            TMP2=$(mktemp)
-            head -n "$N" "$TMP" > "$TMP2"
-            echo "$NEW_LINE" >> "$TMP2"
-            tail -n +$((N+1)) "$TMP" >> "$TMP2"
-            mv "$TMP2" "$TMP"
-        else
-            echo "$NEW_LINE" >> "$TMP"
-        fi
-        sudo sh -c "cat $TMP > $BOOTLOCAL" || fail "Cannot write $BOOTLOCAL."
-        rm -f "$TMP"
-    fi
-
-    # 10. Check imports from the build dir (proves both tc and root see them)
-    say "Checking imports from the build dir (tc)..."
-    PYTHONPATH="$SP" python3 -c \
-        "import camilladsp, websocket, serial, lgpio, alsaaudio, evdev, tm1637_lgpio, bleak" \
-        || fail "A module cannot be imported from the build dir (tc)."
-    say "Checking imports from the build dir (root)..."
-    sudo PYTHONPATH="$SP" python3 -c \
-        "import camilladsp, websocket, serial, lgpio, alsaaudio, evdev, tm1637_lgpio, bleak" \
-        || fail "A module cannot be imported from the build dir (root)."
-
-    # 11. Save
-    say "Saving with pcp bu..."
-    pcp bu
-
-    rm -rf "$TMPDIR_LY"
-
-    echo
-    echo "LyBriCa installed as lybrica.tcz. The temporary build"
-    echo "tools disappear at the next reboot."
-    echo "  /usr/local/bin/start_lybrica.sh   (launcher, from the extension)"
-    echo "  /usr/local/bin/lybrica            (symlink, e.g. 'lybrica help')"
-    echo "  /usr/local/bin/lybrica.py         (from the extension, read-only)"
-    echo "  pcp-bt.tcz                        (rebuilt with the patched hid_ble_bridge.py + hidbridge)"
-    echo "  /home/tc/lybrica-mod.py           (optional, create with 'lybrica reset')"
-    echo "Reboot to activate:  pcp reboot"
-    echo "Logs: /home/tc/pcp_startup.log  /home/tc/lybrica.log"
-    echo "Commands: lybrica help"
-}
-
-###########################################################################
-# BLE HID bridge: patch pcp-bt.tcz
-#
-# pCP's own pcp-bt.tcz ships hid_ble_bridge.py and the "hidbridge" init
-# script. This replaces both with the versions from
-#   https://github.com/melomane63/pcp-ble-gatt
-# by unpacking pcp-bt.tcz, swapping the two files, rebuilding the squashfs
-# and putting it back. The result takes effect at the next reboot.
-#
-# - Idempotent: nothing is rebuilt if the extension already has these files.
-# - Safe: both files are downloaded and checked BEFORE anything is touched.
-# - Not fatal: returns non-zero with a message, the caller only warns.
-#
-# Uses OPT and TMPDIR_LY from install_lybrica; needs unsquashfs / mksquashfs
-# (squashfs-tools.tcz, already loaded with the temporary build tools).
-###########################################################################
-patch_pcp_bt() {
-    PB_URL="https://raw.githubusercontent.com/melomane63/pcp-ble-gatt/refs/heads/main"
-    PB_TCZ="$OPT/pcp-bt.tcz"
-    PB_TMP="$TMPDIR_LY/pcp-bt"
-    PB_EXT="$PB_TMP/ext"
-
-    if [ ! -f "$PB_TCZ" ]; then
-        echo "!!! pcp-bt.tcz not found in $OPT."
-        echo "    Install Bluetooth from the pCP web interface first, then re-run this step."
-        return 1
-    fi
-    if ! command -v unsquashfs >/dev/null 2>&1; then
-        echo "!!! unsquashfs not found (squashfs-tools.tcz not loaded?)"
-        return 1
-    fi
-
-    mkdir -p "$PB_TMP"
-
-    # 1. Download and check both files before touching anything
-    wget -q -O "$PB_TMP/hid_ble_bridge.py" "$PB_URL/hid_ble_bridge.py" \
-        || { echo "!!! Download failed: $PB_URL/hid_ble_bridge.py"; return 1; }
-    wget -q -O "$PB_TMP/hidbridge" "$PB_URL/hidbridge" \
-        || { echo "!!! Download failed: $PB_URL/hidbridge"; return 1; }
-    for f in hid_ble_bridge.py hidbridge; do
-        if head -c 300 "$PB_TMP/$f" | grep -qiE '<!doctype|<html'; then
-            echo "!!! $f is a web page (use the raw URL)."
-            return 1
-        fi
-    done
-    python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$PB_TMP/hid_ble_bridge.py" \
-        || { echo "!!! hid_ble_bridge.py is not valid Python"; return 1; }
-    sh -n "$PB_TMP/hidbridge" \
-        || { echo "!!! hidbridge has a syntax error"; return 1; }
-
-    # 2. Unpack the current pcp-bt.tcz
-    unsquashfs -f -d "$PB_EXT" "$PB_TCZ" > /dev/null \
-        || { echo "!!! unsquashfs failed on $PB_TCZ"; return 1; }
-    for d in usr/local/bin usr/local/etc/init.d; do
-        [ -d "$PB_EXT/$d" ] || { echo "!!! $d missing in pcp-bt.tcz: unexpected layout"; return 1; }
-    done
-
-    # 3. Already patched? Then there is nothing to rebuild
-    if cmp -s "$PB_TMP/hid_ble_bridge.py" "$PB_EXT/usr/local/bin/hid_ble_bridge.py" \
-       && cmp -s "$PB_TMP/hidbridge" "$PB_EXT/usr/local/etc/init.d/hidbridge"; then
-        echo ">>> pcp-bt.tcz already contains these two files: nothing to do."
-        return 0
-    fi
-
-    # 4. Swap the two files
-    cp "$PB_TMP/hid_ble_bridge.py" "$PB_EXT/usr/local/bin/hid_ble_bridge.py"
-    cp "$PB_TMP/hidbridge"         "$PB_EXT/usr/local/etc/init.d/hidbridge"
-    chmod 755 "$PB_EXT/usr/local/bin/hid_ble_bridge.py" "$PB_EXT/usr/local/etc/init.d/hidbridge"
-
-    # 5. Rebuild and put it back
-    mksquashfs "$PB_EXT" "$PB_TMP/pcp-bt.tcz" -noappend -all-root > /dev/null \
-        || { echo "!!! mksquashfs failed"; return 1; }
-
-    # The original md5 no longer matches the rebuilt file: keep it as .orig
-    if [ -f "$OPT/pcp-bt.tcz.md5.txt" ]; then
-        [ -f "$OPT/pcp-bt.tcz.md5.txt.orig" ] || cp "$OPT/pcp-bt.tcz.md5.txt" "$OPT/pcp-bt.tcz.md5.txt.orig"
-        rm -f "$OPT/pcp-bt.tcz.md5.txt"
-    fi
-    mv -f "$PB_TMP/pcp-bt.tcz" "$PB_TCZ"
-    echo ">>> pcp-bt.tcz rebuilt with the patched hid_ble_bridge.py and hidbridge (active after reboot)."
-    return 0
-}
-
-###########################################################################
-# ESP32C3 helper (called from install_esp32)
-#
-# Edits config.txt (FAT partition, /mnt/mmcblk0p1) to add, under [all],
-# the lines that are not already there:
-#   dtoverlay=gpio-poweroff,gpiopin=26,active_low=1
-#   dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down
-#   enable_uart=1
-# Then sets the matching GPIO options in pcp.cfg and installs
-# shutdown-monitor.tcz.
-#
-# Return codes:
-#   0              config.txt updated (reboot required)
-#   SKIP_RC        user cancelled (config.txt unchanged)
-#   UNCHANGED_RC   every line already present (no change, no reboot)
-#   other          error (do not exit the parent step)
-###########################################################################
-configure_esp32c3() {
-    echo
-    echo '-----------------------------------------------------------------'
-    echo ' ESP32C3 microcontroller support'
-    echo '-----------------------------------------------------------------'
-    echo ' This step edits config.txt (FAT partition, /mnt/mmcblk0p1).'
-    echo ''
-    echo ' It ADDS, under [all], the lines that are not already there:'
-    echo '   dtoverlay=gpio-poweroff,gpiopin=26,active_low=1'
-    echo '       (GPIO 26: "shutdown done" signal to the ESP32)'
-    echo '   dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down'
-    echo '       (GPIO 16: shutdown request from the ESP32)'
-    echo '   enable_uart=1'
-    echo '       (UART on GPIO 14/15, link with the ESP32)'
-    echo ''
-    echo ' Nothing is removed. Meant for a fresh install: on a bare Raspberry Pi'
-    echo ' these GPIOs are free (GPIO 14/15 = UART, GPIO 16 and 26 = plain GPIOs).'
-    echo ' If you use a HAT or another add-on board, check its pinout first.'
-    echo ''
-    echo ' Expected setup (ESP32C3 + relay):'
-    echo '   1. A physical button is wired to the ESP32.'
-    echo '   2. Pressing it while the Pi runs: the ESP32 requests a shutdown (GPIO 16).'
-    echo '   3. The Pi shuts down and signals it (GPIO 26); the ESP32 then cuts'
-    echo '      the power with a relay.'
-    echo '   4. Pressing the button again: the ESP32 closes the relay and the Pi boots.'
-    echo ''
-    echo ' It also sets the matching GPIO options in pcp.cfg (so the pCP web'
-    echo ' interface does not overwrite them) and installs shutdown-monitor.tcz'
-    echo ' (REQUIRED for GPIO 16 to actually shut the Pi down).'
-    echo ''
-    echo ' A backup is kept as config.txt.bak (created once, never overwritten).'
-    echo ' A reboot is required to apply the changes.'
-    echo '-----------------------------------------------------------------'
-    echo
-    printf "Apply the ESP32C3 configuration to config.txt? [y/N]: "
-    read -r ESP_ANS
-    case "$ESP_ANS" in
-        y|Y) ;;
-        *)
-            say "Cancelled (config.txt unchanged)."
-            return "$SKIP_RC" ;;
-    esac
-
-    ESP_SCRIPT=/tmp/fix_gpio_overlays.sh
-    cat > "$ESP_SCRIPT" <<'GPIO_SCRIPT_EOF'
-#!/bin/sh
-# Add the gpio-poweroff (GPIO 26) and gpio-shutdown (GPIO 16) overlays and
-# enable the UART, only for the lines that are not already in config.txt.
-
-set -e
-
-FAT_MNT=/mnt/mmcblk0p1
-FAT_DEV=/dev/mmcblk0p1
-CONFIG="$FAT_MNT/config.txt"
-
-[ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root (sudo $0)" >&2; exit 1; }
-
-# Mount the FAT partition if not already mounted.
-# MOUNTED_BY_US remembers it, so it is unmounted at the end only in that case.
-MOUNTED_BY_US=0
-if ! mount | grep -q " $FAT_MNT "; then
-    mkdir -p "$FAT_MNT"
-    mount "$FAT_DEV" "$FAT_MNT"
-    MOUNTED_BY_US=1
-    echo ">>> $FAT_DEV mounted on $FAT_MNT"
-fi
-
-[ -f "$CONFIG" ] || { echo "ERROR: $CONFIG not found" >&2; exit 1; }
-
-# Backup of the original config.txt (created once, never overwritten, so the
-# first untouched copy is always kept).
-if [ ! -f "$CONFIG.bak" ]; then
-    cp -p "$CONFIG" "$CONFIG.bak"
-    echo ">>> Backup created: $CONFIG.bak"
-else
-    echo ">>> Backup already present: $CONFIG.bak (kept as is)"
-fi
-
-# Add a line only if it is not already in config.txt (exact line match).
-# "[all]" is written once, before the first added line: without it, the
-# lines would only apply to the conditional section (e.g. [pi4]) the file
-# happens to end with.
-ADDED=0
-add_line() {
-    if grep -qxF "$1" "$CONFIG"; then
-        echo ">>> Already present: $1"
-    else
-        if [ "$ADDED" -eq 0 ]; then
-            # Make sure the file ends with a newline before appending
-            [ -z "$(tail -c1 "$CONFIG")" ] || echo >> "$CONFIG"
-            echo "[all]" >> "$CONFIG"
-            ADDED=1
-        fi
-        echo "$1" >> "$CONFIG"
-        echo ">>> Added: $1"
-    fi
-}
-
-add_line "dtoverlay=gpio-poweroff,gpiopin=26,active_low=1"
-add_line "dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down"
-add_line "enable_uart=1"
-
-echo ">>> $CONFIG, last lines:"
-tail -10 "$CONFIG"
-
-if [ "$MOUNTED_BY_US" -eq 1 ]; then
-    umount "$FAT_MNT"
-    echo ">>> $FAT_MNT unmounted"
-else
-    echo ">>> $FAT_MNT was already mounted: left mounted"
-fi
-
-# Tell the caller whether anything was actually added.
-# 20 matches UNCHANGED_RC in install_pcp.sh: "already up to date".
-if [ "$ADDED" -eq 0 ]; then
-    exit 20
-fi
-exit 0
-GPIO_SCRIPT_EOF
-
-    chmod 755 "$ESP_SCRIPT"
-    sudo sh "$ESP_SCRIPT"
-    ESP_RC=$?
-    rm -f "$ESP_SCRIPT"
-
-    if [ "$ESP_RC" -eq 0 ] || [ "$ESP_RC" -eq "$UNCHANGED_RC" ]; then
-        PCP_CFG=/usr/local/etc/pcp/pcp.cfg
-        set_pcp_cfg() {
-            if grep -q "^$1=" "$PCP_CFG"; then
-                sed "s|^$1=.*|$1=\"$2\"|" -i "$PCP_CFG"
-                echo ">>> pcp.cfg: $1=\"$2\""
-            else
-                echo "$1=\"$2\"" >> "$PCP_CFG"
-                echo ">>> pcp.cfg: $1=\"$2\" (added)"
-            fi
-        }
-        set_pcp_cfg GPIOPOWEROFF      "yes"
-        set_pcp_cfg GPIOPOWEROFF_GPIO "26"
-        set_pcp_cfg GPIOPOWEROFF_HI   "no"
-        set_pcp_cfg GPIOSHUTDOWN      "yes"
-        set_pcp_cfg GPIOSHUTDOWN_GPIO "16"
-        set_pcp_cfg GPIOSHUTDOWN_HI   "yes"
-        set_pcp_cfg GPIOSHUTDOWN_PU   "down"
-
-        say "Installing the shutdown monitor..."
-        pcp-load -wil shutdown-monitor.tcz \
-            || echo "!!! WARNING: shutdown-monitor.tcz install failed: GPIO 16 will not shut the Pi down."
-    fi
-
-    case "$ESP_RC" in
-        0)
-            say "config.txt updated."
-            echo ">>> Reboot required to apply:  pcp reboot"
-            return 0 ;;
-        "$UNCHANGED_RC")
-            say "config.txt already up to date, no reboot needed."
-            return "$UNCHANGED_RC" ;;
-        *)
-            echo "ERROR: config.txt update failed (see above)." >&2
-            return 1 ;;
-    esac
-}
-
-###########################################################################
-# 3) ESP32C3 (standalone step)
-#
-# Runs configure_esp32c3, then saves with pcp bu. "Already up to date" is
-# not an error here: pcp.cfg may still have been corrected, so we save.
-###########################################################################
-install_esp32() {
-    configure_esp32c3
-    rc=$?
-    rm -f /home/tc/pcp-powerbutton.sh
-    case "$rc" in
-        0|"$UNCHANGED_RC")
-            say "Saving with pcp bu..."
-            pcp bu
-            return 0 ;;
-        "$SKIP_RC")
-            return "$SKIP_RC" ;;
-        *)
-            return 1 ;;
-    esac
-}
-
-###########################################################################
-# DISPATCH: one step = one process (sh "$SELF" --run <step>)
-###########################################################################
-if [ "$1" = "--run" ]; then
-    case "$2" in
-        camilla) install_camilladsp ;;
-        lybrica) install_lybrica ;;
-        esp32)   install_esp32 ;;
-        *) fail "Unknown step: $2" ;;
-    esac
-    exit $?
-fi
-
-[ "$(id -u)" -eq 0 ] && fail "Run this script as user tc, not root."
-
-DONE=""
-
-run_step() {  # $1 = camilla|lybrica|esp32
-    echo
-    echo "############################################################"
-    echo "# Step: $1"
-    echo "############################################################"
-    sh "$SELF" --run "$1"
-    rc=$?
-    case "$rc" in
-        0)        DONE="$DONE $1:OK" ;;
-        "$SKIP_RC") DONE="$DONE $1:SKIPPED" ;;
-        *)        DONE="$DONE $1:FAILED"
-                  echo "!!! Step '$1' failed (see messages above)." >&2 ;;
-    esac
-}
-
-do_reboot() {
-    case "$DONE" in
-        *FAILED*) echo "!!! Some steps failed:$DONE" ;;
-    esac
-    printf "Reboot now? [y/N]: "
-    read -r R
-    case "$R" in
-        y|Y) echo "Rebooting..."; pcp reboot; exit 0 ;;
-        *)   echo "Reboot cancelled." ;;
-    esac
-}
-
-run_choice() {
-    for c in "$@"; do
-        case "$c" in
-            1|camilla) run_step camilla ;;
-            2|lybrica) run_step lybrica ;;
-            3|esp32)   run_step esp32 ;;
-            r|R)       do_reboot ;;
-            q|Q)       return 1 ;;
-            *) echo "Unknown choice: $c" ;;
-        esac
-    done
-    return 0
-}
-
-summary() {
-    echo
-    if [ -n "$DONE" ]; then
-        echo "Result:$DONE"
-        echo "Reboot to activate everything:  pcp reboot"
-    fi
-}
-
-# Interactive menu
-while true; do
-    echo
-    echo "=============================================="
-    echo "  CamillaDSP installer for piCorePlayer "
-    echo "=============================================="
-    echo "  1) CamillaDSP + CamillaGUI"
-    echo "  2) LyBriCa + BLE HID bridge (patches pcp-bt.tcz)"
-    echo "  3) ESP32C3 (GPIO overlays, shutdown monitor)"
-    echo "  R) Reboot now"
-    echo "  Q) Quit"
-    echo "----------------------------------------------"
-    printf "Choice (several allowed, e.g. 1 2 3): "
-    read -r CHOICES || break
-    [ -z "$CHOICES" ] && continue
-    # shellcheck disable=SC2086
-    run_choice $CHOICES || break
-done
-
-summary
+                  Idempotent: does nothing if already

@@ -722,17 +722,26 @@ last_level = next(
 
 
 def find_remote():
-    """Return the remote input device, or None if it is not present."""
+    """Return the remote input device (grabbed), or None if it is not available."""
     for path in evdev.list_devices():
-        device = evdev.InputDevice(path)
-        if device.name == REMOTE_NAME:
-            log.info("'%s' found at %s.", REMOTE_NAME, path)
-            #device.grab()
-            return device
+        try:
+            device = evdev.InputDevice(path)
+        except OSError:                 # device vanished between list and open
+            continue
+        if device.name != REMOTE_NAME:
+            device.close()
+            continue
+        try:
+            # Exclusive access: the kernel stops delivering this device's events
+            # to anyone else (logind no longer sees the remote's KEY_POWER)
+            device.grab()
+        except OSError as e:            # EBUSY: another process holds it / ENODEV: gone
+            log.warning("Cannot grab '%s' (%s), will retry", REMOTE_NAME, e)
+            device.close()
+            continue
+        log.info("'%s' found at %s.", REMOTE_NAME, path)
+        return device
     return None
-
-
-remote = None
 
 
 # CamillaDSP — always needed: the "at least one feature" check in the
@@ -1090,14 +1099,17 @@ def send_lms_command(command):
 
 
 async def remote_watcher():
-    global remote
-    while remote is None:
-        remote = find_remote()
-        if remote:
-            log.info("'%s' connected successfully!", REMOTE_NAME)
-            asyncio.create_task(supervised("remote", lambda: remote_events(remote)))
-            return
-        await asyncio.sleep(1)
+    """Wait for the remote, serve it until it disconnects, then start over."""
+    while True:
+        device = find_remote()
+        if device is None:
+            await asyncio.sleep(1)
+            continue
+        try:
+            await remote_events(device)     # returns when the remote disconnects
+        finally:
+            device.close()                  # also releases the grab
+        log.info("Remote disconnected, waiting for it to come back...")
 
 
 # ====================== DSP CONFIGURATION ======================
@@ -1864,13 +1876,9 @@ async def remote_events(device):
                     last_seek_time = 0
 
         except OSError as e:
-            log.warning("Remote disconnected: %s. Attempting to reconnect...", e)
-            device = None
-            while device is None:
-                device = find_remote()
-                if device is None:
-                    await asyncio.sleep(1)
-            log.info("Remote reconnected.")
+            # Remote disconnected: return, remote_watcher will look for it again
+            log.warning("Remote disconnected: %s", e)
+            return
 
         except Exception:
             # An error while handling a key must not stop the remote (or the script)
@@ -1932,7 +1940,7 @@ async def main():
         spawn("tv-toslink", monitor_tv_toslink)
 
     if ENABLE_REMOTE:
-        tasks.append(asyncio.create_task(remote_watcher()))
+        spawn("remote", remote_watcher)
 
     await asyncio.gather(*tasks)
 

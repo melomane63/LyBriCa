@@ -9,6 +9,14 @@ set -e
 CDSP_URL="https://github.com/HEnquist/camilladsp/releases/download/v5.0.0-beta.2/camilladsp-linux-aarch64.tar.gz"
 GUI_URL="https://github.com/HEnquist/camillagui-backend/releases/download/v5.0.0-beta.2/camillagui_linux_aarch64.tar.gz"
 PYCAMILLADSP_URL="git+https://github.com/HEnquist/pycamilladsp.git@next5"
+LMS_URL="https://downloads.lms-community.org/LyrionMusicServer_v9.1.1/lyrionmusicserver_9.1.1_arm.deb"
+
+# Extract versions from URLs (for menu display)
+CDSP_VERSION="${CDSP_URL#*/download/v}"
+CDSP_VERSION="${CDSP_VERSION%%/*}"
+
+LMS_VERSION="${LMS_URL#*/LyrionMusicServer_v}"
+LMS_VERSION="${LMS_VERSION%%/*}"
 
 # =============================================================================
 # Function to update and upgrade the system
@@ -16,6 +24,7 @@ PYCAMILLADSP_URL="git+https://github.com/HEnquist/pycamilladsp.git@next5"
 upgrade_system() {
     echo "🔄 Updating and upgrading system..."
     sudo apt update && sudo apt upgrade -y
+    ###sudo apt install -y git wget curl python3-pip python3-venv python3-dev build-essential systemd libasound2-dev
     sudo apt install -y wget systemd
 }
 
@@ -206,7 +215,7 @@ EOF
         then
             echo "✅ REMOTE_NAME \"$SAVED_REMOTE_NAME\" kept from the previous lybrica.py."
         else
-            echo "⚠  Could not restore REMOTE_NAME \"$SAVED_REMOTE_NAME\": run option 7 (Pair Bluetooth Remote)."
+            echo "⚠  Could not restore REMOTE_NAME \"$SAVED_REMOTE_NAME\": run option 8 (Pair Bluetooth Remote)."
         fi
     fi
 
@@ -381,13 +390,19 @@ EOL
 }
 
 # =============================================================================
-# Function to install Lyrion Media Server & Squeezelite
+# Function to install Lyrion Media Server
 # =============================================================================
-install_lyrion_and_squeezelite() {
-    echo "🎵 Installing Lyrion Media Server (v9.1.1)..."
-    wget https://downloads.lms-community.org/LyrionMusicServer_v9.1.1/lyrionmusicserver_9.1.1_arm.deb -O ~/lyrionmusicserver_arm.deb
+install_lyrion() {
+    echo "🎵 Installing Lyrion Media Server (v${LMS_VERSION})..."
+    wget "$LMS_URL" -O ~/lyrionmusicserver_arm.deb
     sudo dpkg -i ~/lyrionmusicserver_arm.deb || sudo apt --fix-broken install -y
+    echo "✅ Lyrion Media Server v${LMS_VERSION} installed!"
+}
 
+# =============================================================================
+# Function to install Squeezelite
+# =============================================================================
+install_squeezelite() {
     echo "🔊 Installing Squeezelite..."
     sudo apt install -y squeezelite
 
@@ -396,6 +411,7 @@ install_lyrion_and_squeezelite() {
     echo -e 'SL_SOUNDCARD="hw:Loopback,0"\nSB_EXTRA_ARGS="-W -C 5 -r 48000-48000 -R hLE"' | sudo tee -a /etc/default/squeezelite > /dev/null
 
     sudo systemctl restart squeezelite
+    echo "✅ Squeezelite installed and configured!"
 }
 
 # =============================================================================
@@ -574,13 +590,27 @@ EOF
 }
 
 # =============================================================================
-# Function to shutdown
+# Function to shutdown (with confirmation)
 # =============================================================================
 shutdown_now() {
     read -p "Shutdown now? (y/n): " choice
     if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
         sudo shutdown -h now
+        return 0
     fi
+    return 1
+}
+
+# =============================================================================
+# Function to quit the script (with confirmation)
+# =============================================================================
+quit_now() {
+    read -p "Quit the script? (y/n): " choice
+    if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
+        echo "Quitting..."
+        return 0
+    fi
+    return 1
 }
 
 # =============================================================================
@@ -591,27 +621,69 @@ while true; do
     echo "  Raspberry Pi Audio Setup Menu   "
     echo "=================================="
     echo "1) Upgrade System"
-    echo "2) Install CamillaDSP & GUI"
-    echo "3) Install Lyrion Media Server & Squeezelite"
-    echo "4) Mount USB Drive"
+    echo "2) Install CamillaDSP & GUI (v${CDSP_VERSION})"
+    echo "3) Install Lyrion Media Server (v${LMS_VERSION})"
+    echo "4) Install Squeezelite"
     echo "5) Configure Sound Levels (alsamixer)"
-    echo "6) Install Lybrica (Remote, Display, Trigger, Autoconfig...)"
-    echo "7) Pair Bluetooth Remote"
+    echo "6) Mount USB Drive"
+    echo "7) Install Lybrica (Remote, Display, Trigger, Autoconfig...)"
+    echo "8) Pair Bluetooth Remote"
     echo "S) Shutdown System"
-    echo "E) Exit"
+    echo "Q) Quit"
     echo "=================================="
-    read -p "Choose an option [1-7, S, E]: " option
+    echo "Tip: you can chain several actions, e.g. '2 6 S' (install CamillaDSP + mount USB + shutdown)."
+    echo "     Numeric actions run first in numeric order; S is asked last (with confirmation)."
+    read -p "Choose an option [1-8, S, Q] (space-separated for multiple): " -a choices
 
-    case $option in
-        1) upgrade_system ;;
-        2) install_camilladsp ;;
-        3) install_lyrion_and_squeezelite ;;
-        4) mount_usb_drive ;;
-        5) set_sound_card ;;
-        6) install_lybrica ;;
-        7) pair_bluetooth_remote ;;
-        S|s) shutdown_now ;;
-        E|e) echo "Exiting..."; exit 0 ;;
-        *) echo "Invalid option. Please try again." ;;
-    esac
+    if [ "${#choices[@]}" -eq 0 ]; then
+        echo "⚠  No option entered."
+        continue
+    fi
+
+    # --- Validate all entries first (strict mode) -------------------------
+    for option in "${choices[@]}"; do
+        case $option in
+            1|2|3|4|5|6|7|8) ;;
+            S|s|Q|q) ;;
+            *) echo "⚠  Invalid option: '$option'. Nothing executed."; continue 2 ;;
+        esac
+    done
+
+    # --- Sort numeric choices (unique + ascending) ------------------------
+    mapfile -t sorted_numeric < <(printf '%s\n' "${choices[@]}" | grep -E '^[1-8]$' | sort -n -u)
+
+    # --- Detect S / Q presence --------------------------------------------
+    has_shutdown=false
+    has_quit=false
+    for option in "${choices[@]}"; do
+        case $option in
+            S|s) has_shutdown=true ;;
+            Q|q) has_quit=true ;;
+        esac
+    done
+
+    # --- Execute numeric actions first, in numeric order ------------------
+    for option in "${sorted_numeric[@]}"; do
+        case $option in
+            1) upgrade_system ;;
+            2) install_camilladsp ;;
+            3) install_lyrion ;;
+            4) install_squeezelite ;;
+            5) set_sound_card ;;
+            6) mount_usb_drive ;;
+            7) install_lybrica ;;
+            8) pair_bluetooth_remote ;;
+        esac
+    done
+
+    # --- Then handle S / Q with confirmation (S takes priority) -----------
+    if $has_shutdown; then
+        shutdown_now && exit 0
+    fi
+    if $has_quit; then
+        quit_now && exit 0
+    fi
+
+    echo ""
+    read -rp "Press Enter to return to the menu..." _
 done

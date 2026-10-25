@@ -30,13 +30,13 @@ upgrade_system() {
 
 # =============================================================================
 # Function to install Lybrica
-# (Remote, Display, Trigger, Autoconfig for CamillaDSP <-> LMS volume sync)
+# (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)
 #  - rewrites /boot/firmware/config.txt
 #  - sets up venv + dependencies
 #  - installs and starts systemd service
 # =============================================================================
 install_lybrica() {
-    echo "🎮 Installing Lybrica (Remote, Display, Trigger, Autoconfig for CamillaDSP <-> LMS volume sync)..."
+    echo "🎮 Installing Lybrica (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)..."
 
     # -------------------------------------------------------------------------
     # 0. Lybrica-specific dependencies
@@ -229,7 +229,7 @@ EOF
     # -------------------------------------------------------------------------
     sudo tee /etc/systemd/system/lybrica.service > /dev/null <<EOL
 [Unit]
-Description=Lybrica (Remote, Display, Trigger, Autoconfig for CamillaDSP <-> LMS volume sync)
+Description=Lybrica (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)
 After=default.target
 
 [Service]
@@ -617,9 +617,9 @@ quit_now() {
 # Main Menu
 # =============================================================================
 while true; do
-    echo "=================================="
-    echo "  Raspberry Pi Audio Setup Menu   "
-    echo "=================================="
+    echo "============================================"
+    echo "  RaspberryPi OS - Audio Setup Menu   "
+    echo "============================================"
     echo "1) Upgrade System"
     echo "2) Install CamillaDSP & GUI (v${CDSP_VERSION})"
     echo "3) Install Lyrion Media Server (v${LMS_VERSION})"
@@ -630,9 +630,9 @@ while true; do
     echo "8) Pair Bluetooth Remote"
     echo "S) Shutdown System"
     echo "Q) Quit"
-    echo "=================================="
+    echo "============================================"
     echo "Tip: chain actions with spaces: '2 6 S' = '6 S 2' (numbers ascending, then S, then Q)."
-    read -p "Choose an option [1-8, S, Q] : " -a choices
+    read -p "Choose an option [1-8, S, Q]: " -a choices
 
     if [ "${#choices[@]}" -eq 0 ]; then
         echo "⚠  No option entered."

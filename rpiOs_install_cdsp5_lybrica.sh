@@ -518,14 +518,45 @@ install_lyrion() {
 # Function to install Squeezelite
 # =============================================================================
 install_squeezelite() {
-    echo "🔊 Installing Squeezelite..."
-    sudo apt install -y squeezelite
+    SQUEEZELITE_CONF="/etc/default/squeezelite"
 
-    sudo sed -i '/^SL_OPTIONS=/d;/^SL_SOUNDCARD=/d;/^SB_EXTRA_ARGS=/d' /etc/default/squeezelite
-    echo -e 'SL_SOUNDCARD="hw:Loopback,0"\nSB_EXTRA_ARGS="-W -C 5 -r 48000-48000 -R hLE"' | sudo tee -a /etc/default/squeezelite > /dev/null
+    if dpkg -l squeezelite 2>/dev/null | grep -q "^ii"; then
+        INSTALLED_VER=$(dpkg-query -W -f='${Version}' squeezelite 2>/dev/null || true)
+        echo "ℹ  Squeezelite is already installed (v${INSTALLED_VER})."
+        echo ""
+        echo "📋 Current Squeezelite parameters (from ${SQUEEZELITE_CONF}):"
+        if [ -f "$SQUEEZELITE_CONF" ]; then
+            grep -E '^[A-Z_]+=' "$SQUEEZELITE_CONF" | sed 's/^/   /'
+        else
+            echo "   (file not found)"
+        fi
+        echo ""
+
+        read -p "Reinstall Squeezelite? (y/n): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo "↩  Cancelled, keeping current installation."
+            return 1
+        fi
+        REINSTALL_FLAG="--reinstall"
+    else
+        echo "🔊 Installing Squeezelite..."
+        REINSTALL_FLAG=""
+    fi
+
+    sudo apt install -y $REINSTALL_FLAG squeezelite
+
+    # Safely update Squeezelite output device
+    sudo sed -i '/^SL_OPTIONS=/d;/^SL_SOUNDCARD=/d;/^SB_EXTRA_ARGS=/d' "$SQUEEZELITE_CONF"
+    echo -e 'SL_SOUNDCARD="hw:Loopback,0"\nSB_EXTRA_ARGS="-W -C 5 -r 48000-48000 -R hLE"' | sudo tee -a "$SQUEEZELITE_CONF" > /dev/null
 
     sudo systemctl restart squeezelite
+
+    echo ""
     echo "✅ Squeezelite installed and configured!"
+    echo ""
+    echo "📋 Current Squeezelite parameters (from ${SQUEEZELITE_CONF}):"
+    grep -E '^[A-Z_]+=' "$SQUEEZELITE_CONF" | sed 's/^/   /'
+    echo ""
 }
 
 # =============================================================================

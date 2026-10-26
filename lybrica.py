@@ -20,15 +20,28 @@ from camilladsp import CamillaClient
 #  and the hardware libraries it needs are neither imported nor required.
 # =====================================================================
 
-ENABLE_LMS_SYNC       = True   # LMS <-> CamillaDSP volume bridge (asyncio task)
+ENABLE_LMS_SYNC       = True   # LMS <-> CamillaDSP volume bridge (asyncio task).
+                               # Only the bridge: the LMS CLI is used anyway by the LMS keys
+                               # (play / pause / seek) and by the TOSLINK monitor.
 ENABLE_AUTO_POWEROFF  = True   # Power relay: off after silence, on with sound,
                                # halt after HALT_DELAY, relay toggle on POWER long press
 ENABLE_REMOTE         = True   # Remote control (all keys: volume, mute, LMS, BACK,
                                # HOMEPAGE, POWER). If False, no key works at all.
 ENABLE_DISPLAY        = True   # TM1637 display + ambient light sensor
                                # (the tone / tilt / loudness keys need it)
-ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input
-                               # (BACK / HOMEPAGE keys do NOT depend on this)
+ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input.
+                               # True : automatism ON  -> BACK cycles within the group
+                               #                          (_ or |) of the active config;
+                               #                          HOMEPAGE short press = tone / tilt /
+                               #                          loudness summary.
+                               #        automatism OFF -> BACK = next "_" config;
+                               #                          HOMEPAGE short press = next "|" config.
+                               #        HOMEPAGE long press (2 s) enables / disables
+                               #        the automatism (any state).
+                               # False: BACK = next "_" config,
+                               #        HOMEPAGE = next "|" config.
+                               # If no "_*" or no "|*" config file exists, the automatism
+                               # cannot run: the keys then behave as with False.
 
 
 # ---------------------------------------------------------------------
@@ -121,8 +134,9 @@ LMS_RETRY_S = 5              # (default 5 s) delay before the bridge restarts af
 # ---------------------- Power ----------------------
 
 POWER_GPIO = 4              # GPIO controlling the power relay
-POWER_OFF_DELAY = 2         # Minutes of silence before the power relay is switched off
-HALT_DELAY = 48             # Hours of silence (or without remote) before the Raspberry Pi shuts down
+POWER_OFF_DELAY = 2         # Minutes of silence before the power relay is switched off (needs ENABLE_AUTO_POWEROFF);
+                            # also the delay before the display is blanked (needs ENABLE_DISPLAY)
+HALT_DELAY = 48             # Hours of continuous silence before the Raspberry Pi shuts down (needs ENABLE_AUTO_POWEROFF)
 
 
 # ---------------------- Audio analysis ----------------------
@@ -143,6 +157,9 @@ CREST_MIN_DB   = 2.0     # (default 2 dB)  peak - rms below this -> steady noise
 #   "|*" active: LMS playing + TOSLINK silent -> switch back to "_*"
 #                LMS playing while the TV plays   -> LMS is paused
 #
+# The automatism can be disabled / enabled at run time with a long press
+# on HOMEPAGE (see HOLD_TOGGLE_AUTO_S). Enabled at every start.
+#
 # Capture params come from the first "|*" file: all files in that group must
 # share the same capture input.
 
@@ -156,7 +173,8 @@ TOSLINK_ON_DB = -40.0   # (default -40 dBFS peak) above which audio is considere
 
 CLK, DIO = 23, 24           # TM1637 display pins
 SCREEN_RETURN_DELAY = 30    # Seconds without key press before returning to the volume screen
-POWER_MSG_DURATION = 1.5    # Seconds PW ON / PW OFF stays on the display
+SCROLL_FRAME_DELAY = 0.35   # Seconds per step of a scrolling message (POWER OFF, CONF AUTO...)
+SCROLL_END_PAUSE = 0.6      # Seconds the last frame of a scrolling message stays visible
 
 
 # Ambient light sensor (ADC) -> display brightness
@@ -196,8 +214,13 @@ KEY_BINDINGS = {
     'ENTER':         'KEY_ENTER',        # Short: bass/treble/tilt/presence all 0 or restored
                                          #        (loudness screen: loudness on/off)
                                          # Long:  switch tone / tilt screen (needs ENABLE_DISPLAY)
-    'BACK':          'KEY_BACK',         # Next DSP config (files prefixed with "_")
-    'HOMEPAGE':      'KEY_HOMEPAGE',     # Next DSP config (files prefixed with "|")
+    'BACK':          'KEY_BACK',         # TOSLINK switch ON, automatism ON : next config of the active group ("_" or "|")
+                                         # TOSLINK switch ON, automatism OFF: next config prefixed "_"
+                                         # TOSLINK switch OFF               : next config prefixed "_"
+    'HOMEPAGE':      'KEY_HOMEPAGE',     # TOSLINK switch ON : long press = automatism on / off
+                                         #                     short press, automatism ON : tone / tilt / loudness summary
+                                         #                     short press, automatism OFF: next config prefixed "|"
+                                         # TOSLINK switch OFF: next config prefixed "|"
 }
 
 # Hold durations, in key-repeat events
@@ -208,6 +231,10 @@ HOLD_SEEK = 10              # NEXT/PREVIOUS: seeking starts
 HOLD_SWITCH_TONE_TILT = 15  # ENTER: switch between the tone and tilt screens
 SEEK_STEP_S = 10            # Seconds jumped at each seek
 SEEK_INTERVAL_S = 0.5       # Seconds between two seeks while the key is held (10 s / 0.5 s = 20x speed)
+
+# Hold duration, in real seconds (independent of the remote's repeat rate)
+HOLD_TOGGLE_AUTO_S = 2.0    # HOMEPAGE: long press to enable / disable the TOSLINK automatism
+                            # (only when ENABLE_TOSLINK_SWITCH = True)
 
 # VOLUME+ / VOLUME- held: apply a volume step only on every Nth repeat of the
 # remote. 1 = every repeat (fastest), 2 = every other repeat, 3 = one in three,
@@ -229,6 +256,8 @@ VOLUME_SLOWDOWN = {
 
 
 # ---------------------- Tone and loudness ----------------------
+# Bass, treble, tilt and presence are saved PER CONFIG (each file keeps its own).
+# The loudness is saved PER SERIES: one value shared by all "_*" configs, one by all "|*" configs.
 # Adjustment ranges (TONE_MAX_DB, PRESENCE_MAX_DB and TILT_MAX_STEPS: 9 at most, the display has 2 digits)
 TONE_MAX_DB = 9             # Bass / treble: -9 .. +9 dB
 PRESENCE_MAX_DB = 3         # Presence: -3 .. +3 dB
@@ -256,14 +285,16 @@ SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settin
 
 CONFIG_GROUPS = ("_", "|")  # Config file prefixes: "_" = stereo (BACK key), "|" = TV (HOMEPAGE key)
 
-# settings.json key -> (CamillaDSP filter, parameter)
+# Saved PER CONFIG. settings.json key -> (CamillaDSP filter, parameter)
 TONE_PARAMS = {
     "bass_gain":     ("Bass", "gain"),
     "treble_gain":   ("Treble", "gain"),
     "tilt_gain":     ("Tilt", "gain"),
-    "loudness_ref":  ("Loudness", "reference_level"),
     "presence_gain": ("Presence", "gain"),
 }
+
+# Saved PER SERIES ("_" or "|"), see settings["loudness"]: (CamillaDSP filter, parameter)
+LOUDNESS_FILTER = ("Loudness", "reference_level")
 
 # The four gains driven by the tone / tilt screens and the ENTER key: settings key -> filter
 GAIN_KEYS = {
@@ -588,11 +619,16 @@ auto_power_enabled = True
 is_waiting_for_sound = False
 is_key_held = False
 is_volume_key_held = False
-last_displayed = None
+last_displayed = None           # "volume", "tone", "tilt", "loudness", or "message" (a scrolling message is
+                                # running or has just ended: the volume screen is redrawn right after it)
 blank_volume_when_mute = False
 enter_display_at_press = None   # Screen shown when ENTER was pressed (to tell short/long press apart)
 
-prev_values = {}                # ENTER-key restore values, same keys as TONE_PARAMS (filled by load_prev_values)
+toslink_auto_enabled = True     # TOSLINK automatism active (toggled by a long HOMEPAGE press)
+toslink_ready = False           # True once monitor_tv_toslink has found its "_*" and "|*" config files
+
+prev_values = {}                # ENTER-key restore values: keys of GAIN_KEYS (per config) + "loudness_ref" (per series)
+                                # (filled by load_prev_values)
 current_config_key = None       # Settings key of the active config file
 
 adc_buffer = b""                # Incomplete serial data waiting for its newline
@@ -606,6 +642,8 @@ display_refresh_event = asyncio.Event()
 vol_state = VolumeState()       # Last volume / mute / title / config path read from CamillaDSP (published by cdsp_poller)
 
 current_prefix = '_'            # Prefix ("_" or "|") of the active config, kept up to date by change_config and monitor_tv_toslink
+
+_scroll_task = None             # Current scrolling task (a new one cancels the previous)
 
 
 # ====================== HELPERS ======================
@@ -652,6 +690,112 @@ def blank_display():
     display_is_off = True
 
 
+def _prefix_of(path):
+    """Series of a config: '|' if the file name starts with '|', '_' otherwise."""
+    return '|' if os.path.basename(path or "").startswith('|') else '_'
+
+
+def toslink_active():
+    """True when the TOSLINK automatism can run: the feature is enabled AND
+    monitor_tv_toslink found its config files. Otherwise BACK / HOMEPAGE behave
+    as with ENABLE_TOSLINK_SWITCH = False."""
+    return ENABLE_TOSLINK_SWITCH and toslink_ready
+
+
+def blink_on():
+    """1 Hz blink phase shared by all blinking dots. Derived from the clock at
+    draw time: no state to keep in sync, and every dot blinks in phase."""
+    return int(time.monotonic()) % 2 == 0
+
+
+# ---------- scrolling messages ----------
+
+def scroll_active():
+    """True while a scrolling message is running. Every automatic redraw of the
+    volume screen must check this, otherwise it would overwrite the message."""
+    return _scroll_task is not None and not _scroll_task.done()
+
+
+def cancel_scroll():
+    """Stop the running scrolling message, if any. Returns True if one was running.
+    The end-of-scroll callback does nothing for a task that is no longer the
+    current one, so a cancel never triggers a redraw by itself."""
+    global _scroll_task
+    task, _scroll_task = _scroll_task, None
+    if task is not None and not task.done():
+        task.cancel()
+        return True
+    return False
+
+
+async def wait_scroll():
+    """Wait until the running scrolling message is over.
+    Returns True if it ran to the end, False if there was none or if it was
+    cancelled (a key was pressed)."""
+    task = _scroll_task
+    if task is None:
+        return False
+    if not task.done():
+        await asyncio.wait({task})      # does not raise, and does not cancel the task if we are cancelled
+    return not task.cancelled()
+
+
+def _start_scroll(coro):
+    """Run a display coroutine as THE scrolling task (cancels the previous one).
+    When it ends normally, the volume screen comes back, unless another scroll
+    has taken over or the task was cancelled."""
+    global _scroll_task, last_displayed
+    cancel_scroll()
+    last_displayed = "message"
+    task = asyncio.create_task(coro)
+    _scroll_task = task
+
+    def _on_done(t):
+        if t.cancelled() or t is not _scroll_task:
+            return
+        asyncio.create_task(return_to_volume_later(0))
+
+    task.add_done_callback(_on_done)
+
+
+async def _scroll_coro(text, frame_delay, end_pause):
+    """Scroll `text` through the 6-char display, then leave the last frame
+    visible for `end_pause` seconds. Cancellable."""
+    text = " " + text + " " * 6   # leading/trailing blanks for a clean entry/exit
+    for i in range(len(text) - 5):
+        show(text[i:i + 6])
+        await asyncio.sleep(frame_delay)
+    await asyncio.sleep(end_pause)
+
+
+def scroll_message(text, frame_delay=None, end_pause=None):
+    """Start scrolling `text` on the display (cancels any previous scroll).
+    After the scroll, falls back to the volume screen."""
+    if not ENABLE_DISPLAY:
+        return
+    _start_scroll(_scroll_coro(
+        text,
+        SCROLL_FRAME_DELAY if frame_delay is None else frame_delay,
+        SCROLL_END_PAUSE if end_pause is None else end_pause))
+
+
+async def _scroll_frames_coro(frames, frame_delay, end_pause):
+    """Show each 6-char frame in turn, then leave the last one visible for
+    `end_pause` seconds. Cancellable."""
+    for f in frames:
+        show(f)
+        await asyncio.sleep(frame_delay)
+    await asyncio.sleep(end_pause)
+
+
+def scroll_frames(frames, frame_delay=1.2, end_pause=0.6):
+    """Start showing a sequence of 6-char frames (cancels any previous scroll).
+    After the sequence, falls back to the volume screen."""
+    if not ENABLE_DISPLAY:
+        return
+    _start_scroll(_scroll_frames_coro(frames, frame_delay, end_pause))
+
+
 def is_silent():
     """Silence detection: RMS threshold, then crest factor (peak vs RMS).
     A steady noise floor has peak ≈ RMS; real audio does not."""
@@ -674,6 +818,7 @@ def shutdown_system():
     """Cut the power relay (if managed) and halt the Raspberry Pi."""
     if ENABLE_AUTO_POWEROFF:
         lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
+    cancel_scroll()                 # nothing may overwrite the HALT message
     show(" HALT ")
     os.system("sudo poweroff")
 
@@ -878,9 +1023,13 @@ def load_settings():
         data = {}
     configs = data.get("configs")
     last_config = data.get("last_config")
+    loudness = data.get("loudness")
     return {
+        # per config: bass / treble / tilt / presence gains + their ENTER restore values ("prev")
         "configs": configs if isinstance(configs, dict) else {},
         "last_config": last_config if isinstance(last_config, dict) else {},
+        # per series ("_" / "|"): {"ref": loudness level, "prev": ENTER restore level}
+        "loudness": loudness if isinstance(loudness, dict) else {},
         "last_tone_tilt": data.get("last_tone_tilt", "tone"),
     }
 
@@ -899,20 +1048,78 @@ def save_audio_settings(config):
         return
     if current_config_key:
         entry = get_tone(config)
-        entry["prev"] = dict(prev_values)
+        entry["prev"] = {key: prev_values[key] for key in GAIN_KEYS}
         settings["configs"][current_config_key] = entry
+        # The loudness belongs to the series of the config. A config without a
+        # Loudness filter leaves the series value untouched.
+        ref = get_filter_param(config, *LOUDNESS_FILTER)
+        if ref is not None:
+            settings["loudness"][_prefix_of(current_config_key)] = {
+                "ref": ref, "prev": prev_values["loudness_ref"]}
     settings["last_tone_tilt"] = last_tone_tilt
     write_settings()
 
 
-def load_prev_values(saved=None):
-    """Load the ENTER-key restore values saved for a config (defaults if none)."""
+def get_series_loudness(series, saved_config=None):
+    """Saved loudness of a series ("_" or "|"): {"ref": level, "prev": ENTER restore
+    level}, or None if nothing is saved.
+    Migration: a series with no entry yet takes the loudness the old versions saved
+    in the config entry (`saved_config`), so existing settings are not lost."""
+    entry = settings["loudness"].get(series) if series else None
+    if isinstance(entry, dict) and isinstance(entry.get("ref"), (int, float)):
+        prev = entry.get("prev")
+        return {"ref": entry["ref"],
+                "prev": prev if isinstance(prev, (int, float)) else DEFAULT_LOUDNESS_REF}
+    if isinstance(saved_config, dict) and isinstance(saved_config.get("loudness_ref"), (int, float)):
+        legacy_prev = saved_config.get("prev")
+        legacy_prev = legacy_prev.get("loudness_ref") if isinstance(legacy_prev, dict) else None
+        return {"ref": saved_config["loudness_ref"],
+                "prev": legacy_prev if isinstance(legacy_prev, (int, float)) else DEFAULT_LOUDNESS_REF}
+    return None
+
+
+def apply_saved(filters, series, saved):
+    """Apply the saved tone of a config (`saved`) and the saved loudness of its
+    series to a `filters` dict. Returns True if something was applied."""
+    applied = False
+    if saved:
+        apply_tone(filters, saved)
+        applied = True
+    entry = get_series_loudness(series, saved)
+    if entry is not None:
+        apply_filter_param(filters, *LOUDNESS_FILTER, entry["ref"])
+        applied = True
+    return applied
+
+
+def resync_series_loudness():
+    """After a config change that did not come from this script: put the loudness
+    of the config's series into the active config (and into CamillaDSP)."""
+    if not (TONE_ACTIVE and current_config_key and is_complete_config(config_active)):
+        return
+    entry = get_series_loudness(_prefix_of(current_config_key),
+                                settings["configs"].get(current_config_key))
+    params = get_filter_params(config_active, LOUDNESS_FILTER[0])
+    if entry is None or params is None or params.get(LOUDNESS_FILTER[1]) == entry["ref"]:
+        return
+    params[LOUDNESS_FILTER[1]] = entry["ref"]
+    try:
+        cdsp.config.set_active(config_active)
+    except Exception as e:
+        log.warning("Cannot apply the loudness of series '%s': %s",
+                    _prefix_of(current_config_key), e)
+
+
+def load_prev_values(saved=None, series=None):
+    """Load the ENTER-key restore values: the four gains from the config's saved
+    entry, the loudness one from its series (defaults if nothing is saved)."""
     saved_prev = saved.get("prev") if saved else None
     if not isinstance(saved_prev, dict):
         saved_prev = {}
-    for key in TONE_PARAMS:
-        default = DEFAULT_LOUDNESS_REF if key == "loudness_ref" else 0
-        prev_values[key] = saved_prev.get(key, default)
+    for key in GAIN_KEYS:
+        prev_values[key] = saved_prev.get(key, 0)
+    entry = get_series_loudness(series, saved)
+    prev_values["loudness_ref"] = entry["prev"] if entry else DEFAULT_LOUDNESS_REF
 
 
 def is_complete_config(cfg):
@@ -929,12 +1136,13 @@ def init_tone():
     if not path:
         return
     current_config_key = config_key(path)
+    series = _prefix_of(path)
     saved = settings["configs"].get(current_config_key)
-    load_prev_values(saved)
-    if saved and is_complete_config(config_active):
+    load_prev_values(saved, series)
+    if is_complete_config(config_active):
         filters = config_active.get("filters")
-        apply_tone(filters if isinstance(filters, dict) else {}, saved)
-        cdsp.config.set_active(config_active)
+        if apply_saved(filters if isinstance(filters, dict) else {}, series, saved):
+            cdsp.config.set_active(config_active)
 
 
 settings = load_settings()
@@ -956,6 +1164,9 @@ def display_volume_info(current_volume=None, is_muted=None):
     `current_volume` is the CamillaDSP main volume in dB."""
     global blank_volume_when_mute, last_displayed, display_is_off
 
+    if not ENABLE_DISPLAY:
+        return                  # no display: do not query CamillaDSP for nothing
+
     if current_volume is None:
         current_volume = cdsp.volume.main_volume()
     if is_muted is None:
@@ -976,15 +1187,24 @@ def display_volume_info(current_volume=None, is_muted=None):
     if any(get_filter_param(config_active, f, "gain") for f in GAIN_KEYS.values()):
         segs[3] |= 0x01    # top horizontal segment (A) on the 4th character: tone settings active
 
-    loudness_ref = get_filter_param(config_active, "Loudness", "reference_level")
-    if loudness_ref is not None and round(loudness_ref) != -100:
+    loud = get_filter_param(config_active, "Loudness", "reference_level")
+    if loud is not None and round(loud) != -100:
         segs[3] |= 0x08    # bottom horizontal segment (D) on the 4th character: loudness active
 
-    if ENABLE_AUTO_POWEROFF and auto_power_enabled:
-        segs[2] |= 0x80    # decimal point on the 3rd character: auto power-off active
+    # 3rd character dot: CONF MANUAL blink (only when auto OFF)
+    if ENABLE_TOSLINK_SWITCH and not toslink_auto_enabled and blink_on():
+        segs[2] |= 0x80
 
-    if ENABLE_AUTO_POWEROFF and lgpio.gpio_read(h, POWER_GPIO) == 1:
-        segs[3] |= 0x80    # decimal point on the 4th character: power relay really ON
+    # 4th character dot: POWER state
+    #   auto ON  + relay OFF -> off
+    #   auto ON  + relay ON  -> steady on
+    #   auto OFF (relay forced OFF) -> blinking (1 s / 1 s)
+    if ENABLE_AUTO_POWEROFF:
+        if auto_power_enabled:
+            if lgpio.gpio_read(h, POWER_GPIO) == 1:
+                segs[3] |= 0x80
+        elif blink_on():
+            segs[3] |= 0x80
 
     tm.write(swap(segs))
     last_displayed = "volume"
@@ -1020,6 +1240,38 @@ def display_tilt_info():
     tilt_step = None if tilt_gain is None else round(tilt_gain / TILT_DB_STEP)
     show(f"{fmt_gain(tilt_step)}T{fmt_gain(presence_gain)}P")
     last_displayed = "tilt"
+
+
+def tone_summary_frames():
+    """Return the 6-char frames for the tone, tilt and loudness screens,
+    built exactly like display_tone_info(), display_tilt_info() and
+    display_loudness_info() do."""
+    bass = get_filter_param(config_active, "Bass", "gain")
+    treble = get_filter_param(config_active, "Treble", "gain")
+    tilt = get_filter_param(config_active, "Tilt", "gain")
+    presence = get_filter_param(config_active, "Presence", "gain")
+    loud = get_filter_param(config_active, "Loudness", "reference_level")
+
+    tilt_step = None if tilt is None else round(tilt / TILT_DB_STEP)
+
+    if loud is None:
+        loud_str = "---"
+    elif round(loud) == -100:
+        loud_str = " No"
+    else:
+        loud_str = f"{round(loud)}"
+
+    return [
+        f"{fmt_gain(bass)}B{fmt_gain(treble)}T",
+        f"{fmt_gain(tilt_step)}T{fmt_gain(presence)}P",
+        f"{loud_str:>3} Ld",
+    ]
+
+
+def show_tone_summary():
+    """Scroll through the tone, tilt and loudness screens (same duration for
+    each), then return to the volume screen immediately."""
+    scroll_frames(tone_summary_frames(), frame_delay=1.2, end_pause=0)
 
 
 # ====================== REMOTE KEY ACTIONS ======================
@@ -1215,11 +1467,11 @@ async def change_config(cdsp, config_pattern, cycle=True):
         filters = {}
         new_config_data['filters'] = filters
 
-    # Saved tone for this config; if none, the values from the .yml are kept
+    # Saved tone for this config and saved loudness for its series; if none, the values from the .yml are kept
     new_key = config_key(new_config_path)
+    new_series = _prefix_of(new_config_path)
     saved = settings["configs"].get(new_key)
-    if saved:
-        apply_tone(filters, saved)
+    apply_saved(filters, new_series, saved)     # tone: per config, loudness: per series
 
     # Make relative filter file names absolute
     config_dir = os.path.dirname(os.path.abspath(new_config_path))
@@ -1244,7 +1496,7 @@ async def change_config(cdsp, config_pattern, cycle=True):
     if config_pattern.startswith(CONFIG_DIR) and len(config_pattern) > len(CONFIG_DIR):
         current_prefix = config_pattern[len(CONFIG_DIR)]
 
-    load_prev_values(saved)
+    load_prev_values(saved, new_series)
 
     # Remember this config as the last used of its group (survives TV on/off and restarts)
     if group in CONFIG_GROUPS:
@@ -1264,6 +1516,8 @@ async def change_config(cdsp, config_pattern, cycle=True):
     # not the previous one.
     await asyncio.sleep(0.1)
 
+    # A config switch is a visible event: it replaces any running message
+    cancel_scroll()
     display_volume_info()
     return new_config_data.get("title")
 
@@ -1271,30 +1525,37 @@ async def change_config(cdsp, config_pattern, cycle=True):
 # ====================== POWER ======================
 
 def toggle_power():
-    global auto_power_enabled, is_waiting_for_sound, last_displayed
+    global auto_power_enabled, is_waiting_for_sound
 
     if not auto_power_enabled or is_waiting_for_sound:
-        # Relay forced off (re-enable auto power-off), or switched off by
-        # auto power-off (back on): either way, switch it on
+        # Rearm the automatism, relay ON (trigger active, amps follow sound)
         auto_power_enabled = True
         lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
-        show("PW ON")
+        log.info("[POWER] Auto mode re-armed, relay ON")
+        scroll_message("POWER AUTO")
         is_waiting_for_sound = False
-
     else:
-        # Force the relay off and disable auto power
+        # Disengage the automatism, force the relay OFF (amps off)
         auto_power_enabled = False
         lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
-        show("PW OFF")
+        log.info("[POWER] Relay forced OFF (auto mode disengaged)")
+        scroll_message("POWER OFF")
 
-    last_displayed = "power"
+
+def toggle_toslink_auto():
+    """Enable / disable the TOSLINK automatism (long press on HOMEPAGE)."""
+    global toslink_auto_enabled
+    toslink_auto_enabled = not toslink_auto_enabled
+    log.info("[TOSLINK] Automatism %s", "ON" if toslink_auto_enabled else "OFF")
+    scroll_message("CONF AUTO" if toslink_auto_enabled else "CONF MANUAL")
 
 
-async def return_to_volume_later(delay=POWER_MSG_DURATION):
-    """Go back to the volume screen shortly after PW ON / PW OFF, unless another
-    screen has been shown in the meantime (a key was pressed)."""
+async def return_to_volume_later(delay=0):
+    """Go back to the volume screen after a scrolling message, unless another
+    screen has been shown in the meantime (a key was pressed), another message
+    has started, or the display has been blanked."""
     await asyncio.sleep(delay)
-    if last_displayed == "power":
+    if last_displayed == "message" and not display_is_off and not scroll_active():
         display_volume_info()
 
 
@@ -1319,12 +1580,13 @@ def resync_after_reconnect():
         config_active = new_active
     path = cdsp.config.file_path()
     current_config_key = config_key(path) if path else None
+    series = _prefix_of(path) if path else None
     saved = settings["configs"].get(current_config_key) if current_config_key else None
-    load_prev_values(saved)
-    if TONE_ACTIVE and saved and is_complete_config(config_active):
+    load_prev_values(saved, series)
+    if TONE_ACTIVE and is_complete_config(config_active):
         filters = config_active.get("filters")
-        apply_tone(filters if isinstance(filters, dict) else {}, saved)
-        cdsp.config.set_active(config_active)
+        if apply_saved(filters if isinstance(filters, dict) else {}, series, saved):
+            cdsp.config.set_active(config_active)
 
 
 # ====================== BACKGROUND TASKS ======================
@@ -1487,7 +1749,8 @@ async def volume_watcher_loop():
                 path = cdsp.config.file_path()
                 current_config_key = config_key(path) if path else None
                 saved = settings["configs"].get(current_config_key) if current_config_key else None
-                load_prev_values(saved)
+                load_prev_values(saved, _prefix_of(path) if path else None)
+                resync_series_loudness()      # external change: the series' loudness follows
                 last_warned_title = None
                 log.debug("Config title changed to '%s'", current_title)
 
@@ -1499,8 +1762,10 @@ async def volume_watcher_loop():
         if current_volume != last_volume or current_mute != last_mute or title_changed:
             last_volume = current_volume
             last_mute = current_mute
-            # Redraw only if the volume (or PW ON/OFF) screen is shown and no volume key is held
-            if last_displayed in ("volume", "power") and not is_volume_key_held:
+            # Redraw only if the volume screen is shown, no volume key is held and
+            # no message is scrolling (the end of the scroll redraws the volume itself)
+            if (last_displayed == "volume" and not is_volume_key_held
+                    and not scroll_active() and not display_is_off):
                 display_volume_info(current_volume, current_mute)
 
 
@@ -1512,15 +1777,18 @@ async def display_manager_loop():
         if is_volume_key_held:
             is_volume_key_held = False
             await asyncio.sleep(0.5)
-            if last_displayed == "volume":
+            if last_displayed == "volume" and not scroll_active():
                 display_volume_info()
 
         # Return to the volume screen after SCREEN_RETURN_DELAY seconds without key event
         if last_displayed != "volume":
-            screen_idle_ticks += 1
-            if screen_idle_ticks >= SCREEN_RETURN_DELAY:
+            if scroll_active():
                 screen_idle_ticks = 0
-                display_volume_info()
+            else:
+                screen_idle_ticks += 1
+                if screen_idle_ticks >= SCREEN_RETURN_DELAY:
+                    screen_idle_ticks = 0
+                    display_volume_info()
         else:
             screen_idle_ticks = 0
 
@@ -1532,7 +1800,7 @@ async def display_manager_loop():
         if silent_now:
             if not display_is_off:
                 idle_display_counter += 1
-                if idle_display_counter >= POWER_OFF_DELAY * 60 + 5:  # +5 s: margin after the relay cut, so the 1.5 s PW OFF message stays visible
+                if idle_display_counter >= POWER_OFF_DELAY * 60 + 5:  # +5 s: margin after the relay cut, so the scroll message stays visible
                     idle_display_counter = 0
                     blank_display()
         else:
@@ -1560,10 +1828,12 @@ async def auto_poweroff():
             if silence_counter == POWER_OFF_DELAY * 60 and not is_waiting_for_sound:
                 if auto_power_enabled:
                     lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
-                    show("PW OFF")
+                    scroll_message("POWER OFF")
                     is_waiting_for_sound = True  # Wait for sound or POWER key to switch back on
-                    await asyncio.sleep(1.5)     # how long PW OFF stays visible
-                    if silent_now and is_waiting_for_sound:
+                    # Let the message finish (no fixed delay to keep in sync with it).
+                    # If a key cancelled it, the user is there: do not blank.
+                    finished = await wait_scroll()
+                    if finished and silent_now and is_waiting_for_sound:
                         blank_display()
                 else:
                     blank_display()              # relay already forced off: just blank the display
@@ -1577,10 +1847,31 @@ async def auto_poweroff():
             if (auto_power_enabled and is_waiting_for_sound
                     and lgpio.gpio_read(h, POWER_GPIO) == 0):
                 lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
-                display_volume_info()
+                if not scroll_active():          # a running message redraws the volume itself
+                    display_volume_info()
                 is_waiting_for_sound = False
             elif not auto_power_enabled and lgpio.gpio_read(h, POWER_GPIO) == 1:
                 lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
+
+
+async def blink_loop():
+    """1 s tick, aligned on the clock, that redraws the volume screen while a
+    dot must blink (CONF MANUAL dot on the 3rd character, POWER OFF dot on the
+    4th character). The phase itself comes from blink_on() at draw time."""
+    while True:
+        await asyncio.sleep(1.0 - time.monotonic() % 1.0)
+
+        blinking = ((ENABLE_TOSLINK_SWITCH and not toslink_auto_enabled)
+                    or (ENABLE_AUTO_POWEROFF and not auto_power_enabled))
+
+        # Only when the volume screen is at rest: never wake a blanked display,
+        # never overwrite a message or a held-volume-key display
+        if (blinking
+                and last_displayed == "volume"
+                and not display_is_off
+                and not scroll_active()
+                and not is_volume_key_held):
+            display_volume_info()
 
 
 # --------------------- Config switching: TOSLINK mode ---------------------
@@ -1603,6 +1894,11 @@ async def auto_poweroff():
 #
 #   A failed switch is retried with an exponential delay
 #   (RETRY_BASE_S, doubled each time, up to RETRY_MAX_S).
+#
+#   Automatism disabled (long HOMEPAGE press, `toslink_auto_enabled` False):
+#   no probing, no automatic switch, no LMS pause. The prefix is still kept
+#   in sync with the active config, and BACK keeps working (it then forces
+#   the "_" group).
 
 # Capture formats the probe can measure: CamillaDSP name -> (bytes per sample, bits)
 TOSLINK_FORMATS = {
@@ -1688,14 +1984,9 @@ def _toslink_probe(params):
     return peak_db, rms_db, None
 
 
-def _prefix_of(path):
-    """'|' if the config file name starts with '|', '_' otherwise."""
-    return '|' if os.path.basename(path or "").startswith('|') else '_'
-
-
 async def monitor_tv_toslink():
     """TOSLINK <-> SQUEEZELITE auto switching (see the block comment above)."""
-    global current_prefix
+    global current_prefix, toslink_ready
     loop = asyncio.get_running_loop()
 
     # Internal timings (not user-facing: they are calibrated on the detection
@@ -1719,6 +2010,7 @@ async def monitor_tv_toslink():
         log.error("[LOOPBACK] No '_*' config file found in %s", CONFIG_DIR)
         return
     log.info("[LOOPBACK] Configs '_*' found in %s", CONFIG_DIR)
+    toslink_ready = True        # both groups exist: BACK / HOMEPAGE may rely on the automatism
 
     path = cdsp.config.file_path() or ""
     current_prefix = _prefix_of(path)
@@ -1761,6 +2053,12 @@ async def monitor_tv_toslink():
                 current_prefix = new_prefix
             toslink_hits = silent_ticks = 0
             await asyncio.sleep(1.0)
+            continue
+
+        # Automatism disabled (long HOMEPAGE press): no probing, no switching,
+        # no LMS pause. The prefix is still resynchronised above.
+        if not toslink_auto_enabled:
+            toslink_hits = silent_ticks = 0
             continue
 
         try:
@@ -1830,6 +2128,8 @@ async def remote_events(device):
     global last_tone_tilt, enter_display_at_press
 
     last_seek_time = 0
+    home_press_time = 0.0           # moment HOMEPAGE was pressed (long-press detection, TOSLINK switch ON)
+    home_toggled = False            # the HOMEPAGE long press has already been handled
     volume_repeat_count = 0         # repeats since the last applied volume step (VOLUME_SLOWDOWN)
     swallowed_key = None            # key that only woke the display: ignored until released
     while True:
@@ -1859,6 +2159,14 @@ async def remote_events(device):
                     is_key_held = True
                     key_hold_counter = 0
 
+                    # Stop any running scroll so the key's action is visible immediately.
+                    # A volume key is left alone here: its handler below shows the volume
+                    # screen first when last_displayed is not "volume". For any other key
+                    # the volume screen is restored right away, so a cancelled message never
+                    # leaves a half-scrolled frame behind.
+                    if cancel_scroll() and key not in volume_keys:
+                        display_volume_info()
+
                     if key in volume_keys:
                         is_volume_key_held = True
                         volume_repeat_count = 0
@@ -1881,10 +2189,23 @@ async def remote_events(device):
                         handle_arrow_keys(key)
 
                     elif key == KEY_BINDINGS['BACK']:
-                        await change_config(cdsp, CONFIG_DIR + '_*')
+                        if toslink_active() and toslink_auto_enabled:
+                            # Auto ON: cycle INSIDE the active group, no group change
+                            prefix = _prefix_of(cdsp.config.file_path())
+                            await change_config(cdsp, CONFIG_DIR + prefix + '*')
+                        else:
+                            # Auto OFF (or feature disabled): force the "_" group
+                            await change_config(cdsp, CONFIG_DIR + '_*')
 
                     elif key == KEY_BINDINGS['HOMEPAGE']:
-                        await change_config(cdsp, CONFIG_DIR + '|*')
+                        if toslink_active():
+                            # Arm the long-press detection; the short-press action
+                            # (auto ON: tone summary, auto OFF: force "|" group) is
+                            # decided on release, so a long press does not trigger it.
+                            home_press_time = time.monotonic()
+                            home_toggled = False
+                        else:
+                            await change_config(cdsp, CONFIG_DIR + '|*')
 
                     elif ENABLE_DISPLAY and key == KEY_BINDINGS['ENTER']:
                         # Remember the screen shown BEFORE any change, for the action on release
@@ -1918,11 +2239,17 @@ async def remote_events(device):
                     elif key == KEY_BINDINGS['POWER']:
                         key_hold_counter += 1
                         if ENABLE_AUTO_POWEROFF and key_hold_counter == HOLD_TOGGLE_POWER:
-                            toggle_power()
-                            asyncio.create_task(return_to_volume_later())
+                            toggle_power()      # scroll_message handles the return to volume
                         elif key_hold_counter == HOLD_SHUTDOWN:
                             save_audio_settings(config_active)
                             shutdown_system()
+
+                    elif key == KEY_BINDINGS['HOMEPAGE'] and toslink_active():
+                        # Real-time measurement: independent of the remote's repeat rate
+                        if (not home_toggled
+                                and time.monotonic() - home_press_time >= HOLD_TOGGLE_AUTO_S):
+                            home_toggled = True
+                            toggle_toslink_auto()   # scroll_message handles the return to volume
 
                     elif key == KEY_BINDINGS['ENTER']:
                         key_hold_counter += 1
@@ -1931,6 +2258,15 @@ async def remote_events(device):
                             (display_tilt_info if last_tone_tilt == "tilt" else display_tone_info)()
 
                 elif attrib.keystate == 0:  # Key released
+
+                    # HOMEPAGE short press (long press not triggered):
+                    #   auto ON  -> scroll through the tone, tilt and loudness screens
+                    #   auto OFF -> force the "|" group (active then cycle)
+                    if toslink_active() and key == KEY_BINDINGS['HOMEPAGE'] and not home_toggled:
+                        if toslink_auto_enabled:
+                            show_tone_summary()
+                        else:
+                            await change_config(cdsp, CONFIG_DIR + '|*')
 
                     if ENABLE_DISPLAY and key == KEY_BINDINGS['ENTER'] and key_hold_counter < HOLD_SWITCH_TONE_TILT:
                         handle_enter_press(enter_display_at_press)
@@ -1997,9 +2333,9 @@ async def main():
     def spawn(name, factory):
         tasks.append(asyncio.create_task(supervised(name, factory)))
 
-    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH or ENABLE_LMS_SYNC:
-        # The periodic reader of volume / mute / title, shared through vol_state
-        spawn("cdsp-poller", cdsp_poller)
+    # Always: the periodic reader of volume / mute / title (shared through vol_state)
+    # and the only place that reconnects to CamillaDSP, which every feature needs
+    spawn("cdsp-poller", cdsp_poller)
     if ENABLE_AUTO_POWEROFF or ENABLE_DISPLAY or ENABLE_TOSLINK_SWITCH:
         # Single reader of the CamillaDSP levels, shared through `silent_now`
         spawn("silence", silence_monitor)
@@ -2008,6 +2344,9 @@ async def main():
     if ENABLE_DISPLAY:
         spawn("display", display_manager_loop)
         spawn("adc", adc_reader_loop)
+    if ENABLE_DISPLAY and (ENABLE_AUTO_POWEROFF or ENABLE_TOSLINK_SWITCH):
+        # 1 s tick that redraws the volume screen while a dot must blink
+        spawn("blink", blink_loop)
     if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH:
         # Redraws the display and resyncs config_active after an external change
         spawn("volume-watcher", volume_watcher_loop)

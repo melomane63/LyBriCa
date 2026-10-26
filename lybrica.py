@@ -15,15 +15,6 @@ from camilladsp import CamillaClient
 
 
 # =====================================================================
-#  STRUCTURE OF THIS FILE - read this first
-#
-#   1. FEATURES       (editable)  - turn whole blocks on/off
-#   2. SETTINGS       (editable)  - tunables grouped by topic
-#   3. INTERNAL       (read-only) - do not edit
-# =====================================================================
-
-
-# =====================================================================
 #  FEATURES - EDITABLE
 #  Each block can be switched off. A disabled block is never started,
 #  and the hardware libraries it needs are neither imported nor required.

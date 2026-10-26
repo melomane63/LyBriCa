@@ -14,9 +14,20 @@ from urllib.parse import quote, unquote
 from camilladsp import CamillaClient
 
 
-# ========================= FEATURES =========================
-# Each block can be switched off. A disabled block is never started, and the
-# hardware libraries it needs are neither imported nor required.
+# =====================================================================
+#  STRUCTURE OF THIS FILE - read this first
+#
+#   1. FEATURES       (editable)  - turn whole blocks on/off
+#   2. SETTINGS       (editable)  - tunables grouped by topic
+#   3. INTERNAL       (read-only) - do not edit
+# =====================================================================
+
+
+# =====================================================================
+#  FEATURES - EDITABLE
+#  Each block can be switched off. A disabled block is never started,
+#  and the hardware libraries it needs are neither imported nor required.
+# =====================================================================
 
 ENABLE_LMS_SYNC       = True   # LMS <-> CamillaDSP volume bridge (asyncio task)
 ENABLE_AUTO_POWEROFF  = True   # Power relay: off after silence, on with sound,
@@ -28,15 +39,26 @@ ENABLE_DISPLAY        = True   # TM1637 display + ambient light sensor
 ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input
                                # (BACK / HOMEPAGE keys do NOT depend on this)
 
+
+# ---------------------------------------------------------------------
+#  FEATURES - DERIVED VALUES - DO NOT EDIT
+#  Computed from the switches above. Change the switches, not this.
+# ---------------------------------------------------------------------
+
 # At least one feature must be enabled, otherwise the script has nothing to do
 if not (ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_AUTO_POWEROFF
         or ENABLE_TOSLINK_SWITCH or ENABLE_LMS_SYNC):
     raise ValueError("No feature enabled: turn on at least one option in the FEATURES block")
 
-# Derived from the switches above (do not edit)
 TONE_ACTIVE = ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH   # tone is saved / restored per config
 USE_GPIO    = ENABLE_AUTO_POWEROFF                     # TOSLINK detection needs no GPIO
 
+
+# ---------------------------------------------------------------------
+#  CONDITIONAL IMPORTS - DO NOT EDIT
+#  These depend on the FEATURES block above. Disable a feature there,
+#  not here.
+# ---------------------------------------------------------------------
 
 if ENABLE_REMOTE:
     import evdev
@@ -54,6 +76,10 @@ if ENABLE_TOSLINK_SWITCH:
                                           # (Debian: apt install python3-audioop-lts)
 
 
+# ---------------------------------------------------------------------
+#  LOGGING & ENVIRONMENT - DO NOT EDIT
+# ---------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("remote")
 
@@ -61,10 +87,10 @@ log = logging.getLogger("remote")
 PCP_DIR = "/mnt/mmcblk0p2/tce"
 
 
-# ========================= SETTINGS =========================
-# Everything you may want to change is here, grouped by topic.
-# (The on/off switches are in the FEATURES block above.)
-
+# =====================================================================
+#  SETTINGS - EDITABLE
+#  Tunables grouped by topic. Only change what you understand.
+# =====================================================================
 
 # ---------------------- CamillaDSP ----------------------
 CAMILLA_ADDR = ("127.0.0.1", 1234)  # CamillaDSP on this Pi (must stay local: loopback audio)
@@ -91,14 +117,14 @@ LMS_PLAYER_MANUAL = ""
 LMS_SYNC_DEBUG = False           # Log every volume/mute change and the raw LMS notifications
 
 
-# ---------------------- LMS <-> CamillaDSP bridge ----------------------
-# These three settings only drive the volume-sync bridge (LmsBridge and
-# lms_bridge_task). They are ignored if ENABLE_LMS_SYNC is False.
+# ---------------------- LMS volume-sync bridge ----------------------
+# Tunables for the LMS <-> CamillaDSP volume bridge. All three have sane
+# defaults; only adjust if you see reconnect churn or a slow LMS host.
 
-LMS_RESTORE_WINDOW_S = 0.5   # After an unmute, LMS may briefly announce a wrong volume:
-                             # the bridge corrects it during this window (seconds)
-LMS_CONNECT_TIMEOUT_S = 5    # Timeout for connecting to the LMS CLI (seconds)
-LMS_RETRY_S = 5              # Delay before the bridge restarts after an error (seconds)
+LMS_RESTORE_WINDOW_S = 0.5   # (default 0.5 s) after an unmute, LMS may briefly announce a wrong volume
+                             # the bridge corrects it during this window
+LMS_CONNECT_TIMEOUT_S = 5    # (default 5 s) TCP connect timeout to the LMS CLI
+LMS_RETRY_S = 5              # (default 5 s) delay before the bridge restarts after an error
 
 
 # ---------------------- Power ----------------------
@@ -106,6 +132,16 @@ LMS_RETRY_S = 5              # Delay before the bridge restarts after an error (
 POWER_GPIO = 4              # GPIO controlling the power relay
 POWER_OFF_DELAY = 2         # Minutes of silence before the power relay is switched off
 HALT_DELAY = 48             # Hours of silence (or without remote) before the Raspberry Pi shuts down
+
+
+# ---------------------- Audio analysis ----------------------
+# Thresholds shared by is_silent() (silence detection for the power relay
+# and for the TOSLINK -> loopback return) and by the TOSLINK probe
+# (_toslink_probe): a signal whose crest (peak - rms) is below CREST_MIN_DB
+# is a steady noise floor, not real audio.
+
+SILENCE_RMS_DB = -80.0   # (default -80 dB) RMS below this -> silence
+CREST_MIN_DB   = 2.0     # (default 2 dB)  peak - rms below this -> steady noise, not audio
 
 
 # ---------------------- TOSLINK auto switching ----------------------
@@ -119,13 +155,10 @@ HALT_DELAY = 48             # Hours of silence (or without remote) before the Ra
 # Capture params come from the first "|*" file: all files in that group must
 # share the same capture input.
 
-TOSLINK_ON_DB  = -40.0   # TOSLINK peak level (dBFS) above which audio is considered present
-TOSLINK_LOOP_S = 0.5     # Detection loop period in "_" mode (seconds)
-TOSLINK_TV_LOOP_S = 1.0  # Detection loop period in "|" mode (seconds): one LMS request per cycle
-SILENT_TICKS_TO_LOOPBACK = 2    # Consecutive "|" cycles with LMS playing + TOSLINK silent
-                                # before going back to "_*" (about 2 s with the default period)
-SWITCH_RETRY_BASE_S = 5.0       # Delay after a failed automatic switch; doubled at each failure
-SWITCH_RETRY_MAX_S = 60.0       # ... up to this value (seconds)
+TOSLINK_ON_DB = -40.0   # (default -40 dBFS peak) above which audio is considered present
+
+# The loop timing and backoff values are internal to monitor_tv_toslink()
+# and are defined right there, next to the loop that uses them.
 
 
 # ---------------------- Display ----------------------
@@ -145,9 +178,12 @@ HYSTERESIS_RATIO = 0.03     # 3 % hysteresis between two brightness levels
 
 # ---------------------- Remote control ----------------------
 
-# Name of the remote on Debian (rewritten by the installer, option 7).
-# On PiCorePlayer the name is fixed (REMOTE_NAME_PCP) and the Debian value is ignored.
+# Name of the remote on Debian. Rewritten by the installer or set manually.
 REMOTE_NAME = "HID Remote01 Keyboard"
+
+# (auto-selection below - do not edit)
+# On PiCorePlayer the name is fixed; the Debian value above
+# is ignored on that platform.
 REMOTE_NAME_PCP = "pCP BLE HID Keyboard"
 if os.path.isdir(PCP_DIR):
     REMOTE_NAME = REMOTE_NAME_PCP
@@ -212,7 +248,12 @@ LOUDNESS_STEP = 5           # Loudness: dB per key press
 DEFAULT_LOUDNESS_REF = -20  # Loudness level restored by ENTER when no previous value is saved
 
 
-# ===================== INTERNAL (do not edit) =====================
+# ---------------------------------------------------------------------
+#  INTERNAL - DO NOT EDIT
+#  Everything below is implementation detail. Changing it may break
+#  things silently. Kept here only because it is shared across
+#  multiple functions.
+# ---------------------------------------------------------------------
 
 TASK_RESTART_DELAY_S = 2.0  # Seconds before a background task that crashed is restarted
 
@@ -623,9 +664,6 @@ def blank_display():
 def is_silent():
     """Silence detection: RMS threshold, then crest factor (peak vs RMS).
     A steady noise floor has peak ≈ RMS; real audio does not."""
-    RMS_DB = -80.0        # RMS below this -> silence
-    CREST_MIN_DB = 2.0    # crest (peak - RMS) below this -> steady noise, not audio
-
     rms = cdsp.levels.capture_rms()
     peak = cdsp.levels.capture_peak()
     rms_vals = list(rms.values()) if isinstance(rms, dict) else list(rms)
@@ -634,7 +672,7 @@ def is_silent():
         return True
 
     rms_db = max(float(v) for v in rms_vals)
-    if rms_db <= RMS_DB:                            # below threshold: silence
+    if rms_db <= SILENCE_RMS_DB:                    # below threshold: silence
         return True
 
     peak_db = max(float(v) for v in peak_vals)
@@ -1562,18 +1600,18 @@ async def auto_poweroff():
 #
 #   _XX : CamillaDSP captures the loopback -> TOSLINK is free.
 #         The TOSLINK is probed directly through ALSA (0.5 s). A reading counts
-#         when peak >= TOSLINK_ON_DB AND crest (peak - rms) >= 2.0 dB
+#         when peak >= TOSLINK_ON_DB AND crest (peak - rms) >= CREST_MIN_DB
 #         (a steady noise floor has peak ~= rms and is ignored).
 #         2 consecutive readings -> switch to |XX
 #
 #   |XX : CamillaDSP captures TOSLINK -> `silent_now` is the TV level.
-#         Every TOSLINK_TV_LOOP_S, LMS is asked whether it is playing:
-#           LMS playing + TOSLINK silent for SILENT_TICKS_TO_LOOPBACK cycles
+#         Every TV_LOOP_S, LMS is asked whether it is playing:
+#           LMS playing + TOSLINK silent for SILENT_TICKS cycles
 #             -> switch back to _XX
 #           LMS playing while the TV plays -> LMS is paused
 #
 #   A failed switch is retried with an exponential delay
-#   (SWITCH_RETRY_BASE_S, doubled each time, up to SWITCH_RETRY_MAX_S).
+#   (RETRY_BASE_S, doubled each time, up to RETRY_MAX_S).
 
 # Capture formats the probe can measure: CamillaDSP name -> (bytes per sample, bits)
 TOSLINK_FORMATS = {
@@ -1669,6 +1707,15 @@ async def monitor_tv_toslink():
     global current_prefix
     loop = asyncio.get_running_loop()
 
+    # Internal timings (not user-facing: they are calibrated on the detection
+    # mechanism itself, not on the user's environment).
+    LOOP_S       = 0.5      # base cycle period; "_" mode also spends ~0.5 s probing
+    TV_LOOP_S    = 1.0      # "|" mode: exactly one LMS request per cycle
+    SILENT_TICKS = 2        # consecutive silent cycles (LMS playing) before going back to "_"
+                            # NB: depends on TV_LOOP_S: with 1.0 s -> ~2 s total
+    RETRY_BASE_S = 5.0      # first delay after a failed switch; doubled at each failure
+    RETRY_MAX_S  = 60.0     # backoff ceiling
+
     toslink_params = read_toslink_capture_params()
     if toslink_params is None:
         log.error("[TOSLINK] Cannot determine capture params, detection disabled")
@@ -1703,14 +1750,13 @@ async def monitor_tv_toslink():
             await asyncio.sleep(2.0)            # let the levels settle
             return
         switch_failures += 1
-        delay = min(SWITCH_RETRY_MAX_S,
-                    SWITCH_RETRY_BASE_S * 2 ** (switch_failures - 1))
+        delay = min(RETRY_MAX_S, RETRY_BASE_S * 2 ** (switch_failures - 1))
         log.warning("[TOSLINK] Switch to '%s' failed (#%d), retry in %g s",
                     target_prefix, switch_failures, delay)
         await asyncio.sleep(delay)
 
     while True:
-        await asyncio.sleep(TOSLINK_LOOP_S)
+        await asyncio.sleep(LOOP_S)
 
         # Config changed from outside (remote BACK / HOMEPAGE, GUI...):
         # resynchronise the prefix and restart the detection from scratch
@@ -1743,7 +1789,7 @@ async def monitor_tv_toslink():
 
                 # Protection 1: peak ~= rms -> steady noise floor, ignore it
                 # Protection 2: below the level threshold -> no audio
-                if (peak is None or (peak - rms) < 2.0
+                if (peak is None or (peak - rms) < CREST_MIN_DB
                         or peak < TOSLINK_ON_DB):
                     toslink_hits = 0
                     continue
@@ -1764,7 +1810,7 @@ async def monitor_tv_toslink():
                     # Debounce: a single silent cycle (dialogue pause, stale
                     # reading after a switch) must not send us back to _XX
                     silent_ticks += 1
-                    if silent_ticks >= SILENT_TICKS_TO_LOOPBACK:
+                    if silent_ticks >= SILENT_TICKS:
                         log.info("[LOOPBACK] LMS playing + TOSLINK silent "
                                  "-> switch to _XX")
                         silent_ticks = 0
@@ -1780,7 +1826,7 @@ async def monitor_tv_toslink():
                     await asyncio.sleep(2.0)
                 else:
                     silent_ticks = 0
-                await asyncio.sleep(TOSLINK_TV_LOOP_S - TOSLINK_LOOP_S)
+                await asyncio.sleep(TV_LOOP_S - LOOP_S)
 
         except Exception as e:
             toslink_hits = silent_ticks = 0

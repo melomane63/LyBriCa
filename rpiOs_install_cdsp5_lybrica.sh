@@ -79,7 +79,7 @@ install_lybrica() {
     # 0. Lybrica-specific dependencies
     # -------------------------------------------------------------------------
     echo "📦 Installing Lybrica dependencies..."
-    sudo apt install -y git curl python3-pip python3-venv python3-dev build-essential libasound2-dev
+    sudo apt install -y git curl python3-pip python3-venv python3-dev build-essential libasound2-dev python3-audioop-lts
 
     # -------------------------------------------------------------------------
     # 1. Configure /boot/firmware/config.txt and cmdline.txt

@@ -1196,15 +1196,11 @@ def display_volume_info(current_volume=None, is_muted=None):
         segs[2] |= 0x80
 
     # 4th character dot: POWER state
-    #   auto ON  + relay OFF -> off
-    #   auto ON  + relay ON  -> steady on
     #   auto OFF (relay forced OFF) -> blinking (1 s / 1 s)
     if ENABLE_AUTO_POWEROFF:
-        if auto_power_enabled:
-            if lgpio.gpio_read(h, POWER_GPIO) == 1:
+        if not auto_power_enabled and lgpio.gpio_read(h, POWER_GPIO) == 0:
+            if blink_on():
                 segs[3] |= 0x80
-        elif blink_on():
-            segs[3] |= 0x80
 
     tm.write(swap(segs))
     last_displayed = "volume"

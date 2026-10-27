@@ -228,9 +228,9 @@ KEY_BINDINGS = {
                                          # TOSLINK switch OFF: next config prefixed "|"
 }
 
-# Hold durations, in key-repeat events
-HOLD_TOGGLE_POWER = 2       # POWER: toggle the relay
-HOLD_SHUTDOWN = 300         # POWER: shut the Raspberry Pi down
+# Hold durations, in key-repeat events (40ms each ) 
+HOLD_TOGGLE_POWER = 2       # POWER: toggle the relay ~ 1s
+HOLD_SHUTDOWN = 200         # POWER: shut the Raspberry Pi down - 8s
 HOLD_STOP = 10              # PLAY/PAUSE: stop
 HOLD_SEEK = 10              # NEXT/PREVIOUS: seeking starts
 HOLD_SWITCH_TONE_TILT = 15  # ENTER: switch between the tone and tilt screens

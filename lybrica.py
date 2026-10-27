@@ -140,10 +140,12 @@ HALT_DELAY = 48             # Hours of continuous silence before the Raspberry P
 
 
 # ---------------------- Audio analysis ----------------------
-# Thresholds shared by is_silent() (silence detection for the power relay
-# and for the TOSLINK -> loopback return) and by the TOSLINK probe
-# (_toslink_probe): a signal whose crest (peak - rms) is below CREST_MIN_DB
-# is a steady noise floor, not real audio.
+# is_silent() feeds `silent_now`, used by the power relay (auto power-off and
+# HALT_DELAY), by the display blanking and by the TOSLINK -> loopback return.
+# It declares silence when the RMS level is below SILENCE_RMS_DB, or when the
+# signal is a steady noise floor (crest below CREST_MIN_DB).
+# CREST_MIN_DB is also used by the TOSLINK probe (_toslink_probe), which has its
+# own level threshold (TOSLINK_ON_DB, see below).
 
 SILENCE_RMS_DB = -80.0   # (default -80 dB) RMS below this -> silence
 CREST_MIN_DB   = 2.0     # (default 2 dB)  peak - rms below this -> steady noise, not audio
@@ -163,7 +165,10 @@ CREST_MIN_DB   = 2.0     # (default 2 dB)  peak - rms below this -> steady noise
 # Capture params come from the first "|*" file: all files in that group must
 # share the same capture input.
 
-TOSLINK_ON_DB = -40.0   # (default -40 dBFS peak) above which audio is considered present
+TOSLINK_ON_DB = -60.0   # (default -60 dBFS RMS) above which audio is considered present.
+                        # Keep it ABOVE SILENCE_RMS_DB, otherwise a signal could be detected
+                        # as TV and then count as silence.
+TOSLINK_DEBUG = False   # Log every TOSLINK probe measurement (peak / rms), to calibrate TOSLINK_ON_DB
 
 # The loop timing and backoff values are internal to monitor_tv_toslink()
 # and are defined right there, next to the loop that uses them.
@@ -256,8 +261,30 @@ VOLUME_SLOWDOWN = {
 
 
 # ---------------------- Tone and loudness ----------------------
-# Bass, treble, tilt and presence are saved PER CONFIG (each file keeps its own).
-# The loudness is saved PER SERIES: one value shared by all "_*" configs, one by all "|*" configs.
+# SAVE_MODE decides how the tone (bass, treble, tilt, presence) and the loudness
+# are shared between configs when you switch config:
+#
+#   all_config       : each config keeps its own tone + loudness.
+#                      (historical behaviour of the script)
+#   all_group        : all configs of the same group ("_" or "|") share the same
+#                      tone + loudness. Changing config within the same group copies
+#                      the current values to the new config.
+#   half             : tone per config, loudness per group. Changing config within
+#                      the same group keeps the tone of the new config but copies the
+#                      current loudness to the new config.
+#   same_everywhere  : all configs share the same tone + loudness, regardless of the
+#                      group. Changing config copies the current values to the new config.
+#
+# The copy is written into settings["configs"][new_config_key] before the config is
+# applied, so apply_saved_values uses the copied values. The values survive restarts:
+# they are saved per config in settings.json by save_audio_settings() at every config
+# switch and at script exit. Coming back to a group needs no copy: the config you land
+# on is the last one used in that group, and its values were saved when you left it.
+SAVE_MODE = "half"   # "all_config" | "all_group" | "half" | "same_everywhere"
+
+if SAVE_MODE not in ("all_config", "all_group", "half", "same_everywhere"):
+    raise ValueError(f"Unknown SAVE_MODE {SAVE_MODE!r}")
+
 # Adjustment ranges (TONE_MAX_DB, PRESENCE_MAX_DB and TILT_MAX_STEPS: 9 at most, the display has 2 digits)
 TONE_MAX_DB = 9             # Bass / treble: -9 .. +9 dB
 PRESENCE_MAX_DB = 3         # Presence: -3 .. +3 dB
@@ -286,6 +313,8 @@ SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settin
 CONFIG_GROUPS = ("_", "|")  # Config file prefixes: "_" = stereo (BACK key), "|" = TV (HOMEPAGE key)
 
 # Saved PER CONFIG. settings.json key -> (CamillaDSP filter, parameter)
+# The loudness is handled separately (see LOUDNESS_FILTER): depending on SAVE_MODE,
+# its value may be copied into other configs when switching.
 TONE_PARAMS = {
     "bass_gain":     ("Bass", "gain"),
     "treble_gain":   ("Treble", "gain"),
@@ -293,7 +322,7 @@ TONE_PARAMS = {
     "presence_gain": ("Presence", "gain"),
 }
 
-# Saved PER SERIES ("_" or "|"), see settings["loudness"]: (CamillaDSP filter, parameter)
+# The loudness filter (separate from the tone gains): (CamillaDSP filter, parameter)
 LOUDNESS_FILTER = ("Loudness", "reference_level")
 
 # The four gains driven by the tone / tilt screens and the ENTER key: settings key -> filter
@@ -376,13 +405,18 @@ class VolumeState:
 
     `stamp` is the time (time.monotonic) at which the reading STARTED; it is
     used to discard stale readings. `config_path` is the path of the active
-    config file (used by the TOSLINK monitor to notice external changes)."""
+    config file (used by the TOSLINK monitor to notice external changes).
+    `config_data` is the parsed config published by change_config for an
+    INTERNAL switch: volume_watcher_loop uses it instead of re-reading
+    cdsp.config.active(), which can still return the previous config while
+    CamillaDSP is applying the new one."""
 
     def __init__(self):
         self.db = None
         self.muted = None
         self.title = None
         self.config_path = None
+        self.config_data = None
         self.stamp = 0.0
         self._events = []
 
@@ -397,13 +431,15 @@ class VolumeState:
         except ValueError:
             pass
 
-    def publish(self, db, muted, title=None, config_path=None, stamp=None):
+    def publish(self, db, muted, title=None, config_path=None, config_data=None, stamp=None):
         self.db = db
         self.muted = bool(muted)
         if title:                      # an empty title (e.g. during a config reload) is ignored: the previous one is kept
             self.title = title
         if config_path:                # same rule for the config path
             self.config_path = config_path
+        if config_data is not None:    # kept until the watcher consumes it
+            self.config_data = config_data
         self.stamp = time.monotonic() if stamp is None else stamp
         for ev in self._events:
             ev.set()
@@ -627,7 +663,7 @@ enter_display_at_press = None   # Screen shown when ENTER was pressed (to tell s
 toslink_auto_enabled = True     # TOSLINK automatism active (toggled by a long HOMEPAGE press)
 toslink_ready = False           # True once monitor_tv_toslink has found its "_*" and "|*" config files
 
-prev_values = {}                # ENTER-key restore values: keys of GAIN_KEYS (per config) + "loudness_ref" (per series)
+prev_values = {}                # ENTER-key restore values: keys of GAIN_KEYS + "loudness_ref" (loaded from the config's saved entry)
                                 # (filled by load_prev_values)
 current_config_key = None       # Settings key of the active config file
 
@@ -1023,13 +1059,9 @@ def load_settings():
         data = {}
     configs = data.get("configs")
     last_config = data.get("last_config")
-    loudness = data.get("loudness")
     return {
-        # per config: bass / treble / tilt / presence gains + their ENTER restore values ("prev")
         "configs": configs if isinstance(configs, dict) else {},
         "last_config": last_config if isinstance(last_config, dict) else {},
-        # per series ("_" / "|"): {"ref": loudness level, "prev": ENTER restore level}
-        "loudness": loudness if isinstance(loudness, dict) else {},
         "last_tone_tilt": data.get("last_tone_tilt", "tone"),
     }
 
@@ -1043,83 +1075,44 @@ def write_settings():
 
 
 def save_audio_settings(config):
-    """Store the tone of the active config, then write settings.json."""
+    """Store the tone and the loudness of the active config, then write
+    settings.json. Always per config: how the values are shared between
+    configs is decided by SAVE_MODE in change_config, which copies them into
+    the new config at switch time."""
     if not TONE_ACTIVE:
         return
     if current_config_key:
         entry = get_tone(config)
-        entry["prev"] = {key: prev_values[key] for key in GAIN_KEYS}
-        settings["configs"][current_config_key] = entry
-        # The loudness belongs to the series of the config. A config without a
-        # Loudness filter leaves the series value untouched.
+        entry["prev"] = {key: prev_values[key] for key in TONE_PARAMS}
         ref = get_filter_param(config, *LOUDNESS_FILTER)
         if ref is not None:
-            settings["loudness"][_prefix_of(current_config_key)] = {
-                "ref": ref, "prev": prev_values["loudness_ref"]}
+            entry["loudness_ref"] = ref
+            entry["prev"]["loudness_ref"] = prev_values["loudness_ref"]
+        settings["configs"][current_config_key] = entry
     settings["last_tone_tilt"] = last_tone_tilt
     write_settings()
 
 
-def get_series_loudness(series, saved_config=None):
-    """Saved loudness of a series ("_" or "|"): {"ref": level, "prev": ENTER restore
-    level}, or None if nothing is saved.
-    Migration: a series with no entry yet takes the loudness the old versions saved
-    in the config entry (`saved_config`), so existing settings are not lost."""
-    entry = settings["loudness"].get(series) if series else None
-    if isinstance(entry, dict) and isinstance(entry.get("ref"), (int, float)):
-        prev = entry.get("prev")
-        return {"ref": entry["ref"],
-                "prev": prev if isinstance(prev, (int, float)) else DEFAULT_LOUDNESS_REF}
-    if isinstance(saved_config, dict) and isinstance(saved_config.get("loudness_ref"), (int, float)):
-        legacy_prev = saved_config.get("prev")
-        legacy_prev = legacy_prev.get("loudness_ref") if isinstance(legacy_prev, dict) else None
-        return {"ref": saved_config["loudness_ref"],
-                "prev": legacy_prev if isinstance(legacy_prev, (int, float)) else DEFAULT_LOUDNESS_REF}
-    return None
-
-
-def apply_saved(filters, series, saved):
-    """Apply the saved tone of a config (`saved`) and the saved loudness of its
-    series to a `filters` dict. Returns True if something was applied."""
-    applied = False
-    if saved:
-        apply_tone(filters, saved)
-        applied = True
-    entry = get_series_loudness(series, saved)
-    if entry is not None:
-        apply_filter_param(filters, *LOUDNESS_FILTER, entry["ref"])
-        applied = True
-    return applied
-
-
-def resync_series_loudness():
-    """After a config change that did not come from this script: put the loudness
-    of the config's series into the active config (and into CamillaDSP)."""
-    if not (TONE_ACTIVE and current_config_key and is_complete_config(config_active)):
-        return
-    entry = get_series_loudness(_prefix_of(current_config_key),
-                                settings["configs"].get(current_config_key))
-    params = get_filter_params(config_active, LOUDNESS_FILTER[0])
-    if entry is None or params is None or params.get(LOUDNESS_FILTER[1]) == entry["ref"]:
-        return
-    params[LOUDNESS_FILTER[1]] = entry["ref"]
-    try:
-        cdsp.config.set_active(config_active)
-    except Exception as e:
-        log.warning("Cannot apply the loudness of series '%s': %s",
-                    _prefix_of(current_config_key), e)
-
-
-def load_prev_values(saved=None, series=None):
-    """Load the ENTER-key restore values: the four gains from the config's saved
-    entry, the loudness one from its series (defaults if nothing is saved)."""
+def load_prev_values(saved=None):
+    """Load the ENTER-key restore values (the four gains and the loudness) from
+    the saved entry of a config (defaults if none)."""
     saved_prev = saved.get("prev") if saved else None
     if not isinstance(saved_prev, dict):
         saved_prev = {}
-    for key in GAIN_KEYS:
+    for key in TONE_PARAMS:
         prev_values[key] = saved_prev.get(key, 0)
-    entry = get_series_loudness(series, saved)
-    prev_values["loudness_ref"] = entry["prev"] if entry else DEFAULT_LOUDNESS_REF
+    prev_values["loudness_ref"] = saved_prev.get("loudness_ref", DEFAULT_LOUDNESS_REF)
+
+
+def apply_saved_values(filters, saved):
+    """Apply the saved tone and the saved loudness of a config to a `filters`
+    dict (filters missing from the config are ignored). Which values are in
+    `saved` is decided by SAVE_MODE in change_config, which may copy another
+    config's values into it before this call."""
+    if saved:
+        apply_tone(filters, saved)
+        if "loudness_ref" in saved:
+            apply_filter_param(filters, *LOUDNESS_FILTER, saved["loudness_ref"])
 
 
 def is_complete_config(cfg):
@@ -1130,19 +1123,21 @@ def is_complete_config(cfg):
             and bool(cfg["devices"]))
 
 def init_tone():
-    """Apply the saved tone of the config CamillaDSP started with."""
+    """Apply the saved tone and loudness of the config CamillaDSP started with.
+    The config is pushed to CamillaDSP even when nothing is saved: on this setup
+    that push is what makes CamillaDSP start processing at boot (and the players
+    that depend on it only start after that)."""
     global current_config_key
     path = cdsp.config.file_path()
     if not path:
         return
     current_config_key = config_key(path)
-    series = _prefix_of(path)
     saved = settings["configs"].get(current_config_key)
-    load_prev_values(saved, series)
+    load_prev_values(saved)
     if is_complete_config(config_active):
         filters = config_active.get("filters")
-        if apply_saved(filters if isinstance(filters, dict) else {}, series, saved):
-            cdsp.config.set_active(config_active)
+        apply_saved_values(filters if isinstance(filters, dict) else {}, saved)
+        cdsp.config.set_active(config_active)
 
 
 settings = load_settings()
@@ -1197,6 +1192,7 @@ def display_volume_info(current_volume=None, is_muted=None):
 
     # 4th character dot: POWER state
     #   auto OFF (relay forced OFF) -> blinking (1 s / 1 s)
+    #   otherwise                   -> off (never steady on)
     if ENABLE_AUTO_POWEROFF:
         if not auto_power_enabled and lgpio.gpio_read(h, POWER_GPIO) == 0:
             if blink_on():
@@ -1422,9 +1418,11 @@ async def change_config(cdsp, config_pattern, cycle=True):
     """Switch config within the group of files matching the pattern.
     cycle=True : go to the next file of the group if the active config belongs to it.
     Otherwise (or if cycle=False): go to the last config used in this group.
-    Each config keeps its own tone settings (bass, treble, tilt, loudness, presence).
-    The new config is published into vol_state (title and path) so that the
-    other tasks notice the change.
+    How the tone and the loudness are shared between configs is decided by
+    SAVE_MODE (see the SETTINGS block). The values are always saved per config;
+    SAVE_MODE only controls what is copied into the new config before it is applied.
+    The new config is published into vol_state (title, path and the parsed config)
+    so that the other tasks notice the change.
     Returns the title of the new config if a switch was performed, None otherwise."""
     global config_active, current_config_key, current_prefix
 
@@ -1445,8 +1443,14 @@ async def change_config(cdsp, config_pattern, cycle=True):
     if new_config_path == current_config:
         return None
 
-    # Remember the tone of the config we are leaving (and write it to disk)
+    # Remember the tone and loudness of the config we are leaving (and write them to disk)
     save_audio_settings(config_active)
+
+    # The config we leave is, by definition, the last one used in its group: remember
+    # it now, so that coming back to this group (TV on/off, BACK / HOMEPAGE) lands on
+    # it and finds its latest values - even when it is the config the script started with.
+    if current_config:
+        settings["last_config"][_prefix_of(current_config)] = config_key(current_config)
 
     # Protection 3: abort if the new config cannot be read or does not parse to a dict
     try:
@@ -1463,11 +1467,43 @@ async def change_config(cdsp, config_pattern, cycle=True):
         filters = {}
         new_config_data['filters'] = filters
 
-    # Saved tone for this config and saved loudness for its series; if none, the values from the .yml are kept
     new_key = config_key(new_config_path)
     new_series = _prefix_of(new_config_path)
+
+    # SAVE_MODE: depending on the mode and on whether the new config is in the same
+    # group as the one we are leaving, copy the values saved for the config we are
+    # leaving into settings["configs"][new_key] BEFORE applying, so that
+    # apply_saved_values below picks the copy up.
+    #   all_config       : never copy, B keeps its own values.
+    #   all_group        : same group -> copy tone + loudness.
+    #   half             : same group -> copy the loudness only (the tone stays per config).
+    #   same_everywhere  : always copy tone + loudness, whatever the group.
+    if SAVE_MODE != "all_config":
+        same_group = (new_series == _prefix_of(current_config))
+        old_entry = settings["configs"].get(current_config_key)
+        if isinstance(old_entry, dict):
+            if SAVE_MODE == "all_group" and same_group:
+                settings["configs"][new_key] = dict(old_entry)
+                write_settings()
+            elif SAVE_MODE == "half" and same_group:
+                entry_b = settings["configs"].get(new_key)
+                if not isinstance(entry_b, dict):
+                    entry_b = {}
+                if "loudness_ref" in old_entry:
+                    entry_b["loudness_ref"] = old_entry["loudness_ref"]
+                if isinstance(old_entry.get("prev"), dict):
+                    entry_b.setdefault("prev", {})["loudness_ref"] = (
+                        old_entry["prev"].get("loudness_ref", DEFAULT_LOUDNESS_REF))
+                settings["configs"][new_key] = entry_b
+                write_settings()
+            elif SAVE_MODE == "same_everywhere":
+                settings["configs"][new_key] = dict(old_entry)
+                write_settings()
+
+    # Saved values for this config (possibly overwritten by the copy above);
+    # if none, the values from the .yml are kept
     saved = settings["configs"].get(new_key)
-    apply_saved(filters, new_series, saved)     # tone: per config, loudness: per series
+    apply_saved_values(filters, saved)
 
     # Make relative filter file names absolute
     config_dir = os.path.dirname(os.path.abspath(new_config_path))
@@ -1492,19 +1528,20 @@ async def change_config(cdsp, config_pattern, cycle=True):
     if config_pattern.startswith(CONFIG_DIR) and len(config_pattern) > len(CONFIG_DIR):
         current_prefix = config_pattern[len(CONFIG_DIR)]
 
-    load_prev_values(saved, new_series)
+    load_prev_values(saved)
 
     # Remember this config as the last used of its group (survives TV on/off and restarts)
     if group in CONFIG_GROUPS:
         settings["last_config"][group] = new_key
         write_settings()
 
-    # Let the other tasks know right away (title, path) instead of waiting for
-    # the next cdsp_poller cycle
+    # Let the other tasks know right away (title, path, parsed config) instead of
+    # waiting for the next cdsp_poller cycle
     vol_state.publish(
         vol_state.db, vol_state.muted,
         title=new_config_data.get("title"),
         config_path=new_config_path,
+        config_data=new_config_data,
     )
 
     # Wait until CamillaDSP has finished loading the new config, so that
@@ -1568,21 +1605,20 @@ def reconnect_cdsp():
 
 
 def resync_after_reconnect():
-    """After a CamillaDSP restart: re-read the active config and re-apply the
-    saved tone."""
+    """After a CamillaDSP restart: re-read the active config, re-apply the
+    saved tone and loudness, and push the config back (same push as at boot)."""
     global config_active, current_config_key
     new_active = cdsp.config.active() or {}
     if isinstance(new_active, dict) and new_active:
         config_active = new_active
     path = cdsp.config.file_path()
     current_config_key = config_key(path) if path else None
-    series = _prefix_of(path) if path else None
     saved = settings["configs"].get(current_config_key) if current_config_key else None
-    load_prev_values(saved, series)
+    load_prev_values(saved)
     if TONE_ACTIVE and is_complete_config(config_active):
         filters = config_active.get("filters")
-        if apply_saved(filters if isinstance(filters, dict) else {}, series, saved):
-            cdsp.config.set_active(config_active)
+        apply_saved_values(filters if isinstance(filters, dict) else {}, saved)
+        cdsp.config.set_active(config_active)
 
 
 # ====================== BACKGROUND TASKS ======================
@@ -1710,8 +1746,8 @@ async def adc_reader_loop():
 async def volume_watcher_loop():
     """Consume vol_state (no direct CamillaDSP reads any more): redraw the
     display when volume / mute / title change, and resync the local state when
-    the config changes from outside, so that the script does not later
-    overwrite the external config."""
+    the config changes, so that the script does not later overwrite the active
+    config with an outdated copy."""
     global config_active, current_config_key
 
     ev = vol_state.subscribe()
@@ -1733,26 +1769,38 @@ async def volume_watcher_loop():
             last_title = current_title
 
         if title_changed:
-            # Protection 2: never let config_active become None
-            try:
-                new_active = cdsp.config.active() or {}
-            except Exception as e:
-                log.warning("Volume watcher: could not fetch active config (%s)", e)
-                new_active = None
+            # INTERNAL switch: change_config published the parsed config in
+            # vol_state.config_data. Use it instead of re-reading cdsp.config.active(),
+            # which can still return the PREVIOUS config while CamillaDSP is applying
+            # the new one. It is only trusted if it is the config the title announces:
+            # a published config that was never consumed (same title as the previous
+            # config, or no title) must not be taken for a later, external change.
+            published, vol_state.config_data = vol_state.config_data, None
+            if published is not None and published.get("title") == current_title:
+                new_active = published
+            else:
+                # EXTERNAL change (CamillaDSP UI, another client): give CamillaDSP
+                # time to finish loading before reading.
+                await asyncio.sleep(0.3)
+                # Protection 2: never let config_active become None
+                try:
+                    new_active = cdsp.config.active() or {}
+                except Exception as e:
+                    log.warning("Volume watcher: could not fetch active config (%s)", e)
+                    new_active = None
 
-            if isinstance(new_active, dict) and new_active:
+            if is_complete_config(new_active):
                 config_active = new_active
                 path = cdsp.config.file_path()
                 current_config_key = config_key(path) if path else None
                 saved = settings["configs"].get(current_config_key) if current_config_key else None
-                load_prev_values(saved, _prefix_of(path) if path else None)
-                resync_series_loudness()      # external change: the series' loudness follows
+                load_prev_values(saved)
                 last_warned_title = None
                 log.debug("Config title changed to '%s'", current_title)
 
             else:
                 if current_title != last_warned_title:
-                    log.warning("Config changed but active config is unusable; keeping previous (title=%r)", current_title)
+                    log.warning("Config changed but active config is incomplete; keeping previous (title=%r)", current_title)
                     last_warned_title = current_title
 
         if current_volume != last_volume or current_mute != last_mute or title_changed:
@@ -1878,7 +1926,7 @@ async def blink_loop():
 #
 #   _XX : CamillaDSP captures the loopback -> TOSLINK is free.
 #         The TOSLINK is probed directly through ALSA (0.5 s). A reading counts
-#         when peak >= TOSLINK_ON_DB AND crest (peak - rms) >= CREST_MIN_DB
+#         when rms >= TOSLINK_ON_DB AND crest (peak - rms) >= CREST_MIN_DB
 #         (a steady noise floor has peak ~= rms and is ignored).
 #         2 consecutive readings -> switch to |XX
 #
@@ -1934,16 +1982,25 @@ def read_toslink_capture_params():
         return None
 
 
-def _levels(data, fmt):
+def _levels(data, fmt, channels=2):
     """Peak and RMS level, in dBFS, of a buffer of samples in the CamillaDSP
     format `fmt`. Returns (peak_db, rms_db), or (None, None) if it is empty.
+    Like the levels CamillaDSP reports (and is_silent() uses), the RMS is the one
+    of the LOUDEST channel, not of the channels mixed together: otherwise a steady
+    signal with different levels on the two channels (a DC offset, for instance)
+    would get a peak - rms gap and pass the CREST_MIN_DB test as if it were audio.
+    Stereo only; with another channel count the RMS is the mixed one.
     audioop does the work in C: far cheaper than a Python loop over samples."""
     if not data:
         return None, None
     width, bits = TOSLINK_FORMATS[fmt]
     full_scale = 2 ** (bits - 1)
     peak = audioop.max(data, width)
-    rms = audioop.rms(data, width)
+    if channels == 2:
+        rms = max(audioop.rms(audioop.tomono(data, width, 1, 0), width),    # left
+                  audioop.rms(audioop.tomono(data, width, 0, 1), width))    # right
+    else:
+        rms = audioop.rms(data, width)
     peak_db = 20.0 * math.log10(peak / full_scale) if peak > 0 else -1000.0
     rms_db = 20.0 * math.log10(rms / full_scale) if rms > 0 else -1000.0
     return peak_db, rms_db
@@ -1976,7 +2033,7 @@ def _toslink_probe(params):
     finally:
         pcm.close()
 
-    peak_db, rms_db = _levels(b"".join(chunks), params["format"])     # computed once, at the end
+    peak_db, rms_db = _levels(b"".join(chunks), params["format"], params["channels"])     # computed once, at the end
     return peak_db, rms_db, None
 
 
@@ -2001,6 +2058,9 @@ async def monitor_tv_toslink():
     log.info("[TOSLINK] Capture: %s @ %d Hz, %d ch, %s",
              toslink_params["device"], toslink_params["rate"],
              toslink_params["channels"], toslink_params["format"])
+    if TOSLINK_ON_DB <= SILENCE_RMS_DB:
+        log.warning("[TOSLINK] TOSLINK_ON_DB (%g) is not above SILENCE_RMS_DB (%g): "
+                    "the TV may be detected, then counted as silence", TOSLINK_ON_DB, SILENCE_RMS_DB)
 
     if not glob.glob(CONFIG_DIR + "_*"):
         log.error("[LOOPBACK] No '_*' config file found in %s", CONFIG_DIR)
@@ -2072,10 +2132,14 @@ async def monitor_tv_toslink():
                     continue
                 last_err = None
 
+                if TOSLINK_DEBUG and peak is not None:
+                    log.info("[TOSLINK] probe: peak=%.1f rms=%.1f crest=%.1f",
+                             peak, rms, peak - rms)
+
                 # Protection 1: peak ~= rms -> steady noise floor, ignore it
-                # Protection 2: below the level threshold -> no audio
+                # Protection 2: RMS below the level threshold -> no audio
                 if (peak is None or (peak - rms) < CREST_MIN_DB
-                        or peak < TOSLINK_ON_DB):
+                        or rms < TOSLINK_ON_DB):
                     toslink_hits = 0
                     continue
 

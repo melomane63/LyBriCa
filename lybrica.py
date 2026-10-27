@@ -1872,7 +1872,7 @@ async def auto_poweroff():
             if silence_counter == POWER_OFF_DELAY * 60 and not is_waiting_for_sound:
                 if auto_power_enabled:
                     lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
-                    scroll_message("POWER OFF")
+                    scroll_message("POWER SAVE")
                     is_waiting_for_sound = True  # Wait for sound or POWER key to switch back on
                     # Let the message finish (no fixed delay to keep in sync with it).
                     # If a key cancelled it, the user is there: do not blank.

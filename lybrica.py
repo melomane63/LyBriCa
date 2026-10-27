@@ -234,8 +234,9 @@ HOLD_SHUTDOWN = 300         # POWER: shut the Raspberry Pi down
 HOLD_STOP = 10              # PLAY/PAUSE: stop
 HOLD_SEEK = 10              # NEXT/PREVIOUS: seeking starts
 HOLD_SWITCH_TONE_TILT = 15  # ENTER: switch between the tone and tilt screens
-SEEK_STEP_S = 10            # Seconds jumped at each seek
-SEEK_INTERVAL_S = 0.5       # Seconds between two seeks while the key is held (10 s / 0.5 s = 20x speed)
+SEEK_STEP_FORWARD_S = 30    # Seconds jumped forward at each seek (NEXTSONG)
+SEEK_STEP_BACKWARD_S = 10   # Seconds jumped backward at each seek (PREVIOUSSONG)
+SEEK_INTERVAL_S = 0.8       # Seconds between two seeks while the key is held (10 s / 0.5 s = 20x speed)
 
 # Hold duration, in real seconds (independent of the remote's repeat rate)
 HOLD_TOGGLE_AUTO_S = 2.0    # HOMEPAGE: long press to enable / disable the TOSLINK automatism
@@ -2282,13 +2283,16 @@ async def remote_events(device):
                         if volume_repeat_count >= VOLUME_SLOWDOWN[key]:
                             volume_repeat_count = 0
                             change_volume_from_key(key, cdsp.volume.main_volume())
-
+                          
                     elif key in (KEY_BINDINGS['PREVIOUSSONG'], KEY_BINDINGS['NEXTSONG']):
                         key_hold_counter += 1
                         current_time = time.time()
                         if key_hold_counter >= HOLD_SEEK and current_time - last_seek_time >= SEEK_INTERVAL_S:
-                            sign = "+" if key == KEY_BINDINGS['NEXTSONG'] else "-"
-                            await asyncio.to_thread(send_lms_command, f"time {sign}{SEEK_STEP_S}")
+                            if key == KEY_BINDINGS['NEXTSONG']:
+                                cmd = f"time +{SEEK_STEP_FORWARD_S}"
+                            else:
+                                cmd = f"time -{SEEK_STEP_BACKWARD_S}"
+                            await asyncio.to_thread(send_lms_command, cmd)
                             last_seek_time = current_time
 
                     elif key == KEY_BINDINGS['PLAYPAUSE']:

@@ -3,7 +3,8 @@
 **Ly**rion + **Bri**dge + **Ca**millaDSP
 
 A Raspberry Pi audio-control project connecting
-**Lyrion Music Server** and **CamillaDSP**.
+**Lyrion Music Server** and **CamillaDSP**. It runs on **Raspberry Pi OS
+(Debian)** and on **piCorePlayer**.
 
 LyBriCa is built around **five independent features**, all **enabled by
 default**. Each one can be turned off on its own by editing the corresponding
@@ -15,7 +16,7 @@ switch at the top of `lybrica.py`:
 | 2 | BLE HID remote (volume, tone, player control, configs) | `ENABLE_REMOTE` |
 | 3 | TM1637 display with automatic brightness | `ENABLE_DISPLAY` |
 | 4 | Trigger control for amplifier power | `ENABLE_AUTO_POWEROFF` |
-| 5 | Automatic DSP configuration switching (GPIO or TOSLINK) | `ENABLE_CONFIG_SWITCH` |
+| 5 | Automatic DSP configuration switching (TOSLINK detection) | `ENABLE_TOSLINK_SWITCH` |
 
 An optional **ESP32-C3 companion** manages the Raspberry Pi power, reads
 a physical button and the BLE HID remote, and sends ambient-light readings to
@@ -23,7 +24,8 @@ the Pi over UART serial.
 
 When a feature is disabled, the hardware library it needs is **not imported
 and not required**, so LyBriCa can run on a minimal setup (for example
-volume-sync only, with no display and no remote). See
+volume-sync only, with no display and no remote). At least one feature must be
+enabled, otherwise `lybrica.py` stops at startup with a `ValueError`. See
 [Feature switches](#feature-switches) for details.
 
 ---
@@ -34,23 +36,25 @@ volume-sync only, with no display and no remote). See
 2. [Architecture](#architecture)
 3. [Hardware](#hardware)
 4. [Software components](#software-components)
-5. [Quick install](#quick-install)
+5. [Quick install (Raspberry Pi OS)](#quick-install-raspberry-pi-os)
 6. [What the installer does](#what-the-installer-does)
 7. [Raspberry Pi boot configuration](#raspberry-pi-boot-configuration)
 8. [Manual installation](#manual-installation)
-9. [Configuration](#configuration)
-10. [Feature switches](#feature-switches)
-11. [Lyrion Music Server setup](#lyrion-music-server-setup)
-12. [Remote control keys](#remote-control-keys)
-13. [Display](#display)
-14. [Volume curve](#volume-curve)
-15. [DSP configuration files](#dsp-configuration-files)
-16. [Settings file](#settings-file)
-17. [ESP32-C3 companion](#esp32-c3-companion)
-18. [Systemd service](#systemd-service)
-19. [Troubleshooting](#troubleshooting)
-20. [Known limitations](#known-limitations)
-21. [License](#license)
+9. [piCorePlayer](#picoreplayer)
+10. [Configuration](#configuration)
+11. [Feature switches](#feature-switches)
+12. [Lyrion Music Server setup](#lyrion-music-server-setup)
+13. [Remote control keys](#remote-control-keys)
+14. [Display](#display)
+15. [Volume curve](#volume-curve)
+16. [DSP configuration files and automatic switching](#dsp-configuration-files-and-automatic-switching)
+17. [Tone and loudness sharing (`SAVE_MODE`)](#tone-and-loudness-sharing-save_mode)
+18. [Settings file](#settings-file)
+19. [ESP32-C3 companion](#esp32-c3-companion)
+20. [Systemd service](#systemd-service)
+21. [Troubleshooting](#troubleshooting)
+22. [Known limitations](#known-limitations)
+23. [License](#license)
 
 ---
 
@@ -59,15 +63,16 @@ volume-sync only, with no display and no remote). See
 LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 
 - **Bidirectional volume / mute sync** between Lyrion (on Material Skin) and CamillaDSP
-- **Automatic DSP config switching** (TV / Squeezelite) via GPIO **or** TOSLINK
-  detection (one method at a time)
-- **BLE HID remote control** (volume, mute, config, tone, tilt, loudness,
-  power)
+- **Automatic DSP config switching** (Squeezelite `_*` configs / TV `|*` configs)
+  by listening to the **TOSLINK** input through ALSA
+- **BLE HID remote control** (volume, mute, player control, config, tone, tilt,
+  loudness, power)
 - **TM1637 display** with ambient light sensor for automatic brightness
 - **Power relay control**: switch off after silence, back on with sound,
-  halt the Pi after a long silence
+  halt the Pi after a very long silence
 - **Physical power on/off** handled by an ESP32 companion
-- **Per-config tone settings** saved in `settings.json`
+- **Per-config tone and loudness settings** saved in `settings.json`, shared
+  between configs according to `SAVE_MODE`
 
 ---
 
@@ -99,34 +104,37 @@ LyBriCa keeps **Lyrion Music Server** (ex-LMS) and **CamillaDSP** in sync:
 |  Audio path: Lyrion -> Squeezelite -> ALSA loopback -> CamillaDSP -> DAC   |
 |                                                                            |
 +----------------------------------------------------------------------------+
-            | evdev     ^            |          ^             |
-            v           | "gpio"     v          | "toslink"   v
-    +--------------+    |    +---------------+  |     +--------------+
-    |  HID remote  |    |    | TM1637 display|  |     |  Trigger Amp    |
-    +--------------+    |    | CLK 23 DIO 24 |  |     |   (GPIO 4)   |
-                        |    +---------------+  |     +--------------+
-                        |                       |
-                        |                       |
-                 +------+-----+          +------+-----+
-                 |  TV state  |          | TOSLINK in |
-                 | (GPIO 12)  |          |   (ALSA)   |
-                 +------------+          +------------+
+            | evdev                  |                       |
+            v                        v                       v
+    +--------------+        +---------------+        +--------------+
+    |  HID remote  |        | TM1637 display|        |  Trigger Amp |
+    +--------------+        | CLK 23 DIO 24 |        |   (GPIO 4)   |
+                            +---------------+        +--------------+
 
-            Config switching: one of the two, set by ENABLE_CONFIG_SWITCH
+            +-------------------------------------------+
+            | TOSLINK in (ALSA capture device)          |
+            | probed by LyBriCa while the "_*" config   |
+            | is active, captured by CamillaDSP while   |
+            | the "|*" config is active                 |
+            +-------------------------------------------+
 ```
 
 How the pieces talk to each other:
 
 - **Volume bridge**: LyBriCa listens to Lyrion through its CLI
   (port 9090) and reads/writes the CamillaDSP main volume and mute through its
-  WebSocket (port 1234), in both directions. CamillaDSP is read by a single
-  poller, and bursts of changes coming from Lyrion are merged before being
-  written (see [Lyrion Music Server setup](#lyrion-music-server-setup)).
+  WebSocket (port 1234), in both directions. CamillaDSP is read by a **single
+  poller** (`cdsp_poller`) that publishes into a shared state; the display, the
+  TOSLINK monitor and the bridge all subscribe to it. A CamillaDSP change is
+  forwarded to Lyrion only after it has been seen on two consecutive readings,
+  and readings that started before LyBriCa's own last write are discarded (see
+  [Lyrion Music Server setup](#lyrion-music-server-setup)).
 - **Audio path** (it does not go through LyBriCa): Lyrion streams to
   Squeezelite, which plays into the ALSA loopback (`hw:Loopback,0`);
-  CamillaDSP captures it (`plughw:Loopback,1,0`), applies the filters and
+  CamillaDSP captures it (`hw:Loopback,1`), applies the filters and
   plays to the DAC.
-- **ESP32 <-> Pi signals**:
+- **ESP32 <-> Pi signals** (Raspberry Pi OS; see [piCorePlayer](#picoreplayer) for
+  the pCP pins):
   - ESP32 GPIO5 -> Pi power relay (HIGH = on)
   - ESP32 GPIO10 -> Pi GPIO20: shutdown request (`gpio-shutdown` overlay)
   - Pi GPIO21 -> ESP32 GPIO6: power-good (`gpio-poweroff` overlay)
@@ -134,10 +142,13 @@ How the pieces talk to each other:
 - **HID remote**: BLE to the ESP32 while the Pi is off (wake-up), then to the Pi
   (evdev) once it has booted. The same remote is used on both sides, one at a
   time (see [Using one remote with both the ESP32 and the Pi](#using-one-remote-with-both-the-esp32-and-the-pi)).
-- **Config switching** (one method at a time): with `"gpio"`, LyBriCa reads the
-  TV state on GPIO 12; with `"toslink"`, it probes the TOSLINK capture device
-  through ALSA while CamillaDSP is not holding it. Either one makes LyBriCa load
-  the next `|*` (TV) or `_*` (stereo) config in CamillaDSP.
+- **Config switching**: LyBriCa tells the two groups of configs apart by the
+  filename prefix (`_` = streamer, `|` = TV). While a `_*` config is active,
+  CamillaDSP does not use the TOSLINK input, so LyBriCa probes it through ALSA;
+  when the TV plays, it loads the last used `|*` config. While a `|*` config is
+  active, CamillaDSP captures the TOSLINK input, and LyBriCa uses CamillaDSP's
+  own level meter to know when the TV has gone quiet while Lyrion is playing
+  (see [DSP configuration files and automatic switching](#dsp-configuration-files-and-automatic-switching)).
 
 The **ESP32** manages the Raspberry Pi's physical power supply and can request
 a wake-up from a button or remote-control event. It also reads the ambient-light
@@ -152,19 +163,19 @@ that relay switches the amplifier, not the Raspberry Pi's own power supply.
 
 | Component | Role | Connection |
 |---|---|---|
-| Raspberry Pi (**64-bit capable**, see note) | Runs LyBriCa | - |
+| Raspberry Pi (**64-bit capable** on Raspberry Pi OS, see note) | Runs LyBriCa | - |
 | ESP32-C3 | Raspberry Pi power relay, BLE HID remote, light sensor | UART TX to `/dev/serial0` |
 | HID remote | User input | USB / Bluetooth (evdev) |
 | TM1637 display | 6-digit display | GPIO 23 (CLK), GPIO 24 (DIO) |
 | Power relay | Cuts power to the amplifier | GPIO 4 |
-| TV state input | Detects TV on/off | GPIO 12 (optional) |
+| TOSLINK input | Source detection (automatic config switching) | ALSA capture device (optional) |
 | Ambient light sensor | Auto brightness | Via ESP32 (serial) |
-| TOSLINK input | Source detection | ALSA (optional) |
 
-> **64-bit only.** The installer downloads `aarch64` binaries (CamillaDSP,
-> CamillaGUI), an `arm64` build of `bluetuith`, and sets `arm_64bit=1` in
-> `config.txt`. A 32-bit-only Raspberry Pi (Pi 1, Zero, original Pi 2) is not
-> supported by the installer, even though the GPIO features alone would run.
+> **64-bit only on Raspberry Pi OS.** The Debian installer downloads `aarch64`
+> binaries (CamillaDSP, CamillaGUI), an `arm64` build of `bluetuith`, and sets
+> `arm_64bit=1` in `config.txt`. A 32-bit-only Raspberry Pi (Pi 1, Zero,
+> original Pi 2) is not supported by that installer. The piCorePlayer installer
+> also supports 32-bit (`armv7`) builds.
 
 ---
 
@@ -179,7 +190,7 @@ that relay switches the amplifier, not the Raspberry Pi's own power supply.
 
 ---
 
-## Quick install
+## Quick install (Raspberry Pi OS)
 
 A single script installs everything: CamillaDSP, Lyrion Music Server,
 Squeezelite, LyBriCa, the ALSA loopback, the USB drive mount, and the
@@ -218,6 +229,9 @@ steps.
 > `python3-pip`...) are installed by option 2, not by option 7. Without them,
 > the `pip install pyalsaaudio` step fails and the installer stops (`set -e`).
 
+> **Running on piCorePlayer?** Use `install_pcp.sh` instead, see
+> [piCorePlayer](#picoreplayer).
+
 ### Installer defaults
 
 The installer uses the following fixed values:
@@ -249,7 +263,7 @@ To change any of these, edit `install-lybrica.sh` directly.
 | **3. Lyrion** | Downloads and installs Lyrion Music Server 9.1.1, installs Squeezelite, configures the output device to `hw:Loopback,0` with options `-W -C 5 -r 48000-48000 -R hLE` |
 | **4. USB drive** | Looks for a UUID on `/dev/sda1` only (via `blkid`); if none is found, asks for the UUID. Adds an entry to `/etc/fstab` (`auto defaults,nofail,x-systemd.device-timeout=1,noatime`) |
 | **5. Sound card** | Launches `alsamixer` for manual level adjustment, then saves with `alsactl store` |
-| **6. LyBriCa** | Rewrites `/boot/firmware/config.txt` and cleans `cmdline.txt`, adds the user to the required groups, creates the passwordless `/sbin/shutdown` sudoers rule, creates `/opt/venv`, installs Python dependencies (pycamilladsp pinned to v4.0.0), downloads `lybrica.py` and `tm1637_lgpio.py`, creates and starts the systemd service |
+| **6. LyBriCa** | Rewrites `/boot/firmware/config.txt` and cleans `cmdline.txt`, adds the user to the required groups, creates the passwordless shutdown sudoers rule, creates `/opt/venv`, installs Python dependencies (pycamilladsp pinned to v4.0.0), downloads `lybrica.py` and `tm1637_lgpio.py`, creates and starts the systemd service |
 | **7. Bluetooth remote** | Installs `bluetuith` if needed, launches it for pairing, detects the remote with `evdev`, updates `REMOTE_NAME` in `lybrica.py`, restarts the service |
 | **8. Shutdown** | Prompts for an optional system shutdown at the end |
 
@@ -259,7 +273,7 @@ To change any of these, edit `install-lybrica.sh` directly.
 |---|---|---|
 | `/boot/firmware/config.txt` | **Rewritten entirely** (see [Raspberry Pi boot configuration](#raspberry-pi-boot-configuration)) | `config.txt.bak` |
 | `/boot/firmware/cmdline.txt` | `console=serial0,NNNN` removed | `cmdline.txt.bak` |
-| `/etc/sudoers.d/lybrica` | Created (passwordless `/sbin/shutdown`), mode `440` | - |
+| `/etc/sudoers.d/lybrica` | Created (passwordless shutdown), mode `440` | - |
 | `/opt/venv` | Created (`python3 -m venv --system-site-packages`) | - |
 | `/opt/venv/lib/pythonX.Y/site-packages/tm1637_lgpio.py` | Copied | - |
 | `/etc/systemd/system/lybrica.service` | Created and enabled | - |
@@ -289,9 +303,15 @@ rm -f "$SUDOERS_TMP"
 ```
 
 This rule is **required** for `lybrica.py` to halt the Pi without a password
-(see `shutdown_system()`). Without it, the **POWER very-long-press → shutdown**
-feature fails silently: `os.system("sudo shutdown -h now")` returns an error
-code that LyBriCa does not check.
+(see `shutdown_system()`, which runs `sudo poweroff`). Without it, the
+**POWER very-long-press → shutdown** feature, and the automatic halt after
+`HALT_DELAY` hours of silence, fail silently: the command's exit code is not
+checked.
+
+> ⚠️ `lybrica.py` calls **`sudo poweroff`**. Make sure the rule covers that
+> command on your system (`command -v poweroff` gives its path; add it to the
+> rule if it is not already authorised) and test it as described in
+> [Manual installation → Permissions](#permissions).
 
 The rule is first written to a temporary file and checked with `visudo -c`
 (which does not modify anything and only returns a non-zero exit code on
@@ -329,7 +349,9 @@ is free for the ESP32 UART link.
 
 ### GPIO correspondence ESP32 ↔ Raspberry Pi
 
-The installer's boot overlays expect the ESP32 to be wired as follows:
+The Raspberry Pi OS installer's boot overlays expect the ESP32 to be wired as
+follows (the piCorePlayer installer uses other Pi pins for the two overlay
+signals, see [piCorePlayer](#picoreplayer)):
 
 | ESP32-C3 pin | Direction | Function | Raspberry Pi side |
 |---|---|---|---|
@@ -357,7 +379,7 @@ If you prefer to install step by step:
 
 - Raspberry Pi with GPIO, **64-bit capable** (if you use the installer binaries)
 - Raspberry Pi OS (Bookworm or later recommended), 64-bit
-- Python 3.9+
+- Python 3.9+ (see the note on `audioop` below for Python 3.13+)
 - CamillaDSP installed and running
 - Lyrion Music Server installed and running
 - ESP32 flashed with the companion firmware (see below)
@@ -390,6 +412,15 @@ sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5 pyalsaa
 sudo /opt/venv/bin/pip install "git+https://github.com/HEnquist/pycamilladsp.git@v4.0.0"
 ```
 
+Only the libraries of the features you enable are required (see
+[Feature switches](#feature-switches)).
+
+> **`audioop` and Python 3.13+.** The TOSLINK probe uses the standard-library
+> `audioop` module, which was **removed in Python 3.13**. On Python 3.13 or
+> later, install the replacement package: `pip install audioop-lts`
+> (Debian: `apt install python3-audioop-lts`). On Python 3.11 / 3.12 it is part
+> of the standard library (a deprecation warning is silenced).
+
 ### Install LyBriCa
 
 ```bash
@@ -417,11 +448,12 @@ The user running LyBriCa needs access to:
 sudo usermod -aG dialout,gpio,input,spi,i2c,audio $USER
 ```
 
-And for the shutdown command (required by `shutdown_system()` in `lybrica.py`):
+And for the shutdown command (required by `shutdown_system()` in `lybrica.py`,
+which runs `sudo poweroff`):
 
 ```bash
 SUDOERS_TMP=$(mktemp)
-echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" > "$SUDOERS_TMP"
+echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/poweroff" > "$SUDOERS_TMP"
 if ! sudo visudo -c -f "$SUDOERS_TMP" > /dev/null; then
     rm -f "$SUDOERS_TMP"
     echo "Invalid sudoers rule, nothing installed."
@@ -437,7 +469,7 @@ session would make the test pass for the wrong reason):
 
 ```bash
 sudo -k
-sudo -n shutdown -h now   # should NOT ask for a password, and shuts the Pi down
+sudo -n poweroff   # should NOT ask for a password, and shuts the Pi down
 ```
 
 If `sudo -n` prints `sudo: a password is required`, the rule is missing or
@@ -445,17 +477,96 @@ incorrect and the **POWER very-long-press → shutdown** feature will not work.
 
 ---
 
+## piCorePlayer
+
+`install_pcp.sh` is an all-in-one installer for **piCorePlayer** (run it over
+SSH as user `tc`, not as root). Everything is installed as piCore extensions
+(`.tcz`) so it survives reboots.
+
+```sh
+sh install_pcp.sh
+```
+
+```
+==============================================
+  CamillaDSP installer for piCorePlayer
+==============================================
+  1) CamillaDSP + CamillaGUI
+  2) LyBriCa + BLE HID bridge (patches pcp-bt.tcz)
+  3) ESP32C3 (GPIO overlays, shutdown monitor)
+  R) Reboot now
+  Q) Quit
+```
+
+Several steps can be typed at once (`1 2 3`). **Recommended order: 1, 2, 3,
+then a single reboot.** Each step runs in its own process: an error in one step
+does not stop the menu, and nothing is saved (`pcp bu`) if that step fails.
+Versions and URLs are all grouped at the top of the script.
+
+| Step | What it does |
+|---|---|
+| **1. CamillaDSP + CamillaGUI** | Builds `CDSPpiCore.tcz` containing CamillaDSP (`5.0.0-beta.2`, `aarch64` or `armv7`) and CamillaGUI, with a start script run at boot. Persistent data (configs, coefficients, statefile, GUI config) lives in `/mnt/mmcblk0p2/tce/camilladsp`, outside the extension. Writes a minimal `loopback.yml` (Loopback,1 → gain → DAC; the DAC is taken from `OUTPUT` in `pcp.cfg` when it is a `hw:` device), loads `snd-aloop` at boot, and points Squeezelite to `hw:Loopback,0` in `pcp.cfg` (`-r 48000-48000`, `-R hLE`). Needs ~150 MB free on the partition. GUI: `http://pcp.local:5000/gui/index.html` |
+| **2. LyBriCa + BLE HID bridge** | Builds `lybrica.tcz`: Python modules (pycamilladsp from the `next5` branch, `websocket_client`, `pyserial`, `lgpio`, `pyalsaaudio`, `tm1637_lgpio`), `lybrica.py`, and the `start_lybrica.sh` launcher (`lybrica` symlink). Python, evdev and bleak are permanent extensions; build tools are temporary. **Patches `pcp-bt.tcz`** with the `hid_ble_bridge.py` and `hidbridge` files from [pcp-ble-gatt](https://github.com/melomane63/pcp-ble-gatt) (the original md5 is kept as `.orig`; only warns on failure). Registers the launcher as `USER_COMMAND_1` in `pcp.cfg`. Bluetooth must be installed from the pCP web interface first. |
+| **3. ESP32C3** | After confirmation, **adds** (nothing is removed) to `config.txt` under `[all]`: `dtoverlay=gpio-poweroff,gpiopin=26,active_low=1`, `dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down` and `enable_uart=1`. Sets the matching `GPIOPOWEROFF*` / `GPIOSHUTDOWN*` options in `pcp.cfg` and installs `shutdown-monitor.tcz` (required for the shutdown request to work). A backup `config.txt.bak` is created once. |
+
+### ESP32 ↔ Raspberry Pi wiring on piCorePlayer
+
+The overlays added by the pCP installer use **different Raspberry Pi pins** from
+the Raspberry Pi OS installer. The ESP32 side is unchanged.
+
+| ESP32-C3 pin | Function | Pi pin, Raspberry Pi OS | Pi pin, piCorePlayer |
+|---|---|---|---|
+| GPIO6 | Power-good (Pi → ESP32) | GPIO21 | **GPIO26** |
+| GPIO10 | Shutdown request (ESP32 → Pi) | GPIO20 | **GPIO16** |
+| GPIO21 (UART1 TX) | Ambient light | GPIO15 (RXD) | GPIO15 (RXD) |
+
+On a bare Raspberry Pi these pins are free (GPIO 14/15 = UART). If you use a
+HAT or another add-on board, check its pinout first.
+
+### Differences when running on piCorePlayer
+
+`lybrica.py` detects piCorePlayer by the presence of `/mnt/mmcblk0p2/tce` and
+adapts automatically:
+
+- the remote name is forced to **`pCP BLE HID Keyboard`** (the device created by
+  the patched BLE HID bridge); `REMOTE_NAME` is ignored;
+- the CamillaDSP configs are read from `/mnt/mmcblk0p2/tce/camilladsp/configs/`;
+- LyBriCa is **not** a systemd service: it is started by the launcher below, and
+  at boot it waits for CamillaDSP instead of crashing if it is not up yet.
+
+### The `lybrica` command
+
+```
+lybrica start | restart | stop    (root required: use sudo)
+lybrica status | log [N] | reset | help
+```
+
+The factory `lybrica.py` lives inside `lybrica.tcz` and is read-only. To change
+a setting:
+
+1. `lybrica reset` — create (or restore) the editable copy `/home/tc/lybrica-mod.py`
+2. `vi /home/tc/lybrica-mod.py` — edit it
+3. `sudo lybrica restart` — apply it (the copy overrides the factory file at each start)
+4. `pcp bu` — persist across reboots
+
+Deleting `lybrica-mod.py` falls back to the factory version at the next start.
+Logs: `/home/tc/lybrica.log` (Python output), `/home/tc/pcp_startup.log`
+(launcher trace), PID in `/home/tc/lybrica.pid`.
+
+---
+
 ## Configuration
 
-All configuration is at the top of `lybrica.py`:
+All configuration is at the top of `lybrica.py` (on piCorePlayer: in
+`/home/tc/lybrica-mod.py`, see above):
 
 ```python
 # Feature switches
-ENABLE_LMS_SYNC      = True
-ENABLE_AUTO_POWEROFF = True
-ENABLE_REMOTE        = True
-ENABLE_DISPLAY       = True
-ENABLE_CONFIG_SWITCH = "gpio"   # False | "gpio" | "toslink"
+ENABLE_LMS_SYNC       = True
+ENABLE_AUTO_POWEROFF  = True
+ENABLE_REMOTE         = True
+ENABLE_DISPLAY        = True
+ENABLE_TOSLINK_SWITCH = True
 ```
 
 ### Remote
@@ -464,68 +575,91 @@ ENABLE_CONFIG_SWITCH = "gpio"   # False | "gpio" | "toslink"
 REMOTE_NAME = "HID Remote01 Keyboard"   # found with: python3 -m evdev.evtest
 ```
 
-The installer (option 8) sets this line for you after pairing.
+The Raspberry Pi OS installer (option 8) sets this line for you after pairing.
+On piCorePlayer the name is fixed (`pCP BLE HID Keyboard`).
 
-If `ENABLE_REMOTE = True` and the remote is not found at startup, LyBriCa
-**waits and retries every second for up to `HALT_DELAY` hours (48 h by
-default)**, then shuts the Pi down. While it waits, nothing else is started,
-including the volume sync. If you want to run without a remote, set
-`ENABLE_REMOTE = False`.
+If `ENABLE_REMOTE = True` and the remote is not found, LyBriCa **keeps looking
+for it every second, in the background**. Nothing else is blocked: the volume
+sync, the display, the power relay and the TOSLINK switching keep running, and
+the remote is picked up as soon as it appears (and again after each
+disconnection).
 
 ### Network addresses
 
 ```python
-CAMILLA_ADDR = ("127.0.0.1", 1234)   # CamillaDSP WebSocket
+CAMILLA_ADDR = ("127.0.0.1", 1234)   # CamillaDSP WebSocket (must stay local)
 LMS_ADDR     = ("127.0.0.1", 9090)   # Lyrion CLI
 ```
 
 ### Paths
 
 ```python
-CONFIG_DIR = "~/camilladsp/configs/"   # DSP configs (expanded to the user's home)
+CONFIG_DIR = "~/camilladsp/configs/"   # DSP configs (expanded to the user's home;
+                                       # /mnt/mmcblk0p2/tce/camilladsp/configs/ on pCP)
 # settings.json is stored next to lybrica.py
 ```
 
 ### GPIO pins
 
 ```python
-POWER_GPIO = 4     # Power relay
-TV_GPIO    = 12    # TV state input
+POWER_GPIO = 4      # Power relay
 CLK, DIO   = 23, 24 # TM1637 display
 ```
 
 ### Timing
 
 ```python
-POWER_OFF_DELAY         = 2     # Minutes of silence before the amplifier relay switches off
-HALT_DELAY              = 48    # Hours before the Pi shuts down after prolonged inactivity
-SCREEN_RETURN_DELAY     = 30    # Seconds before returning to the volume screen
-TOSLINK_SILENCE_DELAY_S = 120   # Seconds of TOSLINK silence before switching back to Squeezelite
+POWER_OFF_DELAY     = 2     # Minutes without sound AND without key press before the
+                            # amplifier relay switches off (also the delay before the display is blanked)
+HALT_DELAY          = 48    # Hours of continuous audio silence before the Pi shuts down
+SCREEN_RETURN_DELAY = 30    # Seconds before returning to the volume screen
+WAKE_DISPLAY_DELAY  = 30    # Seconds the display stays on after a key press woke it while the relay is already off
 ```
 
 `ENABLE_AUTO_POWEROFF` controls the Pi-side amplifier relay and the associated
 silence/shutdown behaviour. It is not the same as the ESP32's physical power
-management for the Raspberry Pi.
+management for the Raspberry Pi. The halt after `HALT_DELAY` only depends on
+audio silence (key presses do not postpone it).
+
+### Silence and TOSLINK detection
+
+```python
+SILENCE_RMS_DB  = -80.0   # RMS below this -> silence
+CREST_MIN_DB    = 2.0     # peak - rms below this -> steady noise floor, not audio
+TOSLINK_ON_DB   = -60.0   # RMS above which TOSLINK audio is considered present
+TOSLINK_DEBUG   = False   # log every probe (peak / rms / crest) to calibrate TOSLINK_ON_DB
+```
+
+Keep `TOSLINK_ON_DB` **above** `SILENCE_RMS_DB`; otherwise a signal could be
+detected as TV and then immediately count as silence (a warning is logged at
+startup).
 
 ### Other settings (advanced)
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `TOSLINK_TV_ON_DB` | `-30.0` | TOSLINK level (dB) at or above which the source is considered "TV" |
+| `SAVE_MODE` | `"half"` | How tone / loudness are shared between configs, see [Tone and loudness sharing](#tone-and-loudness-sharing-save_mode) |
 | `VOLUME_SLOWDOWN` | `{UP: 2, DOWN: 1}` | Volume step applied once every N key repeats (the remote repeats every ~40 ms) |
-| `HOLD_TOGGLE_POWER` | `2` | POWER held: repeats before the relay toggles |
-| `HOLD_SHUTDOWN` | `300` | POWER held: repeats before the Pi shuts down (about 12 s at 40 ms per repeat) |
+| `VOLUME_PEEK_S` | `0.5` | Seconds the volume stays shown after a volume key is released while muted |
+| `HOLD_TOGGLE_POWER` | `2` | POWER held: repeats before the relay toggles (~1 s) |
+| `HOLD_SHUTDOWN` | `200` | POWER held: repeats before the Pi shuts down (about 8 s) |
 | `HOLD_STOP` / `HOLD_SEEK` | `10` | PLAY/PAUSE: repeats before *stop*; NEXT/PREVIOUS: repeats before seeking starts |
 | `HOLD_SWITCH_TONE_TILT` | `15` | ENTER held: repeats before switching tone/tilt screen |
-| `SEEK_STEP_S`, `SEEK_INTERVAL_S` | `10`, `0.5` | Seek jump (seconds) and delay between jumps while the key is held |
-| `TONE_MAX_DB`, `PRESENCE_MAX_DB`, `TILT_MAX_STEPS`, `TILT_DB_STEP` | `9`, `3`, `3`, `2` | Tone / presence / tilt ranges |
+| `HOLD_TOGGLE_AUTO_S` | `2.0` | HOMEPAGE held: **seconds** (real time) before the TOSLINK automatism is enabled / disabled |
+| `SEEK_STEP_FORWARD_S`, `SEEK_STEP_BACKWARD_S`, `SEEK_INTERVAL_S` | `30`, `10`, `0.8` | Seek jumps (seconds) and delay between jumps while the key is held |
+| `TONE_MAX_DB`, `PRESENCE_MAX_DB`, `TILT_MAX_STEPS`, `TILT_DB_STEP` | `9`, `3`, `3`, `2` | Tone / presence / tilt ranges (the display has 2 digits: keep them ≤ 9) |
 | `LOUDNESS_MIN`, `LOUDNESS_MAX`, `LOUDNESS_STEP` | `-50`, `-10`, `5` | Loudness reference range and step (dB) |
+| `DEFAULT_LOUDNESS_REF` | `-20` | Loudness level restored by ENTER when no previous value is saved |
+| `SCROLL_FRAME_DELAY`, `SCROLL_END_PAUSE` | `0.35`, `0.6` | Speed of scrolling messages (`POWER OFF`, `CONF AUTO`...) |
 | `LMS_PLAYER_MANUAL` | `""` | Player MAC address; empty = MAC of the default network interface |
 | `LMS_SYNC_DEBUG` | `False` | Log every volume/mute change and raw LMS notification |
-| `LMS_COALESCE_S`, `LMS_RESTORE_WINDOW_S` | `0.05`, `0.5` | Burst merging and post-unmute correction window |
+| `LMS_RESTORE_WINDOW_S` | `0.5` | Post-unmute correction window |
 | `LMS_CONNECT_TIMEOUT_S`, `LMS_RETRY_S` | `5`, `5` | LMS CLI connection timeout and restart delay |
-| `POLL_INTERVAL_S`, `CDSP_RECONNECT_DELAY_S` | `0.25`, `2.0` | CamillaDSP polling period and reconnection delay |
+| `POLL_INTERVAL_S`, `TITLE_EVERY`, `CDSP_RECONNECT_DELAY_S` | `0.25`, `2`, `2.0` | CamillaDSP polling period, config title/path read every N cycles, reconnection delay |
 | `ADC_LEVELS`, `BRIGHTNESS_LEVELS`, `HYSTERESIS_RATIO` | see [Display](#display) | Ambient light → brightness mapping |
+
+A background task that crashes is restarted automatically after 2 s, so a single
+error does not bring the whole script down.
 
 ---
 
@@ -534,35 +668,37 @@ management for the Raspberry Pi.
 Each feature can be disabled independently. When disabled, the corresponding
 hardware library is **not imported** and **not required**.
 
-| Switch | Default | Values | Effect |
-|---|---|---|---|
-| `ENABLE_LMS_SYNC` | `True` | `True` / `False` | Lyrion <-> CamillaDSP volume/mute sync |
-| `ENABLE_AUTO_POWEROFF` | `True` | `True` / `False` | Power relay: off after silence, on with sound |
-| `ENABLE_REMOTE` | `True` | `True` / `False` | HID remote control (all keys; if `False`, no key works) |
-| `ENABLE_DISPLAY` | `True` | `True` / `False` | TM1637 display + ambient light sensor (the tone / tilt / loudness keys need it) |
-| `ENABLE_CONFIG_SWITCH` | `"gpio"` | `False` / `"gpio"` / `"toslink"` | Automatic config switching — **only one method at a time** |
+| Switch | Default | Values | Effect | Needs |
+|---|---|---|---|---|
+| `ENABLE_LMS_SYNC` | `True` | `True` / `False` | Lyrion <-> CamillaDSP volume/mute sync | - |
+| `ENABLE_AUTO_POWEROFF` | `True` | `True` / `False` | Power relay: off after silence, on with sound, halt after `HALT_DELAY` | `lgpio` |
+| `ENABLE_REMOTE` | `True` | `True` / `False` | HID remote control (all keys; if `False`, no key works) | `evdev` |
+| `ENABLE_DISPLAY` | `True` | `True` / `False` | TM1637 display + ambient light sensor (the tone / tilt / loudness keys need it) | `pyserial`, `tm1637_lgpio` |
+| `ENABLE_TOSLINK_SWITCH` | `True` | `True` / `False` | Automatic config switching on the TOSLINK input | `pyalsaaudio`, `audioop` |
 
-### `ENABLE_CONFIG_SWITCH` details
+`pycamilladsp` is always required. The LMS CLI is used anyway by the player
+keys (play / pause / seek) and by the TOSLINK monitor, even with
+`ENABLE_LMS_SYNC = False` (that switch only controls the volume bridge).
 
-The switch is a **single choice**. Set it to exactly one of these three
-values:
+### `ENABLE_TOSLINK_SWITCH` details
 
-| Value | Meaning |
-|---|---|
-| `False` | Automatic config switching is off. Only the manual keys `BACK` and `HOMEPAGE` can change the config. |
-| `"gpio"` | The TV state is read on `TV_GPIO` (0 = TV on). |
-| `"toslink"` | The TOSLINK input is monitored through ALSA. `TOSLINK_SILENCE_DELAY_S` seconds of silence switches back to Squeezelite. |
+This switch replaces the former `ENABLE_CONFIG_SWITCH` (`"gpio"` / `"toslink"`):
+**the GPIO TV-state input (`TV_GPIO`) has been removed**, TOSLINK detection is
+now the only automatic method. The manual keys work whatever its value (see
+[Remote control keys](#remote-control-keys)).
 
-`"gpio"` and `"toslink"` are **mutually exclusive** — you cannot run both
-detectors at the same time. An invalid value raises `ValueError` at startup
-(checked in the `FEATURES` block of `lybrica.py`).
+With the switch on, the automatism can additionally be **enabled / disabled at
+run time** with a long press (2 s) on `HOMEPAGE`. It is enabled at every start.
+
+If no `_*` or no `|*` config file exists, the automatism cannot run: the keys
+then behave exactly as with the switch off.
 
 #### TOSLINK mode dependencies
 
-The `"toslink"` mode imports the `alsaaudio` Python module
-(`pyalsaaudio`). The installer installs it, together with its system
-dependency `libasound2-dev` (installed by **option 2 / Upgrade System**; see the
-note in [Quick install](#quick-install)):
+The TOSLINK mode imports `alsaaudio` (`pyalsaaudio`) and `audioop`. The
+installer installs `pyalsaaudio`, together with its system dependency
+`libasound2-dev` (installed by **option 2 / Upgrade System**; see the note in
+[Quick install](#quick-install-raspberry-pi-os)):
 
 ```bash
 # System library (ALSA headers, needed to BUILD pyalsaaudio)
@@ -572,11 +708,10 @@ sudo apt install -y libasound2-dev
 sudo /opt/venv/bin/pip install pyalsaaudio
 ```
 
-If the module is missing (for example after a manual install that skipped
-the step), `lybrica.py` raises `ModuleNotFoundError: No module named
-'alsaaudio'` at startup and the service **crashes in a restart loop**
-(`Restart=on-failure`, `RestartSec=5`). In that case, run the two commands
-above and then:
+If a module is missing (for example after a manual install that skipped the
+step), `lybrica.py` raises `ModuleNotFoundError` at startup and the service
+**crashes in a restart loop** (`Restart=on-failure`, `RestartSec=5`). In that
+case, install it (and `audioop-lts` on Python ≥ 3.13) and then:
 
 ```bash
 sudo systemctl restart lybrica
@@ -631,6 +766,18 @@ inconsistent values.
 > fight to resynchronise them (see `LMS_RESTORE_WINDOW_S` and the
 > `[LMS sync]` debug messages when `LMS_SYNC_DEBUG = True`).
 
+### How the bridge behaves
+
+- **At startup, CamillaDSP wins**: its volume and mute are pushed to Lyrion.
+- A volume change coming from Lyrion is written to CamillaDSP immediately.
+- A volume change coming from CamillaDSP (remote keys, GUI...) is pushed to
+  Lyrion only once it has been read twice in a row.
+- After an **unmute**, Lyrion may briefly announce a wrong volume (the `+/-`
+  keys restart from 0 / 5 %). During `LMS_RESTORE_WINDOW_S` the bridge corrects
+  Lyrion back to the right level and pushes nothing from CamillaDSP.
+- If the connection to Lyrion is lost, the bridge restarts itself every
+  `LMS_RETRY_S` seconds (one log line per distinct error).
+
 ### Debugging the bridge
 
 Enable `LMS_SYNC_DEBUG = True` in `lybrica.py` to log every volume/mute change
@@ -649,27 +796,47 @@ If the bridge keeps correcting the volume in a loop, the player is not set to
 
 ## Remote control keys
 
+All keys require `ENABLE_REMOTE = True`.
+
 | Key | Short press | Long press |
 |---|---|---|
-| `VOLUMEUP` / `VOLUMEDOWN` | Volume +/-1 step | Continuous volume |
+| `VOLUMEUP` / `VOLUMEDOWN` | Volume +/-1 step | Continuous volume (up: every 2nd repeat, down: every repeat, see `VOLUME_SLOWDOWN`) |
 | `MUTE` | Mute / unmute | - |
-| `PLAYPAUSE` | Pause | Stop (LMS) |
+| `PLAYPAUSE` | Pause / resume (Lyrion) | Stop (Lyrion) |
 | `PREVIOUSSONG` | Previous track | Rewind (10 s steps) |
-| `NEXTSONG` | Next track | Fast-forward (10 s steps) |
+| `NEXTSONG` | Next track | Fast-forward (30 s steps) |
 | `UP` / `DOWN` | Bass +/- on the tone screen; tilt +/- on the tilt screen; loudness +/- on the loudness screen | - |
 | `LEFT` / `RIGHT` | Treble -/+ on the tone screen; presence -/+ on the tilt screen; nothing on the loudness screen | - |
-| `ENTER` | Reset / restore tone values (tone and tilt screens); toggle loudness on/off (loudness screen) | Switch between tone and tilt screens |
-| `BACK` | Next config whose filename starts with `_` (stereo group) | - |
-| `HOMEPAGE` | Next config whose filename starts with `\|` (TV group) | - |
-| `POWER` | - | Held ~2 repeats: toggle amplifier relay. Held ~300 repeats (about 12 s): shut down the Pi |
+| `ENTER` | Tone / tilt screens: set bass, treble, tilt and presence **all** to 0, or restore their previous values if they are already all at 0. Loudness screen: toggle loudness on/off. Volume screen: open the loudness screen | Switch between tone and tilt screens |
+| `BACK` | See [below](#back-and-homepage) | - |
+| `HOMEPAGE` | See [below](#back-and-homepage) | See [below](#back-and-homepage) |
+| `POWER` | - | Held ~1 s: toggle the amplifier relay (`POWER AUTO` / `POWER OFF`). Held ~8 s: shut down the Pi |
 
-Notes:
+### BACK and HOMEPAGE
+
+Config files are split in two groups by prefix: `_` (streamer) and `|` (TV).
+
+| Situation | `BACK` | `HOMEPAGE` short press | `HOMEPAGE` long press (2 s) |
+|---|---|---|---|
+| `ENABLE_TOSLINK_SWITCH` on, automatism **ON** | Next config **inside the active group** (`_` or `\|`) | Scroll the tone, tilt and loudness values | Disable the automatism (`CONF MANUAL`) |
+| `ENABLE_TOSLINK_SWITCH` on, automatism **OFF** | Next `_*` config | Next `\|*` config | Enable the automatism (`CONF AUTO`) |
+| `ENABLE_TOSLINK_SWITCH` off (or no `_*` / `\|*` files) | Next `_*` config | Next `\|*` config | - |
+
+When switching *to* a group from another one, LyBriCa lands on the **last config
+used in that group** (kept in `settings.json`); inside a group, each press goes
+to the next file in alphabetical order.
+
+### Notes
 
 - The UP / DOWN / LEFT / RIGHT / ENTER behaviours need `ENABLE_DISPLAY = True`.
 - Toggling the amplifier relay with POWER needs `ENABLE_AUTO_POWEROFF = True`.
-  The shutdown works regardless.
+  The shutdown works regardless (it also saves the tone settings first).
 - If the display is blanked (after a long silence), the **first** key press only
-  wakes it up and is otherwise ignored.
+  wakes it up and is otherwise ignored (including its repeats and release).
+- If the volume screen is not shown (or the volume is displayed as `--` while
+  muted), the **first** volume key press only brings the volume screen back,
+  without changing the volume.
+- Any key press cancels a running scrolling message.
 
 ### Screen navigation
 
@@ -688,21 +855,36 @@ Notes:
 
 The TM1637 display shows:
 
-- **Volume screen**: config label (3 chars) + volume (0-100). At 100 the volume
-  is shown as `HI`; when muted it is shown as `--`.
+- **Volume screen**: config label (3 chars, taken from the config `title`, or
+  `---` if it has none; the `_` and `|` prefixes are stripped) + volume (0-100).
+  At 100 the volume is shown as `HI`; when muted it is shown as `--` (the real
+  volume appears while a volume key is held, and for `VOLUME_PEEK_S` after).
 - **Tone screen**: bass / treble (` 3B 2T`)
 - **Tilt screen**: tilt / presence (` 2T 1P`), tilt in steps of `TILT_DB_STEP` dB
-- **Loudness screen**: reference level (`-30 Ld`); ` No Ld` when loudness is off
-- **Power screen**: `PW ON` / `PW OFF` / ` HALT `
+- **Loudness screen**: reference level (`-30 Ld`); ` No Ld` when loudness is off;
+  `--- Ld` when the config has no Loudness filter
+- **Scrolling messages**: `POWER AUTO`, `POWER OFF`, `POWER SAVE`, `CONF AUTO`,
+  `CONF MANUAL`, then `HALT` before a shutdown. The volume screen comes back
+  when the message ends.
 
 A value shown as `--` means the corresponding filter does not exist (or is not
 used by the pipeline) in the active config.
 
-Special indicators:
+Special indicators on the volume screen:
 
-- Decimal point on the 3rd character: auto power-off active
-- Decimal point on the 4th character: power relay ON
-- Top segment on the 4th character: tone settings active
+- Blinking dot on the 3rd character: TOSLINK automatism **disabled** (`CONF MANUAL`)
+- Blinking dot on the 4th character: power relay **forced OFF** with the POWER key
+- Top segment on the 4th character: tone settings active (a non-zero bass,
+  treble, tilt or presence gain)
+- Bottom segment on the 4th character: loudness active
+
+### Blanking and wake-up
+
+After `POWER_OFF_DELAY` minutes of silence without key press, the relay is cut
+(`POWER SAVE`) and the display is blanked. If the relay was already off, the
+display goes off after `WAKE_DISPLAY_DELAY` seconds following a wake-up key
+press. Sound (or a key) wakes it up again; with sound, the relay is switched
+back on.
 
 ### Automatic brightness
 
@@ -725,35 +907,76 @@ CamillaDSP main-volume level in dB, and converts changes in the other direction.
 | 2–24 | -71 to -38 dB | 1.5 dB per level |
 | 25–100 | -37.5 to 0 dB | 0.5 dB per level |
 
-The inverse conversion rounds to the nearest integer Lyrion level. Mute is
-synchronised separately from volume, so level `0` should not be treated as
-the only mute mechanism.
+The curve is strictly increasing, and the inverse conversion rounds to the
+nearest integer Lyrion level. Mute is synchronised separately from volume, so
+level `0` should not be treated as the only mute mechanism.
 
 ---
 
-## DSP configuration files
+## DSP configuration files and automatic switching
 
-Automatic configuration switching uses filename prefixes in `CONFIG_DIR`
-(`~/camilladsp/configs/`):
+Configs live in `CONFIG_DIR` and are grouped by filename prefix:
 
-- `_` identifies the stereo/Squeezelite group, selected with `BACK`.
-- `|` identifies the TV group, selected with `HOMEPAGE`.
-- `ENABLE_CONFIG_SWITCH = False` disables automatic switching (manual keys
-  still work).
-- `ENABLE_CONFIG_SWITCH = "gpio"` uses the TV-state input (`TV_GPIO`).
-- `ENABLE_CONFIG_SWITCH = "toslink"` detects audio on the TOSLINK input and
-  uses `TOSLINK_SILENCE_DELAY_S` before returning to Squeezelite. The capture
-  device, rate and channels are read at startup from the **first `|*` config
-  file**, so all `|*` configs must share the same capture input.
+- `_` identifies the stereo / Squeezelite group (captures the ALSA loopback).
+- `|` identifies the TV group (captures the TOSLINK input).
 
-Make sure the configuration files in `CONFIG_DIR` use the prefixes expected
-by your setup. The installer creates a default `_Setup.yml` there.
+Make sure the configuration files in `CONFIG_DIR` use the prefixes expected by
+your setup. The installer creates a default `_Setup.yml` there (piCorePlayer:
+`loopback.yml`, which you should rename / copy to a `_*` name).
+
+### How the automatism works
+
+It only runs when `ENABLE_TOSLINK_SWITCH = True` and the automatism is ON.
+
+| Active config | What LyBriCa does | Action |
+|---|---|---|
+| `_*` (loopback) | CamillaDSP does not use the TOSLINK input, so LyBriCa **probes it through ALSA** (~0.5 s per cycle). A reading counts when its RMS is ≥ `TOSLINK_ON_DB` **and** its crest (peak − rms) is ≥ `CREST_MIN_DB` (a steady noise floor is ignored). | **2 consecutive readings** → switch to the last used `\|*` config |
+| `\|*` (TOSLINK) | Once per second, asks Lyrion whether the player is playing, and reads the TV level from CamillaDSP. | Lyrion playing **and** TOSLINK silent for 2 cycles → switch back to the last used `_*` config. Lyrion starts playing **while the TV plays** → Lyrion is **paused** (the TV has priority). |
+
+A failed switch is retried with an exponential delay (5 s, doubled each time,
+up to 60 s). A config change made from outside (remote, CamillaDSP GUI) restarts
+the detection from scratch. With the automatism disabled, there is no probing,
+no automatic switch and no Lyrion pause.
+
+### Capture parameters
+
+The capture device, sample rate, channel count and sample format used for the
+probe are read at startup from the **first `|*` config file** (alphabetical
+order), so **all `|*` configs must share the same capture input**. Supported
+capture formats: `S16_LE`, `S24_3LE`, `S24_LE`, `S32_LE`.
+
+### Tone filters
 
 Tone filters are looked up **by name** in each config: `Bass`, `Treble`,
 `Tilt`, `Presence` (parameter `gain`) and `Loudness` (parameter
-`reference_level`). A filter must also be listed in an enabled `Filter` step of
-the pipeline to be taken into account; otherwise it is shown as `--` and its
-keys do nothing.
+`reference_level`; `-100` means "off"). A filter must also be listed in an
+enabled `Filter` step of the pipeline to be taken into account; otherwise it is
+shown as `--` and its keys do nothing.
+
+### Configs without a complete definition
+
+A config that fails to parse, or has no (or an empty) `devices` section, is
+rejected: LyBriCa keeps the previous config and logs a warning rather than
+pushing an incomplete config to CamillaDSP.
+
+---
+
+## Tone and loudness sharing (`SAVE_MODE`)
+
+Tone (bass, treble, tilt, presence) and loudness values are always **saved per
+config** in `settings.json`. `SAVE_MODE` decides what is **copied into the new
+config** when you switch, before it is applied:
+
+| `SAVE_MODE` | Behaviour |
+|---|---|
+| `"all_config"` | Each config keeps its own tone **and** loudness. |
+| `"all_group"` | All configs of the same group (`_` or `\|`) share the same tone and loudness: switching inside a group copies the current values to the new config. |
+| `"half"` *(default)* | Tone per config, **loudness per group**: switching inside a group keeps the tone of the new config but copies the current loudness. |
+| `"same_everywhere"` | All configs share the same tone and loudness, whatever the group. |
+
+Coming back to a group needs no copy: you land on the last config used in that
+group, and its values were saved when you left it. An unknown value raises
+`ValueError` at startup.
 
 ---
 
@@ -762,10 +985,20 @@ keys do nothing.
 `settings.json` (stored next to `lybrica.py`) contains:
 
 - the saved tone-related values for each configuration (`configs`), including
-  the previous values used by the ENTER restore function;
+  the previous values used by the ENTER restore function (`prev`) and the
+  loudness reference level (`loudness_ref`);
 - the last config used in each group (`last_config`, for `_` and `|`), so that
   a TV on/off cycle or a restart returns to the last used config of the group;
 - the last tone/tilt screen selection (`last_tone_tilt`).
+
+The values are saved at every config switch, at shutdown (POWER very-long-press)
+and when LyBriCa receives `SIGTERM` / `SIGINT`. This needs `ENABLE_REMOTE` or
+`ENABLE_TOSLINK_SWITCH` (tone is only managed when one of them is on).
+
+At startup, the saved tone and loudness of the active config are re-applied, and
+the config is pushed to CamillaDSP. After a CamillaDSP restart (detected by the
+poller), LyBriCa reconnects, re-reads the active config and re-applies the saved
+values.
 
 If the file is missing, `load_settings()` falls back to safe defaults (empty
 dictionaries, `last_tone_tilt = "tone"`), so LyBriCa still starts and creates
@@ -908,7 +1141,9 @@ Two different things use a remote:
   is off triggers the relay sequence).
 - **The Pi** (`lybrica.py`, via `evdev`) uses it for all the **key actions**
   (volume, tone, player, configs...). `ENABLE_REMOTE` and `REMOTE_NAME` refer to
-  the remote as seen by the Pi, paired with the installer's option 8 (`bluetuith`).
+  the remote as seen by the Pi, paired with the installer's option 8
+  (`bluetuith`) on Raspberry Pi OS, or through the patched BLE HID bridge on
+  piCorePlayer.
 
 As soon as the relay activates, the ESP32 calls `deinit_bluetooth()` and drops
 its BLE connection, which frees the remote so that the Pi can connect to it once
@@ -983,7 +1218,8 @@ UART1 uses **115200 baud, 8 data bits, no parity, and one stop bit**. Every
 approximately 200 ms, the firmware takes 20 ADC samples, averages them, applies
 an exponential filter (alpha 0.2), and sends the resulting integer followed by
 newline (`<integer>\n`) on ESP32-C3 GPIO21 TX. LyBriCa reads these newline-terminated
-integer values from `/dev/serial0` to adjust the TM1637 display brightness.
+integer values from `/dev/serial0` to adjust the TM1637 display brightness (only
+the most recent complete line is used at each pass).
 
 This firmware's serial output is for the **ambient-light ADC value only**. The
 provided code does not send `POWER` messages or receive `ON` / `OFF` commands
@@ -996,6 +1232,8 @@ through UART; power control is performed through the ESP32-C3 GPIOs.
 ---
 
 ## Systemd service
+
+*(Raspberry Pi OS only; on piCorePlayer see [The `lybrica` command](#the-lybrica-command).)*
 
 The installer creates `/etc/systemd/system/lybrica.service`:
 
@@ -1031,9 +1269,14 @@ sudo systemctl stop lybrica
 journalctl -u lybrica -f
 ```
 
+On `SIGTERM` / `SIGINT`, LyBriCa saves its settings, cuts the amplifier relay
+and releases the GPIO before exiting.
+
 ---
 
 ## Troubleshooting
+
+On piCorePlayer, replace `journalctl -u lybrica -f` with `lybrica log`.
 
 ### Remote not detected
 
@@ -1041,9 +1284,11 @@ journalctl -u lybrica -f
 /opt/venv/bin/python3 -m evdev.evtest
 ```
 
-Check that the remote name matches `REMOTE_NAME` in `lybrica.py`. If the remote
-is missing at startup, LyBriCa keeps retrying (for up to `HALT_DELAY` hours)
-before shutting the Pi down, and starts nothing else in the meantime.
+Check that the remote name matches `REMOTE_NAME` in `lybrica.py` (on pCP the name
+must be `pCP BLE HID Keyboard`). If the remote is missing, LyBriCa keeps looking
+for it every second **without blocking the other features**, and logs
+`'<name>' found at ...` once it is grabbed. A message `Cannot grab ... will retry`
+means another process holds the device.
 
 ### CamillaDSP unreachable
 
@@ -1051,7 +1296,9 @@ before shutting the Pi down, and starts nothing else in the meantime.
 camilladsp --check
 ```
 
-Check `CAMILLA_ADDR` and that CamillaDSP is running.
+Check `CAMILLA_ADDR` and that CamillaDSP is running. At startup, LyBriCa waits
+for CamillaDSP; once running, it reconnects by itself (`CamillaDSP unreachable
+... reconnecting` then `CamillaDSP connection restored`).
 
 ### Lyrion CLI unreachable
 
@@ -1073,16 +1320,16 @@ If the volume keeps jumping or correcting itself:
 
 ### Shutdown from the remote (POWER very-long-press) does nothing
 
-`lybrica.py` halts the Pi with `os.system("sudo shutdown -h now")`. If the
-user running the service is not allowed to run `shutdown` as root **without a
-password**, the command fails silently (its exit code is not checked).
+`lybrica.py` halts the Pi with `sudo poweroff`. If the user running the service
+is not allowed to run it as root **without a password**, the command fails
+silently (its exit code is not checked). The display shows `HALT` even if the
+command failed.
 
 Check the rule:
 
 ```bash
 cat /etc/sudoers.d/lybrica
-# expected:
-# <your-user> ALL=(ALL) NOPASSWD: /sbin/shutdown
+# expected: <your-user> ALL=(ALL) NOPASSWD: ... (covering poweroff)
 
 ls -l /etc/sudoers.d/lybrica
 # expected mode: -r--r----- (440)
@@ -1093,7 +1340,7 @@ a previous `sudo` call may make the test pass for the wrong reason:
 
 ```bash
 sudo -k
-sudo -n shutdown -h now
+sudo -n poweroff
 ```
 
 - If the Pi shuts down: the rule is correct.
@@ -1124,11 +1371,13 @@ sudo -n shutdown -h now
 - Check the serial port: `ls -l /dev/serial0`
 - Check the baud rate: `115200`
 - Check the ESP32 logs (if available)
-- Check that `enable_uart=1` is present in `/boot/firmware/config.txt` and that
+- Check that `enable_uart=1` is present in `config.txt` and (Raspberry Pi OS) that
   `console=serial0,...` has been removed from `/boot/firmware/cmdline.txt`.
 - Check that the ESP32 console is set to USB Serial/JTAG (see
   [Flashing the firmware](#flashing-the-firmware)), so that no log text is mixed
   with the light readings on GPIO21.
+- Note: with `ENABLE_DISPLAY = True`, LyBriCa opens `/dev/serial0` at startup;
+  without the serial port, it fails to start.
 
 ### BLE remote does not connect to the ESP32
 
@@ -1146,14 +1395,29 @@ sudo -n shutdown -h now
   `hciconfig -a` or `bluetoothctl list`.
 - If `dtoverlay=disable-wifi` disabled the Bluetooth adapter, remove that line
   from `/boot/firmware/config.txt` and reboot.
+- On piCorePlayer, make sure Bluetooth is installed from the pCP web interface
+  and that step 2 of `install_pcp.sh` patched `pcp-bt.tcz` (check the
+  `pcp-bt.tcz rebuilt` / `already contains these two files` message).
 
 ### Automatic configuration switching does not work
 
-- For `"gpio"` mode, check `TV_GPIO`, the input wiring and the configured
-  pull-up.
-- For `"toslink"` mode, check the ALSA capture device and the TOSLINK signal
-  threshold (`TOSLINK_TV_ON_DB`).
-- Check that the config filenames use the expected `_` and `|` prefixes.
+- Check that `ENABLE_TOSLINK_SWITCH = True` and that the automatism is **ON**
+  (long-press `HOMEPAGE`: `CONF AUTO`; a blinking dot on the 3rd character means
+  it is off).
+- Check that at least one `_*` **and** one `|*` config exist in `CONFIG_DIR`:
+  otherwise the logs show `[TOSLINK] No '|*' config file found` /
+  `[LOOPBACK] No '_*' config file found`, detection is disabled and the keys
+  behave as with the switch off.
+- Check the capture parameters in the log (`[TOSLINK] Capture: device @ rate Hz,
+  ch, format`) and that the format is one of `S16_LE`, `S24_3LE`, `S24_LE`,
+  `S32_LE`.
+- `[TOSLINK] Probe failed: ...` means the ALSA capture device cannot be opened
+  (wrong device name, or it is already in use).
+- Set `TOSLINK_DEBUG = True` to see the measured peak / rms / crest, and adjust
+  `TOSLINK_ON_DB` (keep it above `SILENCE_RMS_DB`).
+- If the TV is detected but LyBriCa goes straight back to `_*`, check that
+  Lyrion is actually playing (`mode` is `play`) and that the TOSLINK level in
+  the `|*` config is above the silence threshold.
 
 ### ALSA loopback not loaded
 
@@ -1180,6 +1444,24 @@ journalctl -u camillagui -f
 
 ## Known limitations
 
+- **TV detection by GPIO removed**: the former `ENABLE_CONFIG_SWITCH = "gpio"`
+  mode and the `TV_GPIO` setting no longer exist. The only automatic method is
+  TOSLINK detection (`ENABLE_TOSLINK_SWITCH`).
+- **TOSLINK, shared capture input**: the probe parameters come from the first
+  `|*` config file, so all `|*` configs must use the same capture input. The
+  probe can only listen while the `_*` group is active (CamillaDSP holds the
+  device in the `|*` group).
+- **TOSLINK, Python 3.13+**: needs the `audioop-lts` package (see
+  [Manual installation](#python-dependencies)).
+- **Shutdown command**: `shutdown_system()` runs `sudo poweroff` without
+  checking the result; the sudoers rule must allow it.
+- **piCorePlayer, settings location**: `settings.json` is written next to
+  `lybrica.py`. Check that your tone / loudness values survive a reboot on pCP
+  (the script is launched from `/usr/local/bin`, which is not on the persistent
+  partition) and run `pcp bu` if needed.
+- **piCorePlayer, CamillaDSP version**: `install_pcp.sh` installs CamillaDSP /
+  CamillaGUI `5.0.0-beta.2` with pycamilladsp from the `next5` branch, while the
+  Raspberry Pi OS installer pins CamillaDSP `v4.1.3` and pycamilladsp `v4.0.0`.
 - **ESP32 firmware, ADC API**: it uses the legacy `driver/adc.h` API, which is
   deprecated in ESP-IDF 5.x and removed in later major versions. A move to
   `esp_adc/adc_oneshot.h` will be needed for newer ESP-IDF releases.
@@ -1191,8 +1473,6 @@ journalctl -u camillagui -f
   sequence is running, the button is handled inside that sequence (second press
   asserts GPIO10); the "relay already active" branch of the main loop is not
   reached.
-- **Config switching**: `ENABLE_CONFIG_SWITCH = 0` is accepted by the startup
-  check (since `0 == False`) and behaves like `False`.
 - **Installer, USB drive**: only `/dev/sda1` is auto-detected; otherwise the
   UUID must be typed in.
 
@@ -1213,6 +1493,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 - [lgpio](https://github.com/joan2937/lg)
 - [tm1637_lgpio](https://github.com/melomane63/tm1637_lgpio)
 - [bluetuith](https://github.com/bluetuith-org/bluetuith)
+- [pcp-ble-gatt](https://github.com/melomane63/pcp-ble-gatt) (BLE HID bridge for piCorePlayer)
 - [RPi-CamillaDSP](https://github.com/mdsimon2/RPi-CamillaDSP) by mdsimon2 (CamillaDSP setup guidance on Raspberry Pi)
 - Original LMS volume sync idea by [mbrennwa](https://github.com/mbrennwa/camilla_LMS_volume_sync)
 

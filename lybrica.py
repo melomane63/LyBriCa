@@ -134,8 +134,9 @@ LMS_RETRY_S = 5              # (default 5 s) delay before the bridge restarts af
 # ---------------------- Power ----------------------
 
 POWER_GPIO = 4              # GPIO controlling the power relay
-POWER_OFF_DELAY = 2         # Minutes of silence before the power relay is switched off (needs ENABLE_AUTO_POWEROFF);
-                            # also the delay before the display is blanked (needs ENABLE_DISPLAY)
+POWER_OFF_DELAY = 2         # Minutes without sound AND without key press before the power relay is switched off
+                            # (needs ENABLE_AUTO_POWEROFF); also the delay before the display is blanked
+                            # (needs ENABLE_DISPLAY). A key press restarts the countdown.
 HALT_DELAY = 48             # Hours of continuous silence before the Raspberry Pi shuts down (needs ENABLE_AUTO_POWEROFF)
 
 
@@ -178,8 +179,12 @@ TOSLINK_DEBUG = False   # Log every TOSLINK probe measurement (peak / rms), to c
 
 CLK, DIO = 23, 24           # TM1637 display pins
 SCREEN_RETURN_DELAY = 30    # Seconds without key press before returning to the volume screen
+WAKE_DISPLAY_DELAY = 30     # Seconds the display stays on after a key press that woke it while the relay is
+                            # already off (POWER SAVE done, or relay forced OFF). Independent of POWER_OFF_DELAY.
 SCROLL_FRAME_DELAY = 0.35   # Seconds per step of a scrolling message (POWER OFF, CONF AUTO...)
 SCROLL_END_PAUSE = 0.6      # Seconds the last frame of a scrolling message stays visible
+VOLUME_PEEK_S = 0.5         # Seconds the volume level stays shown after a volume key is released while muted
+                            # (the screen then goes back to "--")
 
 
 # Ambient light sensor (ADC) -> display brightness
@@ -406,11 +411,11 @@ class VolumeState:
 
     `stamp` is the time (time.monotonic) at which the reading STARTED; it is
     used to discard stale readings. `config_path` is the path of the active
-    config file (used by the TOSLINK monitor to notice external changes).
-    `config_data` is the parsed config published by change_config for an
-    INTERNAL switch: volume_watcher_loop uses it instead of re-reading
-    cdsp.config.active(), which can still return the previous config while
-    CamillaDSP is applying the new one."""
+    config file (used by the TOSLINK monitor to notice external changes, and
+    to know the active group). `config_data` is the parsed config published by
+    change_config for an INTERNAL switch: volume_watcher_loop uses it instead
+    of re-reading cdsp.config.active(), which can still return the previous
+    config while CamillaDSP is applying the new one."""
 
     def __init__(self):
         self.db = None
@@ -650,12 +655,11 @@ class LmsBridge:
 
 # ====================== GLOBAL VARIABLES ======================
 
-key_hold_counter = 0            # Key-repeat events of the key being held (remote_events only)
-screen_idle_ticks = 0           # Seconds since the last key event (display_manager_loop)
+key_hold_counter = 0            # Key-repeat events of the key being held (remote_events only).
+                                # A repeat counter on purpose (HOLD_* thresholds are in events), not a clock.
 auto_power_enabled = True
 is_waiting_for_sound = False
-is_key_held = False
-is_volume_key_held = False
+is_volume_key_held = False      # True from a volume key press until VOLUME_PEEK_S after its release
 last_displayed = None           # "volume", "tone", "tilt", "loudness", or "message" (a scrolling message is
                                 # running or has just ended: the volume screen is redrawn right after it)
 blank_volume_when_mute = False
@@ -671,14 +675,14 @@ current_config_key = None       # Settings key of the active config file
 adc_buffer = b""                # Incomplete serial data waiting for its newline
 
 silent_now = False              # True when CamillaDSP reports silence (updated once per second by silence_monitor)
+silent_since = None             # time.monotonic() at which the current silence began (None while there is sound)
+last_activity = time.monotonic()  # time.monotonic() of the last remote key event (touch_activity)
+                                # Single source of truth for every "inactivity" delay: relay cut,
+                                # display blanking and return to the volume screen.
 
 display_is_off = False          # True when the display has been blanked
 
-display_refresh_event = asyncio.Event()
-
 vol_state = VolumeState()       # Last volume / mute / title / config path read from CamillaDSP (published by cdsp_poller)
-
-current_prefix = '_'            # Prefix ("_" or "|") of the active config, kept up to date by change_config and monitor_tv_toslink
 
 _scroll_task = None             # Current scrolling task (a new one cancels the previous)
 
@@ -699,13 +703,12 @@ class NullDisplay:
 
 
 def swap(segs):
-    """Reorder TM1637 segments to match the physical wiring of the display."""
-    length = len(segs)
-    if length == 4 or length == 5:
-        segs.extend(bytearray([0] * (6 - length)))
+    """Reorder TM1637 segments to match the physical wiring of the display.
+    Always called with 6 segments: every text shown is 6 characters long
+    (show(), clear_display(), display_volume_info())."""
+    segs.extend(bytearray(max(0, 6 - len(segs))))   # no-op when already 6
     segs[0], segs[2] = segs[2], segs[0]
-    if length >= 4:
-        segs[3], segs[5] = segs[5], segs[3]
+    segs[3], segs[5] = segs[5], segs[3]
     return segs
 
 
@@ -743,6 +746,43 @@ def blink_on():
     """1 Hz blink phase shared by all blinking dots. Derived from the clock at
     draw time: no state to keep in sync, and every dot blinks in phase."""
     return int(time.monotonic()) % 2 == 0
+
+
+# ---------- activity / silence clocks ----------
+# All inactivity delays are computed from timestamps, never from counters
+# incremented by a loop tick: the loops do not run at an exact rate, and a counter
+# reset from another task is easy to forget.
+
+def touch_activity():
+    """A remote key event restarts every inactivity delay."""
+    global last_activity
+    last_activity = time.monotonic()
+
+
+def idle_age():
+    """Seconds since the last remote key event."""
+    return time.monotonic() - last_activity
+
+
+def silence_age():
+    """Seconds of continuous audio silence (0 while there is sound)."""
+    if not silent_now or silent_since is None:
+        return 0.0
+    return time.monotonic() - silent_since
+
+
+def quiet_age():
+    """Seconds of silence AND without key press: common base of the relay cut
+    and of the display blanking (0 while there is sound)."""
+    if not silent_now:
+        return 0.0
+    return min(silence_age(), idle_age())
+
+
+def relay_is_off():
+    """True when the power relay is already off: POWER SAVE done (waiting for
+    sound) or relay forced OFF by the POWER key."""
+    return ENABLE_AUTO_POWEROFF and (is_waiting_for_sound or not auto_power_enabled)
 
 
 # ---------- scrolling messages ----------
@@ -1221,7 +1261,7 @@ def display_loudness_info():
         value_str = " No"        # loudness switched off (-100)
     else:
         value_str = f"{round(loudness_ref)}"
-    show(f"{value_str} Ld")
+    show(f"{value_str:>3} Ld")      # right-aligned on 3 characters: always 6 in total
     last_displayed = "loudness"
 
 
@@ -1280,6 +1320,34 @@ def change_volume_from_key(key, current_volume, volume_step=1):
         new_volume = pct_to_db(new_pct)
         cdsp.volume.set_main_volume(new_volume)
         display_volume_info(new_volume)
+
+
+_volume_release_task = None     # Pending "end of the volume key" task (see schedule_volume_release)
+
+
+def cancel_volume_release():
+    """Cancel the pending end-of-volume-key task, if any (a volume key was pressed again)."""
+    global _volume_release_task
+    task, _volume_release_task = _volume_release_task, None
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def _volume_release_coro():
+    """VOLUME_PEEK_S after the release: the volume key is no longer "held", the
+    volume screen is redrawn (a muted state shows "--" again)."""
+    global is_volume_key_held
+    await asyncio.sleep(VOLUME_PEEK_S)
+    is_volume_key_held = False
+    if last_displayed == "volume" and not display_is_off and not scroll_active():
+        display_volume_info()
+
+
+def schedule_volume_release():
+    """Called when a volume key is released."""
+    global _volume_release_task
+    cancel_volume_release()
+    _volume_release_task = asyncio.create_task(_volume_release_coro())
 
 
 def handle_arrow_keys(key):
@@ -1425,7 +1493,7 @@ async def change_config(cdsp, config_pattern, cycle=True):
     The new config is published into vol_state (title, path and the parsed config)
     so that the other tasks notice the change.
     Returns the title of the new config if a switch was performed, None otherwise."""
-    global config_active, current_config_key, current_prefix
+    global config_active, current_config_key
 
     group = os.path.basename(config_pattern)[:1]
     config_files = sorted(glob.glob(config_pattern))
@@ -1525,10 +1593,6 @@ async def change_config(cdsp, config_pattern, cycle=True):
     config_active = new_config_data
     current_config_key = new_key
 
-    # Prefix of the group we just switched to ("_" or "|")
-    if config_pattern.startswith(CONFIG_DIR) and len(config_pattern) > len(CONFIG_DIR):
-        current_prefix = config_pattern[len(CONFIG_DIR)]
-
     load_prev_values(saved)
 
     # Remember this config as the last used of its group (survives TV on/off and restarts)
@@ -1537,7 +1601,8 @@ async def change_config(cdsp, config_pattern, cycle=True):
         write_settings()
 
     # Let the other tasks know right away (title, path, parsed config) instead of
-    # waiting for the next cdsp_poller cycle
+    # waiting for the next cdsp_poller cycle. The active group (_ or |) is derived
+    # from the published path, there is no separate prefix variable to keep in sync.
     vol_state.publish(
         vol_state.db, vol_state.muted,
         title=new_config_data.get("title"),
@@ -1702,13 +1767,19 @@ async def lms_bridge_task():
 
 async def silence_monitor():
     """Single reader of the CamillaDSP levels: refreshes `silent_now` once per
-    second. auto_poweroff, display_manager_loop and monitor_tv_toslink read the
-    variable instead of each querying CamillaDSP themselves.
+    second and records in `silent_since` when the current silence began.
+    auto_poweroff, display_manager_loop and monitor_tv_toslink read these
+    variables instead of each querying CamillaDSP themselves.
     On a read error the previous value is kept (no power cut because of a glitch)."""
-    global silent_now
+    global silent_now, silent_since
     while True:
         try:
-            silent_now = is_silent()
+            now_silent = is_silent()
+            if now_silent and not silent_now:
+                silent_since = time.monotonic()     # silence just began
+            elif not now_silent:
+                silent_since = None
+            silent_now = now_silent
         except Exception as e:
             log.warning("Silence monitor: cannot read levels (%s)", e)
         await asyncio.sleep(1)
@@ -1815,62 +1886,59 @@ async def volume_watcher_loop():
 
 
 async def display_manager_loop():
-    global screen_idle_ticks, is_key_held, is_volume_key_held
-    idle_display_counter = 0
-
+    """Housekeeping of the display, once per second: return to the volume screen
+    after SCREEN_RETURN_DELAY s without key press, blanking after a long quiet
+    period, wake-up when sound returns.
+    Every delay is a timestamp comparison (idle_age / silence_age), so none of them
+    depends on how often this loop runs."""
     while True:
-        if is_volume_key_held:
-            is_volume_key_held = False
-            await asyncio.sleep(0.5)
-            if last_displayed == "volume" and not scroll_active():
-                display_volume_info()
-
-        # Return to the volume screen after SCREEN_RETURN_DELAY seconds without key event
-        if last_displayed != "volume":
-            if scroll_active():
-                screen_idle_ticks = 0
-            else:
-                screen_idle_ticks += 1
-                if screen_idle_ticks >= SCREEN_RETURN_DELAY:
-                    screen_idle_ticks = 0
-                    display_volume_info()
-        else:
-            screen_idle_ticks = 0
-
-        if is_key_held:
-            idle_display_counter = 0
-            is_key_held = False
+        # Return to the volume screen after SCREEN_RETURN_DELAY seconds without
+        # key event. Never during a scroll, and never on a blanked display
+        # (display_volume_info() would wake it up).
+        if (last_displayed != "volume"
+                and not scroll_active()
+                and not display_is_off
+                and idle_age() >= SCREEN_RETURN_DELAY):
+            display_volume_info()
 
         # Blank the display after a long silence, wake it when sound returns
         if silent_now:
-            if not display_is_off:
-                idle_display_counter += 1
-                if idle_display_counter >= POWER_OFF_DELAY * 60 + 5:  # +5 s: margin after the relay cut, so the scroll message stays visible
-                    idle_display_counter = 0
-                    blank_display()
-        else:
-            idle_display_counter = 0
-            if display_is_off:
-                display_volume_info()
+            # Relay still on (managed, not yet cut): nothing to do here, auto_poweroff
+            # cuts the relay, shows POWER SAVE, then blanks the display itself.
+            # Relay off (or not managed): the silence must have lasted POWER_OFF_DELAY,
+            # then the display goes off after POWER_OFF_DELAY without key press, or
+            # after only WAKE_DISPLAY_DELAY when the relay is already off (key wake-up).
+            normal_delay = POWER_OFF_DELAY * 60
+            relay_managed_on = ENABLE_AUTO_POWEROFF and not relay_is_off()
+            key_delay = WAKE_DISPLAY_DELAY if relay_is_off() else normal_delay
+            if (not relay_managed_on and not display_is_off and not scroll_active()
+                    and silence_age() >= normal_delay and idle_age() >= key_delay):
+                blank_display()
+        elif display_is_off:
+            display_volume_info()
 
-        try:
-            await asyncio.wait_for(display_refresh_event.wait(), timeout=1.0)
-            display_refresh_event.clear()
-        except asyncio.TimeoutError:
-            pass
+        await asyncio.sleep(1.0)
 
 async def auto_poweroff():
-    """Switch the power relay off after POWER_OFF_DELAY minutes of silence, back on
-    when sound returns, and halt the Raspberry Pi after HALT_DELAY hours of silence."""
+    """Switch the power relay off after POWER_OFF_DELAY minutes without sound and
+    without key press, back on when sound returns, and halt the Raspberry Pi
+    after HALT_DELAY hours of (audio) silence."""
     global is_waiting_for_sound
-    silence_counter = 0
+    power_off_done = False          # the relay cut has already been handled for this quiet period
+    seen_activity = last_activity   # to notice a key press and re-arm the cut
 
     while True:
         await asyncio.sleep(1)
 
+        # A key press restarts the countdown, so the cut can happen again
+        if last_activity != seen_activity:
+            seen_activity = last_activity
+            power_off_done = False
+
         if silent_now:
-            silence_counter += 1
-            if silence_counter == POWER_OFF_DELAY * 60 and not is_waiting_for_sound:
+            if (quiet_age() >= POWER_OFF_DELAY * 60
+                    and not power_off_done and not is_waiting_for_sound):
+                power_off_done = True
                 if auto_power_enabled:
                     lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
                     scroll_message("POWER SAVE")
@@ -1880,15 +1948,16 @@ async def auto_poweroff():
                     finished = await wait_scroll()
                     if finished and silent_now and is_waiting_for_sound:
                         blank_display()
-                else:
-                    blank_display()              # relay already forced off: just blank the display
+                # else: relay already forced off, nothing to cut. The display is
+                # blanked by display_manager_loop (normal delay, then WAKE_DISPLAY_DELAY after a key press)
 
-            if silence_counter >= HALT_DELAY * 3600:
+            # The Pi halt only depends on audio silence, not on key presses
+            if silence_age() >= HALT_DELAY * 3600:
                 shutdown_system()
                 break
 
         else:
-            silence_counter = 0
+            power_off_done = False
             if (auto_power_enabled and is_waiting_for_sound
                     and lgpio.gpio_read(h, POWER_GPIO) == 0):
                 lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
@@ -1921,9 +1990,8 @@ async def blink_loop():
 
 # --------------------- Config switching: TOSLINK mode ---------------------
 # The prefix of the active config (_ or |) decides what is monitored. It is
-# kept in `current_prefix`, and resynchronised whenever the config path
-# published in vol_state changes, so manual BACK / HOMEPAGE presses (or any
-# external change) are honoured automatically.
+# derived at each cycle from the config path published in vol_state, so manual
+# BACK / HOMEPAGE presses (or any external change) are honoured automatically.
 #
 #   _XX : CamillaDSP captures the loopback -> TOSLINK is free.
 #         The TOSLINK is probed directly through ALSA (0.5 s). A reading counts
@@ -1941,9 +2009,8 @@ async def blink_loop():
 #   (RETRY_BASE_S, doubled each time, up to RETRY_MAX_S).
 #
 #   Automatism disabled (long HOMEPAGE press, `toslink_auto_enabled` False):
-#   no probing, no automatic switch, no LMS pause. The prefix is still kept
-#   in sync with the active config, and BACK keeps working (it then forces
-#   the "_" group).
+#   no probing, no automatic switch, no LMS pause. BACK keeps working (it then
+#   forces the "_" group).
 
 # Capture formats the probe can measure: CamillaDSP name -> (bytes per sample, bits)
 TOSLINK_FORMATS = {
@@ -2040,7 +2107,7 @@ def _toslink_probe(params):
 
 async def monitor_tv_toslink():
     """TOSLINK <-> SQUEEZELITE auto switching (see the block comment above)."""
-    global current_prefix, toslink_ready
+    global toslink_ready
     loop = asyncio.get_running_loop()
 
     # Internal timings (not user-facing: they are calibrated on the detection
@@ -2069,9 +2136,7 @@ async def monitor_tv_toslink():
     log.info("[LOOPBACK] Configs '_*' found in %s", CONFIG_DIR)
     toslink_ready = True        # both groups exist: BACK / HOMEPAGE may rely on the automatism
 
-    path = cdsp.config.file_path() or ""
-    current_prefix = _prefix_of(path)
-    last_config_path = path
+    last_config_path = cdsp.config.file_path() or ""
     toslink_hits = 0            # consecutive TOSLINK readings above the threshold ("_" mode)
     silent_ticks = 0            # consecutive cycles LMS playing + TOSLINK silent ("|" mode)
     switch_failures = 0         # consecutive failed automatic switches (backoff)
@@ -2081,11 +2146,11 @@ async def monitor_tv_toslink():
         """Switch to the requested group and check that it really happened.
         On failure: exponential backoff instead of retrying at every cycle."""
         nonlocal last_config_path, switch_failures
-        global current_prefix
         await change_config(cdsp, pattern, cycle=False)
-        last_config_path = cdsp.config.file_path() or ""
-        current_prefix = _prefix_of(last_config_path)
-        if current_prefix == target_prefix:
+        # change_config publishes the new path into vol_state before returning;
+        # if it failed, vol_state still holds the old path
+        last_config_path = vol_state.config_path or ""
+        if _prefix_of(last_config_path) == target_prefix:
             switch_failures = 0
             await asyncio.sleep(2.0)            # let the levels settle
             return
@@ -2099,27 +2164,26 @@ async def monitor_tv_toslink():
         await asyncio.sleep(LOOP_S)
 
         # Config changed from outside (remote BACK / HOMEPAGE, GUI...):
-        # resynchronise the prefix and restart the detection from scratch
+        # restart the detection from scratch
         cp = vol_state.config_path
         if cp and cp != last_config_path:
+            old_prefix, new_prefix = _prefix_of(last_config_path), _prefix_of(cp)
             last_config_path = cp
-            new_prefix = _prefix_of(cp)
-            if new_prefix != current_prefix:
+            if new_prefix != old_prefix:
                 log.info("[TOSLINK] Config change: %s -> %s",
-                         current_prefix, new_prefix)
-                current_prefix = new_prefix
+                         old_prefix, new_prefix)
             toslink_hits = silent_ticks = 0
             await asyncio.sleep(1.0)
             continue
 
         # Automatism disabled (long HOMEPAGE press): no probing, no switching,
-        # no LMS pause. The prefix is still resynchronised above.
+        # no LMS pause. The change detection above still runs.
         if not toslink_auto_enabled:
             toslink_hits = silent_ticks = 0
             continue
 
         try:
-            if current_prefix == '_':
+            if _prefix_of(vol_state.config_path) == '_':
                 # _XX: TOSLINK is free -> probe it
                 silent_ticks = 0
                 peak, rms, err = await loop.run_in_executor(
@@ -2185,7 +2249,7 @@ async def monitor_tv_toslink():
 
 
 async def remote_events(device):
-    global last_displayed, key_hold_counter, screen_idle_ticks, is_key_held, is_volume_key_held
+    global last_displayed, key_hold_counter, is_volume_key_held
     global last_tone_tilt, enter_display_at_press
 
     last_seek_time = 0
@@ -2199,7 +2263,10 @@ async def remote_events(device):
                 if event.type != evdev.ecodes.EV_KEY:
                     continue
 
-                screen_idle_ticks = 0  # Any key event restarts the return-to-volume timer
+                # Any key event restarts every inactivity delay: return to the volume
+                # screen, relay cut, display blanking. Done BEFORE the display-off test,
+                # so the key press that wakes the display counts too.
+                touch_activity()
 
                 attrib = evdev.categorize(event)
                 key = attrib.keycode
@@ -2207,7 +2274,6 @@ async def remote_events(device):
 
                 # Display off: the first key only wakes it up, and its repeat / release are ignored
                 if attrib.keystate == 1 and display_is_off:
-                    is_key_held = True
                     display_volume_info()
                     swallowed_key = key
                     continue
@@ -2217,7 +2283,6 @@ async def remote_events(device):
                     continue
 
                 if attrib.keystate == 1:  # Key pressed
-                    is_key_held = True
                     key_hold_counter = 0
 
                     # Stop any running scroll so the key's action is visible immediately.
@@ -2229,6 +2294,7 @@ async def remote_events(device):
                         display_volume_info()
 
                     if key in volume_keys:
+                        cancel_volume_release()
                         is_volume_key_held = True
                         volume_repeat_count = 0
                         current_volume = cdsp.volume.main_volume()
@@ -2241,6 +2307,9 @@ async def remote_events(device):
 
                     # `in`, not `==`: evdev returns a list when a code has several names
                     elif KEY_BINDINGS['MUTE'] in key:
+                        # End the volume "peek" now: the new mute state must show at once
+                        cancel_volume_release()
+                        is_volume_key_held = False
                         is_muted = not cdsp.volume.main_mute()
                         cdsp.volume.set_main_mute(is_muted)
                         display_volume_info(cdsp.volume.main_volume(), is_muted)
@@ -2251,7 +2320,9 @@ async def remote_events(device):
 
                     elif key == KEY_BINDINGS['BACK']:
                         if toslink_active() and toslink_auto_enabled:
-                            # Auto ON: cycle INSIDE the active group, no group change
+                            # Auto ON: cycle INSIDE the active group, no group change.
+                            # Fresh read on purpose (not vol_state): change_config re-reads
+                            # file_path() itself, both must agree within one operation.
                             prefix = _prefix_of(cdsp.config.file_path())
                             await change_config(cdsp, CONFIG_DIR + prefix + '*')
                         else:
@@ -2277,13 +2348,12 @@ async def remote_events(device):
                 elif attrib.keystate == 2:  # Key held down
 
                     if key in volume_keys:
-                        is_volume_key_held = True
                         # One step every VOLUME_SLOWDOWN repeats of the remote
                         volume_repeat_count += 1
                         if volume_repeat_count >= VOLUME_SLOWDOWN[key]:
                             volume_repeat_count = 0
                             change_volume_from_key(key, cdsp.volume.main_volume())
-                          
+
                     elif key in (KEY_BINDINGS['PREVIOUSSONG'], KEY_BINDINGS['NEXTSONG']):
                         key_hold_counter += 1
                         current_time = time.time()
@@ -2346,8 +2416,8 @@ async def remote_events(device):
                             else "playlist index +1")
 
                     elif key in volume_keys:
-                        display_refresh_event.set()
                         volume_repeat_count = 0
+                        schedule_volume_release()   # flag cleared + redraw after VOLUME_PEEK_S
 
                     key_hold_counter = 0
                     last_seek_time = 0
@@ -2355,6 +2425,8 @@ async def remote_events(device):
         except OSError as e:
             # Remote disconnected: return, remote_watcher will look for it again
             log.warning("Remote disconnected: %s", e)
+            cancel_volume_release()
+            is_volume_key_held = False      # no release event will ever come
             return
 
         except Exception:
@@ -2401,7 +2473,7 @@ async def main():
     # and the only place that reconnects to CamillaDSP, which every feature needs
     spawn("cdsp-poller", cdsp_poller)
     if ENABLE_AUTO_POWEROFF or ENABLE_DISPLAY or ENABLE_TOSLINK_SWITCH:
-        # Single reader of the CamillaDSP levels, shared through `silent_now`
+        # Single reader of the CamillaDSP levels, shared through `silent_now` / `silent_since`
         spawn("silence", silence_monitor)
     if ENABLE_AUTO_POWEROFF:
         spawn("auto-poweroff", auto_poweroff)

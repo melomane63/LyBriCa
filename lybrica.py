@@ -10,6 +10,7 @@ import signal
 import socket
 import sys
 import time
+import unicodedata
 from urllib.parse import quote, unquote
 from camilladsp import CamillaClient
 
@@ -103,7 +104,7 @@ CAMILLA_ADDR = ("127.0.0.1", 1234)  # CamillaDSP on this Pi (must stay local: lo
 # `vol_state`; display/resync, the TOSLINK monitor and the LMS bridge
 # subscribe to it.
 POLL_INTERVAL_S = 0.25      # One read cycle of CamillaDSP (volume + mute)
-TITLE_EVERY = 2             # The config title and file path are read every N cycles (2 -> every 0.5 s)
+PATH_EVERY = 2              # The config file path is read every N cycles (2 -> every 0.5 s)
 CDSP_RECONNECT_DELAY_S = 2.0    # Seconds to wait before trying to reconnect to CamillaDSP after an error
 
 
@@ -355,23 +356,28 @@ ARROW_ADJUST = {
     },
 }
 
-# ============================================================================
-# LMS <-> CAMILLADSP VOLUME BRIDGE (asyncio, no thread)
-# Inspired by the original work by mbrennwa, entirely reworked:
-#     https://github.com/mbrennwa/camilla_LMS_volume_sync
-#
-#   - it reads the values published by ONE reader (cdsp_poller) in a VolumeState,
-#     instead of querying CamillaDSP itself;
-#   - the LMS connection uses asyncio streams;
-#   - CamillaDSP readings that started before our last write are ignored
-#     (otherwise a stale reading could undo a change that was just received
-#     from LMS).
-# ============================================================================
 
-bridge_log = logging.getLogger("lms_bridge")
+# =====================================================================
+#  MAP OF THE FILE (below the SETTINGS)
+# =====================================================================
+#   1. CORE - shared by every feature
+#   2. LMS - Logitech Media Server
+#   3. POWER - relay, auto power-off, halt
+#   4. DISPLAY - TM1637 and ambient light sensor
+#   5. TOSLINK - automatic _ / | config switching
+#   6. REMOTE - keys
+#   7. STARTUP - module-level initialisation
+#   8. SHUTDOWN / MAIN
 
 
-# ====================== VOLUME CURVE FUNCTIONS ======================
+# =====================================================================
+#  CORE - shared by every feature
+#  Not switchable: volume curve, the state published by cdsp_poller, activity /
+#  silence clocks, filters + settings.json, CamillaDSP connection, config switching.
+# =====================================================================
+
+
+# ---------- Volume curve (level 0..100 <-> dB) ----------
 # Level 0..100 (LMS scale) <-> dB (CamillaDSP).
 #
 # Based on the gain sent by LMS to Squeezelite (dB = 20 * log10(gain / 65536)),
@@ -404,8 +410,7 @@ def db_to_pct(d):
     return min((0, 1, 2), key=lambda i: abs(pct_to_db(i) - d))
 
 
-# ====================== SHARED STATE ======================
-
+# ---------- Shared CamillaDSP state ----------
 class VolumeState:
     """Last CamillaDSP reading, published by a single reader (cdsp_poller).
 
@@ -415,14 +420,20 @@ class VolumeState:
     to know the active group). `config_data` is the parsed config published by
     change_config for an INTERNAL switch: volume_watcher_loop uses it instead
     of re-reading cdsp.config.active(), which can still return the previous
-    config while CamillaDSP is applying the new one."""
+    config while CamillaDSP is applying the new one.
+
+    `config_active` is the full content of cdsp.config.active(), published
+    every poll by cdsp_poller. It is the change-detection source: comparing
+    it to the last known content catches any config change, INTERNAL
+    (change_config) or EXTERNAL (GUI), because it reflects what CamillaDSP
+    actually plays, not what file_path() stores."""
 
     def __init__(self):
         self.db = None
         self.muted = None
-        self.title = None
         self.config_path = None
         self.config_data = None
+        self.config_active = None      # full active() content, for change detection
         self.stamp = 0.0
         self._events = []
 
@@ -437,21 +448,799 @@ class VolumeState:
         except ValueError:
             pass
 
-    def publish(self, db, muted, title=None, config_path=None, config_data=None, stamp=None):
+    def publish(self, db, muted, config_path=None, config_data=None,
+                config_active=None, stamp=None):
         self.db = db
         self.muted = bool(muted)
-        if title:                      # an empty title (e.g. during a config reload) is ignored: the previous one is kept
-            self.title = title
-        if config_path:                # same rule for the config path
+        if config_path:                # an empty path (e.g. during a config reload) is ignored: the previous one is kept
             self.config_path = config_path
         if config_data is not None:    # kept until the watcher consumes it
             self.config_data = config_data
+        if config_active is not None:  # overwritten every poll: it is the detection source
+            self.config_active = config_active
         self.stamp = time.monotonic() if stamp is None else stamp
         for ev in self._events:
             ev.set()
 
 
-# ====================== THE BRIDGE ======================
+vol_state = VolumeState()       # Last volume / mute / config path read from CamillaDSP (published by cdsp_poller)
+
+
+# ---------- Activity and silence clocks ----------
+silent_now = False              # True when CamillaDSP reports silence (updated once per second by silence_monitor)
+silent_since = None             # time.monotonic() at which the current silence began (None while there is sound)
+last_activity = time.monotonic()  # time.monotonic() of the last remote key event (touch_activity)
+                                # Single source of truth for every "inactivity" delay: relay cut,
+                                # display blanking and return to the volume screen.
+
+
+# All inactivity delays are computed from timestamps, never from counters
+# incremented by a loop tick: the loops do not run at an exact rate, and a counter
+# reset from another task is easy to forget.
+
+def touch_activity():
+    """A remote key event restarts every inactivity delay."""
+    global last_activity
+    last_activity = time.monotonic()
+
+
+def idle_age():
+    """Seconds since the last remote key event."""
+    return time.monotonic() - last_activity
+
+
+def silence_age():
+    """Seconds of continuous audio silence (0 while there is sound)."""
+    if not silent_now or silent_since is None:
+        return 0.0
+    return time.monotonic() - silent_since
+
+
+def quiet_age():
+    """Seconds of silence AND without key press: common base of the relay cut
+    and of the display blanking (0 while there is sound)."""
+    if not silent_now:
+        return 0.0
+    return min(silence_age(), idle_age())
+
+
+def is_silent():
+    """Silence detection: RMS threshold, then crest factor (peak vs RMS).
+    A steady noise floor has peak ≈ RMS; real audio does not."""
+    rms = cdsp.levels.capture_rms()
+    peak = cdsp.levels.capture_peak()
+    rms_vals = list(rms.values()) if isinstance(rms, dict) else list(rms)
+    peak_vals = list(peak.values()) if isinstance(peak, dict) else list(peak)
+    if not rms_vals or not peak_vals:
+        return True
+
+    rms_db = max(float(v) for v in rms_vals)
+    if rms_db <= SILENCE_RMS_DB:                    # below threshold: silence
+        return True
+
+    peak_db = max(float(v) for v in peak_vals)
+    return (peak_db - rms_db) < CREST_MIN_DB        # steady noise: silence
+
+
+async def silence_monitor():
+    """Single reader of the CamillaDSP levels: refreshes `silent_now` once per
+    second and records in `silent_since` when the current silence began.
+    auto_poweroff, display_manager_loop and monitor_tv_toslink read these
+    variables instead of each querying CamillaDSP themselves.
+    On a read error the previous value is kept (no power cut because of a glitch)."""
+    global silent_now, silent_since
+    while True:
+        try:
+            now_silent = is_silent()
+            if now_silent and not silent_now:
+                silent_since = time.monotonic()     # silence just began
+            elif not now_silent:
+                silent_since = None
+            silent_now = now_silent
+        except Exception as e:
+            log.warning("Silence monitor: cannot read levels (%s)", e)
+        await asyncio.sleep(1)
+
+
+# ---------- Filters and settings.json ----------
+prev_values = {}                # ENTER-key restore values: keys of GAIN_KEYS + "loudness_ref" (loaded from the config's saved entry)
+                                # (filled by load_prev_values)
+current_config_key = None       # Settings key of the active config file
+current_config_external = False # True while the active config was chosen OUTSIDE this script (CamillaDSP UI, another
+                                # client): its tone / loudness are neither saved nor copied to the next config
+
+
+def apply_filter_param(filters, filt, param, value):
+    """Set a CamillaDSP filter parameter, silently ignoring filters that are
+    missing from the active config (configs need not define every filter)."""
+    f = filters.get(filt)
+    if not isinstance(f, dict):
+        return
+    params = f.get("parameters")
+    if not isinstance(params, dict):
+        return
+    params[param] = value
+
+
+def active_filter_names(config):
+    """Names of the filters really used by the pipeline. A filter defined in
+    `filters:` but not listed in an (enabled) Filter step has no effect on the sound."""
+    names = set()
+    for step in config.get("pipeline") or []:
+        if isinstance(step, dict) and step.get("type") == "Filter" and not step.get("bypassed"):
+            step_names = step.get("names")
+            if isinstance(step_names, list):
+                names.update(n for n in step_names if isinstance(n, str))
+    return names
+
+
+def get_filter_params(config, filt):
+    """Return the 'parameters' dict of a filter, or None if the filter is missing
+    from the config or not used by its pipeline."""
+    if filt not in active_filter_names(config):
+        return None
+    f = (config.get("filters") or {}).get(filt)
+    params = f.get("parameters") if isinstance(f, dict) else None
+    return params if isinstance(params, dict) else None
+
+
+def get_filter_param(config, filt, param):
+    """Return a filter parameter, or None if the filter/parameter is missing."""
+    params = get_filter_params(config, filt)
+    return params.get(param) if params is not None else None
+
+
+def get_all_tone_params(config):
+    """Return the four tone gains and the loudness reference level in a single
+    pipeline traversal (active_filter_names is called once instead of five times).
+    Each value is None if the filter is missing from the config or not used by
+    its pipeline."""
+    active = active_filter_names(config)
+    filters = config.get("filters") or {}
+
+    def value(filt, param):
+        if filt not in active:
+            return None
+        f = filters.get(filt)
+        p = f.get("parameters") if isinstance(f, dict) else None
+        return p.get(param) if isinstance(p, dict) else None
+
+    return {
+        "bass":     value("Bass", "gain"),
+        "treble":   value("Treble", "gain"),
+        "tilt":     value("Tilt", "gain"),
+        "presence": value("Presence", "gain"),
+        "loudness": value("Loudness", "reference_level"),
+    }
+
+
+def config_key(path):
+    """Settings key of a config file: its name without directory or extension."""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def get_tone(config):
+    """Current tone values of a config (only for filters that really exist)."""
+    tone = {}
+    for key, (filt, param) in TONE_PARAMS.items():
+        value = get_filter_param(config, filt, param)
+        if value is not None:
+            tone[key] = value
+    return tone
+
+
+def apply_tone(filters, tone):
+    """Apply a saved tone dict to the filters of a config."""
+    for key, (filt, param) in TONE_PARAMS.items():
+        if key in tone:
+            apply_filter_param(filters, filt, param, tone[key])
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    configs = data.get("configs")
+    last_config = data.get("last_config")
+    return {
+        "configs": configs if isinstance(configs, dict) else {},
+        "last_config": last_config if isinstance(last_config, dict) else {},
+        "last_tone_tilt": data.get("last_tone_tilt", "tone"),
+    }
+
+
+def write_settings():
+    """Write settings.json atomically (no half-written file on power loss)."""
+    tmp_path = SETTINGS_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(settings, f, indent=4, ensure_ascii=False)
+    os.replace(tmp_path, SETTINGS_PATH)
+
+
+def save_audio_settings(config):
+    """Store the tone and the loudness of the active config, then write
+    settings.json. Always per config: how the values are shared between
+    configs is decided by SAVE_MODE in change_config, which copies them into
+    the new config at switch time.
+    A config chosen outside this script (current_config_external) is not stored."""
+    if not TONE_ACTIVE:
+        return
+    if current_config_key and not current_config_external:
+        entry = get_tone(config)
+        entry["prev"] = {key: prev_values[key] for key in TONE_PARAMS}
+        ref = get_filter_param(config, *LOUDNESS_FILTER)
+        if ref is not None:
+            entry["loudness_ref"] = ref
+            entry["prev"]["loudness_ref"] = prev_values["loudness_ref"]
+        settings["configs"][current_config_key] = entry
+    settings["last_tone_tilt"] = last_tone_tilt
+    write_settings()
+
+
+def load_prev_values(saved=None):
+    """Load the ENTER-key restore values (the four gains and the loudness) from
+    the saved entry of a config (defaults if none)."""
+    saved_prev = saved.get("prev") if saved else None
+    if not isinstance(saved_prev, dict):
+        saved_prev = {}
+    for key in TONE_PARAMS:
+        prev_values[key] = saved_prev.get(key, 0)
+    prev_values["loudness_ref"] = saved_prev.get("loudness_ref", DEFAULT_LOUDNESS_REF)
+
+
+def apply_saved_values(filters, saved):
+    """Apply the saved tone and the saved loudness of a config to a `filters`
+    dict (filters missing from the config are ignored). Which values are in
+    `saved` is decided by SAVE_MODE in change_config, which may copy another
+    config's values into it before this call."""
+    if saved:
+        apply_tone(filters, saved)
+        if "loudness_ref" in saved:
+            apply_filter_param(filters, *LOUDNESS_FILTER, saved["loudness_ref"])
+
+
+def is_complete_config(cfg):
+    """True si cfg a la section obligatoire 'devices' non vide.
+    CamillaDSP rejette toute config sans 'devices'."""
+    return (isinstance(cfg, dict)
+            and isinstance(cfg.get("devices"), dict)
+            and bool(cfg["devices"]))
+
+
+def init_tone():
+    """Apply the saved tone and loudness of the config CamillaDSP started with.
+    The config is pushed to CamillaDSP even when nothing is saved: on this setup
+    that push is what makes CamillaDSP start processing at boot (and the players
+    that depend on it only start after that)."""
+    global current_config_key
+    path = cdsp.config.file_path()
+    if not path:
+        return
+    current_config_key = config_key(path)
+    saved = settings["configs"].get(current_config_key)
+    load_prev_values(saved)
+    if is_complete_config(config_active):
+        filters = config_active.get("filters")
+        apply_saved_values(filters if isinstance(filters, dict) else {}, saved)
+        cdsp.config.set_active(config_active)
+
+
+# ---------- CamillaDSP connection, polling and task supervision ----------
+def reconnect_cdsp():
+    """Close and reopen the main connection. It is the SAME `cdsp` object, so
+    every existing call keeps working."""
+    try:
+        cdsp.disconnect()
+    except Exception:
+        pass
+    cdsp.connect()
+
+
+def resync_after_reconnect():
+    """After a CamillaDSP restart: re-read the active config, re-apply the
+    saved tone and loudness, and push the config back (same push as at boot).
+    If CamillaDSP comes back with ANOTHER config (changed from outside, the GUI
+    restarting CamillaDSP), it is an external change: the config we leave is
+    saved, the new one is marked external and keeps its file values (the saved
+    tone / loudness are not applied to an external config)."""
+    global config_active, current_config_key, current_config_external
+    new_active = cdsp.config.active() or {}
+    path = cdsp.config.file_path()
+    new_key = config_key(path) if path else None
+    if new_key and current_config_key and new_key != current_config_key:
+        # Before config_active is replaced (it still holds the config we leave)
+        try:
+            save_audio_settings(config_active)
+        except Exception as e:
+            log.warning("Resync: could not save the settings (%s)", e)
+        log.info("[CONFIG] External change after a CamillaDSP restart: %s -> %s (%s)",
+                 current_config_key, new_key,
+                 "previous config not saved: it was already external"
+                 if current_config_external else "previous config saved")
+        current_config_external = True
+    if isinstance(new_active, dict) and new_active:
+        config_active = new_active
+    current_config_key = new_key
+    saved = settings["configs"].get(current_config_key) if current_config_key else None
+    load_prev_values(saved)
+    if TONE_ACTIVE and is_complete_config(config_active):
+        filters = config_active.get("filters")
+        if not current_config_external:
+            apply_saved_values(filters if isinstance(filters, dict) else {}, saved)
+        cdsp.config.set_active(config_active)
+
+
+async def supervised(name, factory):
+    """Restart a task that crashes, instead of bringing the whole script down."""
+    while True:
+        try:
+            await factory()
+            return                          # normal end (e.g. auto_poweroff after the shutdown, or TOSLINK detection disabled)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Task '%s' crashed, restarting in %g s", name, TASK_RESTART_DELAY_S)
+            await asyncio.sleep(TASK_RESTART_DELAY_S)
+
+
+async def cdsp_poller():
+    """Periodic reader of the CamillaDSP volume / mute / config path.
+    Publishes into vol_state; volume_watcher_loop, monitor_tv_toslink and the
+    LMS bridge consume it.
+    Also publishes the full content of cdsp.config.active(): it is the
+    change-detection source that works even when the GUI changed the config
+    without updating file_path() (CamillaDSP stores the path but does not
+    touch it on SetConfig: only change_config calls set_file_path).
+    On error: automatic reconnection, the script keeps running."""
+    n = 0
+    failures = 0
+    while True:
+        try:
+            t0 = time.monotonic()           # start of the read (stale-reading guard)
+            db = cdsp.volume.main_volume()
+            muted = bool(cdsp.volume.main_mute())
+ 
+            path = active = None
+            if n % PATH_EVERY == 0:
+                path = cdsp.config.file_path()
+                # active() returns the whole serialized config: it is the
+                # expensive call that blocks the event loop. Read it only
+                # every PATH_EVERY cycles (0.5 s), and skip it entirely
+                # while a volume key is held, otherwise the volume display
+                # stutters on every key repeat (the remote handler already
+                # refreshes the display directly during the hold).
+                if not is_volume_key_held:
+                    try:
+                        active = cdsp.config.active() or {}
+                    except Exception:
+                        active = None
+ 
+            n += 1
+            vol_state.publish(db, muted, config_path=path,
+                              config_active=active, stamp=t0)
+            if failures:
+                log.info("CamillaDSP reachable again")
+                failures = 0
+        except Exception as e:
+            failures += 1
+            if failures == 1 or failures % 20 == 0:
+                log.warning("CamillaDSP unreachable (%s), reconnecting...", e)
+            await asyncio.sleep(CDSP_RECONNECT_DELAY_S)
+            try:
+                reconnect_cdsp()
+                resync_after_reconnect()
+                log.info("CamillaDSP connection restored")
+            except Exception as e2:
+                log.warning("Reconnection failed (%s)", e2)
+            continue
+        await asyncio.sleep(POLL_INTERVAL_S)
+
+
+# ---------- Config switching and resync after an external change ----------
+def _prefix_of(path):
+    """Series of a config: '|' if the file name starts with '|', '_' otherwise."""
+    return '|' if os.path.basename(path or "").startswith('|') else '_'
+
+
+def find_config_file(active_config):
+    """Return the path of the YAML file whose content matches active_config,
+    or None. Used ONLY when the GUI changed the config without updating
+    file_path() (CamillaDSP stores the path but does not touch it on SetConfig:
+    only change_config calls set_file_path). Stops at the first match. Only
+    called on a GUI change, never on every poll."""
+    if not isinstance(active_config, dict) or not active_config:
+        return None
+    for path in sorted(glob.glob(CONFIG_DIR + "*")):
+        try:
+            data = cdsp.config.read_and_parse_file(path)
+        except Exception:
+            continue
+        if isinstance(data, dict) and data == active_config:
+            return path
+    return None
+
+
+async def change_config(cdsp, config_pattern, cycle=True):
+    """Switch config within the group of files matching the pattern.
+    cycle=True : go to the next file of the group if the active config belongs to it.
+    Otherwise (or if cycle=False): go to the last config used in this group.
+    How the tone and the loudness are shared between configs is decided by
+    SAVE_MODE (see the SETTINGS block). The values are always saved per config;
+    SAVE_MODE only controls what is copied into the new config before it is applied.
+    The new config is published into vol_state (path and the parsed config)
+    so that the other tasks notice the change.
+    Returns the title of the new config if a switch was performed, None otherwise."""
+    global config_active, current_config_key, current_config_external
+
+    group = os.path.basename(config_pattern)[:1]
+    config_files = sorted(glob.glob(config_pattern))
+    if not config_files:
+        return None
+    current_config = cdsp.config.file_path()
+    if cycle and current_config in config_files:
+        index = config_files.index(current_config)
+        new_config_path = config_files[(index + 1) % len(config_files)]
+    else:
+        last_key = settings["last_config"].get(group)
+        new_config_path = next(
+            (p for p in config_files if config_key(p) == last_key),
+            config_files[0],
+        )
+    if new_config_path == current_config:
+        return None
+
+    # Remember the tone and loudness of the config we are leaving (and write them to disk)
+    if current_config_external:
+        log.info("[CONFIG] Leaving the external config %s: its tone / loudness are not saved",
+                 current_config_key)
+    save_audio_settings(config_active)
+
+    # The config we leave is, by definition, the last one used in its group: remember
+    # it now, so that coming back to this group (TV on/off, BACK / HOMEPAGE) lands on
+    # it and finds its latest values - even when it is the config the script started with.
+    if current_config:
+        settings["last_config"][_prefix_of(current_config)] = config_key(current_config)
+
+    # Protection 3: abort if the new config cannot be read or does not parse to a dict
+    try:
+        new_config_data = cdsp.config.read_and_parse_file(new_config_path)
+    except Exception as e:
+        log.error("Cannot read %s: %s", new_config_path, e)
+        return None
+    if not isinstance(new_config_data, dict):
+        log.error("Config %s is invalid, aborting switch", new_config_path)
+        return None
+
+    filters = new_config_data.get('filters')
+    if not isinstance(filters, dict):
+        filters = {}
+        new_config_data['filters'] = filters
+
+    new_key = config_key(new_config_path)
+    new_series = _prefix_of(new_config_path)
+
+    # SAVE_MODE: depending on the mode and on whether the new config is in the same
+    # group as the one we are leaving, copy the values saved for the config we are
+    # leaving into settings["configs"][new_key] BEFORE applying, so that
+    # apply_saved_values below picks the copy up.
+    #   all_config       : never copy, B keeps its own values.
+    #   all_group        : same group -> copy tone + loudness.
+    #   half             : same group -> copy the loudness only (the tone stays per config).
+    #   same_everywhere  : always copy tone + loudness, whatever the group.
+    # Nothing is copied from a config chosen outside this script (its saved values
+    # are not the ones that were playing).
+    if SAVE_MODE != "all_config" and not current_config_external:
+        same_group = (new_series == _prefix_of(current_config))
+        old_entry = settings["configs"].get(current_config_key)
+        if isinstance(old_entry, dict):
+            if SAVE_MODE == "all_group" and same_group:
+                settings["configs"][new_key] = dict(old_entry)
+                write_settings()
+            elif SAVE_MODE == "half" and same_group:
+                entry_b = settings["configs"].get(new_key)
+                if not isinstance(entry_b, dict):
+                    entry_b = {}
+                if "loudness_ref" in old_entry:
+                    entry_b["loudness_ref"] = old_entry["loudness_ref"]
+                if isinstance(old_entry.get("prev"), dict):
+                    entry_b.setdefault("prev", {})["loudness_ref"] = (
+                        old_entry["prev"].get("loudness_ref", DEFAULT_LOUDNESS_REF))
+                settings["configs"][new_key] = entry_b
+                write_settings()
+            elif SAVE_MODE == "same_everywhere":
+                settings["configs"][new_key] = dict(old_entry)
+                write_settings()
+
+    # Saved values for this config (possibly overwritten by the copy above);
+    # if none, the values from the .yml are kept
+    saved = settings["configs"].get(new_key)
+    apply_saved_values(filters, saved)
+
+    # Make relative filter file names absolute
+    config_dir = os.path.dirname(os.path.abspath(new_config_path))
+    for f in filters.values():
+        params = f.get("parameters") if isinstance(f, dict) else None
+        filename = params.get("filename") if isinstance(params, dict) else None
+        if isinstance(filename, str) and filename and not os.path.isabs(filename):
+            params["filename"] = os.path.normpath(os.path.join(config_dir, filename))
+
+    # Protection 4: only update the local state if CamillaDSP accepted the config
+    try:
+        cdsp.config.set_active(new_config_data)
+        cdsp.config.set_file_path(new_config_path)
+    except Exception as e:
+        log.error("Failed to apply config %s: %s", new_config_path, e)
+        return None
+
+    config_active = new_config_data
+    current_config_key = new_key
+    current_config_external = False     # this config was chosen here
+
+    load_prev_values(saved)
+
+    # Remember this config as the last used of its group (survives TV on/off and restarts)
+    if group in CONFIG_GROUPS:
+        settings["last_config"][group] = new_key
+        write_settings()
+
+    # Let the other tasks know right away (path, parsed config) instead of
+    # waiting for the next cdsp_poller cycle. The active group (_ or |) is derived
+    # from the published path, there is no separate prefix variable to keep in sync.
+    vol_state.publish(
+        vol_state.db, vol_state.muted,
+        config_path=new_config_path,
+        config_data=new_config_data,
+    )
+
+    # Wait until CamillaDSP has finished loading the new config, so that
+    # cdsp.config.title() returns the NEW title (or "" if it has none),
+    # not the previous one.
+    await asyncio.sleep(0.1)
+
+    # A config switch is a visible event: it replaces any running message
+    cancel_scroll()
+    display_volume_info()
+    return new_config_data.get("title")
+
+async def volume_watcher_loop():
+    """Detect config changes by comparing the full active config content
+    (cdsp.config.active()) to the last known one. That content is the ONLY
+    detection source: it changes on any config change, internal (change_config)
+    or external (GUI), because it reflects what CamillaDSP actually plays.
+
+    INTERNAL switch: change_config published config_data -> already handled,
+    skip immediately.
+    LOCAL change (parameter tweak by the remote, or the poller catching up
+    with change_config): current_active == config_active -> nothing to do.
+    EXTERNAL change (GUI): identify the file, save the config we leave,
+    update state, reset prev_values, redraw tone/tilt/loudness. Do NOT restore
+    the saved values of the external config, do NOT push it back to CamillaDSP."""
+    global config_active, current_config_key, current_config_external
+
+    ev = vol_state.subscribe()
+    while vol_state.db is None or vol_state.config_active is None:
+        await ev.wait()
+        ev.clear()
+    last_volume, last_mute = vol_state.db, vol_state.muted
+    last_active = vol_state.config_active
+    resync_retries = 0              # failed resyncs of the same change (the config can be unreadable for a moment)
+    RESYNC_RETRIES = 5             # ~ 2,5 s of attempts, then the change is given up
+
+    while True:
+        await ev.wait()
+        ev.clear()
+        current_volume, current_mute = vol_state.db, vol_state.muted
+        current_path = vol_state.config_path
+        current_active = vol_state.config_active
+
+        # DETECTION: compare the full active config content. It changes on
+        # any config change, INTERNAL (change_config) or EXTERNAL (GUI),
+        # because it reflects what CamillaDSP actually plays.
+        config_changed = (current_active is not None
+                          and current_active != last_active)
+
+        if config_changed:
+            # INTERNAL switch: change_config published the parsed config in
+            # vol_state.config_data. Trust it and skip the rest: change_config
+            # already did save, apply, set_active, set_file_path,
+            # current_config_key, current_config_external = False, and display.
+            published, vol_state.config_data = vol_state.config_data, None
+            if published is not None:
+                last_active = current_active
+                resync_retries = 0
+                continue
+
+            # LOCAL change (parameter tweak by the remote, or the poller
+            # catching up with an internal switch): nothing to do.
+            if current_active == config_active:
+                last_active = current_active
+                resync_retries = 0
+                continue
+
+            # EXTERNAL change (GUI or another client). Give CamillaDSP time
+            # to finish loading before reading.
+            await asyncio.sleep(0.3)
+            try:
+                new_active = cdsp.config.active() or {}
+            except Exception as e:
+                log.warning("Volume watcher: could not fetch active config (%s)", e)
+                new_active = None
+
+            if is_complete_config(new_active):
+                # Identify the file. The GUI does not call set_file_path, so
+                # file_path() may still point to the PREVIOUS config. First
+                # try the file it still points to (the GUI may have reloaded
+                # the same file); if it does not match, scan the YAML files;
+                # as a last resort, keep current_path.
+                new_path = None
+                if current_path:
+                    try:
+                        same_file = cdsp.config.read_and_parse_file(current_path)
+                    except Exception:
+                        same_file = None
+                    if isinstance(same_file, dict) and same_file == new_active:
+                        new_path = current_path
+                if new_path is None:
+                    new_path = find_config_file(new_active)
+                if new_path is None:
+                    new_path = current_path
+
+                new_key = config_key(new_path) if new_path else None
+                key_changed = new_key != current_config_key
+                old_key, was_external = current_config_key, current_config_external
+
+                # Keep the tone / loudness set on the config we leave (the last
+                # one pushed internally), before config_active is replaced.
+                # save_audio_settings itself skips a config that was already
+                # external.
+                if current_config_key and not current_config_external and key_changed:
+                    try:
+                        save_audio_settings(config_active)
+                        log.info("[CONFIG] External change: %s -> %s (previous config saved)",
+                                 old_key, new_key)
+                    except Exception as e:
+                        log.warning("Volume watcher: could not save the settings (%s)", e)
+                elif key_changed:
+                    log.info("[CONFIG] External change: %s -> %s (%s)", old_key, new_key,
+                             "previous config not saved: it was already external"
+                             if was_external else "same config reloaded")
+
+                # Update local state, mark the config external. No saved values
+                # are restored, the config plays its file values; nothing is
+                # pushed back to CamillaDSP.
+                config_active = new_active
+                current_config_key = new_key
+                current_config_external = True
+
+                # Reset prev_values so ENTER does not restore the values of the
+                # config we just left.
+                load_prev_values(None)
+
+                resync_retries = 0
+                log.debug("External config change detected")
+
+                # A tone / tilt / loudness screen still shows the previous config's values
+                redraw = {"tone": display_tone_info, "tilt": display_tilt_info,
+                          "loudness": display_loudness_info}.get(last_displayed)
+                if redraw and not scroll_active() and not display_is_off:
+                    redraw()
+
+                last_active = current_active
+
+            else:
+                resync_retries += 1
+                if resync_retries <= RESYNC_RETRIES:
+                    # Do not update last_active: retry the same change at the next reading
+                    pass
+                else:
+                    resync_retries = 0
+                    log.warning("Config changed but active config is incomplete; keeping previous")
+                    last_active = current_active
+
+        if current_volume != last_volume or current_mute != last_mute or config_changed:
+            last_volume = current_volume
+            last_mute = current_mute
+            # Redraw only if the volume screen is shown, no volume key is held and
+            # no message is scrolling (the end of the scroll redraws the volume itself)
+            if (last_displayed == "volume" and not is_volume_key_held
+                    and not scroll_active() and not display_is_off):
+                display_volume_info(current_volume, current_mute)
+
+
+# =====================================================================
+#  LMS - Logitech Media Server
+#  The CLI helpers are used by the remote keys and by the TOSLINK monitor too;
+#  the volume bridge itself needs ENABLE_LMS_SYNC.
+# =====================================================================
+
+
+# ---------- LMS CLI helpers ----------
+@functools.lru_cache(maxsize=None)   # read once; a failure (exception) is not cached
+def detect_player_mac():
+    """MAC of the default network interface, raw format (dc:a6:32:3c:1c:21)."""
+    with open("/proc/net/route") as f:
+        next(f)  # header
+        iface = next(
+            (cols[0] for cols in map(str.split, f)
+             if len(cols) >= 8 and cols[1] == cols[7] == "00000000"),
+            None,
+        )
+    if not iface:
+        raise RuntimeError("No default network interface found")
+    with open(f"/sys/class/net/{iface}/address") as f:
+        return f.read().strip().lower()
+
+
+def player_id():
+    """LMS player used everywhere (bridge and CLI commands): the manual value
+    from the SETTINGS block, or the MAC of the default network interface."""
+    return LMS_PLAYER_MANUAL or detect_player_mac()
+
+
+def send_lms_command(command, quiet=False):
+    """Send a command to Logitech Media Server, identifying the player with
+    player_id().
+    Uses its own socket (no shared state), so it is safe to run in a thread.
+    The reply is read until LMS closes the connection (after our "exit").
+    quiet=True: do not log a failure (for commands sent in a loop)."""
+    try:
+        mac = quote(player_id(), safe="")
+
+        with socket.create_connection(LMS_ADDR, timeout=5) as sock:
+            sock.sendall(f"{mac} {command}\r\nexit\r\n".encode("utf-8"))
+            chunks = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks).decode("utf-8").strip()
+
+    except Exception as e:
+        if not quiet:
+            log.error("LMS command failed: %s", e)
+        return None
+
+
+_lms_unreachable = False        # True while LMS does not answer (to log the change of state only)
+
+
+def lms_is_playing() -> bool:
+    """True if LMS is in 'play' mode for this player.
+    Called in a loop by monitor_tv_toslink: it only logs the changes of state
+    (LMS unreachable / reachable again), never every failed request."""
+    global _lms_unreachable
+    response = send_lms_command("mode ?", quiet=True)
+    if not response:
+        if not _lms_unreachable:
+            log.warning("[LMS] unreachable or empty reply, assuming not playing")
+            _lms_unreachable = True
+        return False
+    if _lms_unreachable:
+        log.info("[LMS] reachable again")
+        _lms_unreachable = False
+    parts = unquote(response).split()
+    return bool(parts) and parts[-1] == "play"
+
+
+# ---------- LMS <-> CamillaDSP volume bridge ----------
+# LMS <-> CAMILLADSP VOLUME BRIDGE (asyncio, no thread)
+# Inspired by the original work by mbrennwa, entirely reworked:
+#     https://github.com/mbrennwa/camilla_LMS_volume_sync
+#
+#   - it reads the values published by ONE reader (cdsp_poller) in a VolumeState,
+#     instead of querying CamillaDSP itself;
+#   - the LMS connection uses asyncio streams;
+#   - CamillaDSP readings that started before our last write are ignored
+#     (otherwise a stale reading could undo a change that was just received
+#     from LMS).
+
+bridge_log = logging.getLogger("lms_bridge")
+
 
 class LmsBridge:
     def __init__(self, player, state, set_volume_db, set_mute, lms_addr, *,
@@ -653,47 +1442,144 @@ class LmsBridge:
             await asyncio.sleep(retry_s)
 
 
-# ====================== GLOBAL VARIABLES ======================
+async def lms_bridge_task():
+    """Run the LMS <-> CamillaDSP volume bridge (see LmsBridge above).
+    Only the player detection is retried here (no network interface yet at
+    boot); the bridge restarts itself after any error, and `supervised`
+    restarts this task if it ever crashes."""
+    player = None
+    warned = False
+    while player is None:
+        try:
+            player = player_id()
+        except Exception as e:
+            if not warned:             # one log line, not one every LMS_RETRY_S
+                log.warning("[LMS sync] cannot find the player (%s), retrying every %s s",
+                            e, LMS_RETRY_S)
+                warned = True
+            await asyncio.sleep(LMS_RETRY_S)
 
-key_hold_counter = 0            # Key-repeat events of the key being held (remote_events only).
-                                # A repeat counter on purpose (HOLD_* thresholds are in events), not a clock.
+    bridge = LmsBridge(
+        player, vol_state,
+        set_volume_db=cdsp.volume.set_main_volume,
+        set_mute=cdsp.volume.set_main_mute,
+        lms_addr=LMS_ADDR, debug=LMS_SYNC_DEBUG,
+        restore_window_s=LMS_RESTORE_WINDOW_S,
+        connect_timeout_s=LMS_CONNECT_TIMEOUT_S)
+    await bridge.run_forever(retry_s=LMS_RETRY_S)
+
+
+# =====================================================================
+#  POWER - relay, auto power-off, halt
+#  Needs ENABLE_AUTO_POWEROFF.
+# =====================================================================
+
 auto_power_enabled = True
 is_waiting_for_sound = False
-is_volume_key_held = False      # True from a volume key press until VOLUME_PEEK_S after its release
+
+
+def relay_is_off():
+    """True when the power relay is already off: POWER SAVE done (waiting for
+    sound) or relay forced OFF by the POWER key."""
+    return ENABLE_AUTO_POWEROFF and (is_waiting_for_sound or not auto_power_enabled)
+
+
+def toggle_power():
+    global auto_power_enabled, is_waiting_for_sound
+
+    if not auto_power_enabled or is_waiting_for_sound:
+        # Rearm the automatism, relay ON (trigger active, amps follow sound)
+        auto_power_enabled = True
+        lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
+        log.info("[POWER] Auto mode re-armed, relay ON")
+        scroll_message("POWER AUTO")
+        is_waiting_for_sound = False
+    else:
+        # Disengage the automatism, force the relay OFF (amps off)
+        auto_power_enabled = False
+        lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
+        log.info("[POWER] Relay forced OFF (auto mode disengaged)")
+        scroll_message("POWER OFF")
+
+
+def shutdown_system():
+    """Cut the power relay (if managed) and halt the Raspberry Pi."""
+    if ENABLE_AUTO_POWEROFF:
+        lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
+    cancel_scroll()                 # nothing may overwrite the HALT message
+    show(" HALT ")
+    os.system("sudo poweroff")
+
+
+async def auto_poweroff():
+    """Switch the power relay off after POWER_OFF_DELAY minutes without sound and
+    without key press, back on when sound returns, and halt the Raspberry Pi
+    after HALT_DELAY hours of (audio) silence."""
+    global is_waiting_for_sound
+    power_off_done = False          # the relay cut has already been handled for this quiet period
+    seen_activity = last_activity   # to notice a key press and re-arm the cut
+
+    while True:
+        await asyncio.sleep(1)
+
+        # A key press restarts the countdown, so the cut can happen again
+        if last_activity != seen_activity:
+            seen_activity = last_activity
+            power_off_done = False
+
+        if silent_now:
+            if (quiet_age() >= POWER_OFF_DELAY * 60
+                    and not power_off_done and not is_waiting_for_sound):
+                power_off_done = True
+                if auto_power_enabled:
+                    lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
+                    scroll_message("POWER SAVE")
+                    is_waiting_for_sound = True  # Wait for sound or POWER key to switch back on
+                    # Let the message finish (no fixed delay to keep in sync with it).
+                    # If a key cancelled it, the user is there: do not blank.
+                    finished = await wait_scroll()
+                    if finished and silent_now and is_waiting_for_sound:
+                        blank_display()
+                # else: relay already forced off, nothing to cut. The display is
+                # blanked by display_manager_loop (normal delay, then WAKE_DISPLAY_DELAY after a key press)
+
+            # The Pi halt only depends on audio silence, not on key presses
+            if silence_age() >= HALT_DELAY * 3600:
+                shutdown_system()
+                break
+
+        else:
+            power_off_done = False
+            if (auto_power_enabled and is_waiting_for_sound
+                    and lgpio.gpio_read(h, POWER_GPIO) == 0):
+                lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
+                if not scroll_active():          # a running message redraws the volume itself
+                    display_volume_info()
+                is_waiting_for_sound = False
+            elif not auto_power_enabled and lgpio.gpio_read(h, POWER_GPIO) == 1:
+                lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
+
+# =====================================================================
+#  DISPLAY - TM1637 and ambient light sensor
+#  Needs ENABLE_DISPLAY.
+# =====================================================================
+
+
+# ---------- Display driver ----------
 last_displayed = None           # "volume", "tone", "tilt", "loudness", or "message" (a scrolling message is
                                 # running or has just ended: the volume screen is redrawn right after it)
 blank_volume_when_mute = False
-enter_display_at_press = None   # Screen shown when ENTER was pressed (to tell short/long press apart)
-
-toslink_auto_enabled = True     # TOSLINK automatism active (toggled by a long HOMEPAGE press)
-toslink_ready = False           # True once monitor_tv_toslink has found its "_*" and "|*" config files
-
-prev_values = {}                # ENTER-key restore values: keys of GAIN_KEYS + "loudness_ref" (loaded from the config's saved entry)
-                                # (filled by load_prev_values)
-current_config_key = None       # Settings key of the active config file
-
-adc_buffer = b""                # Incomplete serial data waiting for its newline
-
-silent_now = False              # True when CamillaDSP reports silence (updated once per second by silence_monitor)
-silent_since = None             # time.monotonic() at which the current silence began (None while there is sound)
-last_activity = time.monotonic()  # time.monotonic() of the last remote key event (touch_activity)
-                                # Single source of truth for every "inactivity" delay: relay cut,
-                                # display blanking and return to the volume screen.
-
 display_is_off = False          # True when the display has been blanked
 
-vol_state = VolumeState()       # Last volume / mute / title / config path read from CamillaDSP (published by cdsp_poller)
-
-_scroll_task = None             # Current scrolling task (a new one cancels the previous)
-
-
-# ====================== HELPERS ======================
 
 class NullDisplay:
     """Stand-in for the TM1637 when ENABLE_DISPLAY is False: accepts every call
     and shows nothing, so the rest of the code does not have to care."""
     def encode_string(self, text):
         return bytearray(len(text))
+
+    def encode_char(self, char):
+        return 0
 
     def write(self, segs):
         pass
@@ -712,9 +1598,28 @@ def swap(segs):
     return segs
 
 
+# Extra segments for characters encode_char rejects but we want to display:
+# _ (underscore) = segment D only, | (bar) = segments B + C.
+_EXTRA_SEGMENTS = {
+    '_': 0x08,
+    '|': 0x06,
+}
+
+
+def encode_string_extended(tm_obj, s):
+    """Like tm.encode_string, but maps _ and | to their segments."""
+    segs = bytearray(len(s))
+    for i, c in enumerate(s):
+        if c in _EXTRA_SEGMENTS:
+            segs[i] = _EXTRA_SEGMENTS[c]
+        else:
+            segs[i] = tm_obj.encode_char(c)
+    return segs
+
+
 def show(text):
     """Write a 6-character text on the display."""
-    tm.write(swap(tm.encode_string(text)))
+    tm.write(swap(encode_string_extended(tm, text)))
 
 
 def clear_display():
@@ -730,62 +1635,9 @@ def blank_display():
     display_is_off = True
 
 
-def _prefix_of(path):
-    """Series of a config: '|' if the file name starts with '|', '_' otherwise."""
-    return '|' if os.path.basename(path or "").startswith('|') else '_'
+# ---------- Scrolling messages ----------
+_scroll_task = None             # Current scrolling task (a new one cancels the previous)
 
-
-def toslink_active():
-    """True when the TOSLINK automatism can run: the feature is enabled AND
-    monitor_tv_toslink found its config files. Otherwise BACK / HOMEPAGE behave
-    as with ENABLE_TOSLINK_SWITCH = False."""
-    return ENABLE_TOSLINK_SWITCH and toslink_ready
-
-
-def blink_on():
-    """1 Hz blink phase shared by all blinking dots. Derived from the clock at
-    draw time: no state to keep in sync, and every dot blinks in phase."""
-    return int(time.monotonic()) % 2 == 0
-
-
-# ---------- activity / silence clocks ----------
-# All inactivity delays are computed from timestamps, never from counters
-# incremented by a loop tick: the loops do not run at an exact rate, and a counter
-# reset from another task is easy to forget.
-
-def touch_activity():
-    """A remote key event restarts every inactivity delay."""
-    global last_activity
-    last_activity = time.monotonic()
-
-
-def idle_age():
-    """Seconds since the last remote key event."""
-    return time.monotonic() - last_activity
-
-
-def silence_age():
-    """Seconds of continuous audio silence (0 while there is sound)."""
-    if not silent_now or silent_since is None:
-        return 0.0
-    return time.monotonic() - silent_since
-
-
-def quiet_age():
-    """Seconds of silence AND without key press: common base of the relay cut
-    and of the display blanking (0 while there is sound)."""
-    if not silent_now:
-        return 0.0
-    return min(silence_age(), idle_age())
-
-
-def relay_is_off():
-    """True when the power relay is already off: POWER SAVE done (waiting for
-    sound) or relay forced OFF by the POWER key."""
-    return ENABLE_AUTO_POWEROFF and (is_waiting_for_sound or not auto_power_enabled)
-
-
-# ---------- scrolling messages ----------
 
 def scroll_active():
     """True while a scrolling message is running. Every automatic redraw of the
@@ -873,326 +1725,85 @@ def scroll_frames(frames, frame_delay=1.2, end_pause=0.6):
     _start_scroll(_scroll_frames_coro(frames, frame_delay, end_pause))
 
 
-def is_silent():
-    """Silence detection: RMS threshold, then crest factor (peak vs RMS).
-    A steady noise floor has peak ≈ RMS; real audio does not."""
-    rms = cdsp.levels.capture_rms()
-    peak = cdsp.levels.capture_peak()
-    rms_vals = list(rms.values()) if isinstance(rms, dict) else list(rms)
-    peak_vals = list(peak.values()) if isinstance(peak, dict) else list(peak)
-    if not rms_vals or not peak_vals:
-        return True
-
-    rms_db = max(float(v) for v in rms_vals)
-    if rms_db <= SILENCE_RMS_DB:                    # below threshold: silence
-        return True
-
-    peak_db = max(float(v) for v in peak_vals)
-    return (peak_db - rms_db) < CREST_MIN_DB        # steady noise: silence
+async def return_to_volume_later(delay=0):
+    """Go back to the volume screen after a scrolling message, unless another
+    screen has been shown in the meantime (a key was pressed), another message
+    has started, or the display has been blanked."""
+    await asyncio.sleep(delay)
+    if last_displayed == "message" and not display_is_off and not scroll_active():
+        display_volume_info()
 
 
-def shutdown_system():
-    """Cut the power relay (if managed) and halt the Raspberry Pi."""
-    if ENABLE_AUTO_POWEROFF:
-        lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
-    cancel_scroll()                 # nothing may overwrite the HALT message
-    show(" HALT ")
-    os.system("sudo poweroff")
+# ---------- Screens ----------
+def blink_on():
+    """1 Hz blink phase shared by all blinking dots. Derived from the clock at
+    draw time: no state to keep in sync, and every dot blinks in phase."""
+    return int(time.monotonic()) % 2 == 0
 
-
-def adc_to_brightness(adc_value):
-    """Convert an ADC reading to a display brightness, with hysteresis."""
-    global last_level
-
-    for i, threshold in enumerate(ADC_LEVELS):
-        if adc_value < threshold:
-            target_level = i
-            break
-    else:
-        target_level = len(BRIGHTNESS_LEVELS) - 1
-
-    if target_level > last_level and adc_value > ADC_LEVELS[last_level] * (1 + HYSTERESIS_RATIO):
-        last_level = target_level
-    elif target_level < last_level and adc_value < ADC_LEVELS[target_level] * (1 - HYSTERESIS_RATIO):
-        last_level = target_level
-
-    return BRIGHTNESS_LEVELS[last_level]
-
-
-@functools.lru_cache(maxsize=None)   # read once; a failure (exception) is not cached
-def detect_player_mac():
-    """MAC of the default network interface, raw format (dc:a6:32:3c:1c:21)."""
-    with open("/proc/net/route") as f:
-        next(f)  # header
-        iface = next(
-            (cols[0] for cols in map(str.split, f)
-             if len(cols) >= 8 and cols[1] == cols[7] == "00000000"),
-            None,
-        )
-    if not iface:
-        raise RuntimeError("No default network interface found")
-    with open(f"/sys/class/net/{iface}/address") as f:
-        return f.read().strip().lower()
-
-
-def player_id():
-    """LMS player used everywhere (bridge and CLI commands): the manual value
-    from the SETTINGS block, or the MAC of the default network interface."""
-    return LMS_PLAYER_MANUAL or detect_player_mac()
-
-
-def get_config_display_label():
-    """Return the 3-character label shown on the display for the active config.
-    Prefer the config `title` field; fall back to the config file name.
-    Config file prefixes ("_" and "|") are stripped in both cases."""
-    title = cdsp.config.title()
-    label = title.strip().replace("_", "").replace("|", "") if title else "---"
-    return label[:3].ljust(3)
-
-
-# ====================== INITIALISATION ======================
-
-# Ambient light sensor: initial brightness level
-ser = None
-adc_value_init = 1500   # fallback if the sensor is absent (or the display is disabled)
-if ENABLE_DISPLAY:
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    try:
-        adc_value_init = int(ser.readline().decode().strip())
-    except ValueError:
-        pass
-    ser.timeout = 0   # non-blocking reads from here on
-
-last_level = next(
-    (i for i, t in enumerate(ADC_LEVELS) if adc_value_init < t),
-    len(BRIGHTNESS_LEVELS) - 1,
-)
-
-
-def find_remote():
-    """Return the remote input device (grabbed), or None if it is not available."""
-    for path in evdev.list_devices():
-        try:
-            device = evdev.InputDevice(path)
-        except OSError:                 # device vanished between list and open
-            continue
-        if device.name != REMOTE_NAME:
-            device.close()
-            continue
-        try:
-            # Exclusive access: the kernel stops delivering this device's events
-            # to anyone else (logind no longer sees the remote's KEY_POWER)
-            device.grab()
-        except OSError as e:            # EBUSY: another process holds it / ENODEV: gone
-            log.warning("Cannot grab '%s' (%s), will retry", REMOTE_NAME, e)
-            device.close()
-            continue
-        log.info("'%s' found at %s.", REMOTE_NAME, path)
-        return device
-    return None
-
-
-# CamillaDSP — always needed: the "at least one feature" check in the
-# FEATURES block guarantees that at least one option requires it.
-cdsp = CamillaClient(*CAMILLA_ADDR)
-config_active = {}
-# Wait for CamillaDSP instead of crashing if it is not up yet.
-# bootlocal.sh launches us in the background, so this loop never
-# blocks the boot. It exits as soon as CamillaDSP answers.
-while True:
-    try:
-        cdsp.connect()
-        cdsp.general.reload()
-        break
-    except Exception as e:
-        log.warning("CamillaDSP not reachable (%s), waiting %g s",
-                    e, CDSP_RECONNECT_DELAY_S)
-        time.sleep(CDSP_RECONNECT_DELAY_S)
-# Protection 1: never let config_active be None at startup
-config_active = cdsp.config.active() or {}
-
-
-# GPIO
-h = None
-if USE_GPIO:
-    h = lgpio.gpiochip_open(0)
-    lgpio.gpio_claim_output(h, POWER_GPIO, 0)   # Initial level LOW: no LOW -> HIGH glitch on the relay
-    time.sleep(1)                   # Keep the relay off so the A70 can re-arm
-    lgpio.gpio_write(h, POWER_GPIO, 1)
-
-# TM1637 display
-tm = TM1637(clk=CLK, dio=DIO) if ENABLE_DISPLAY else NullDisplay()
-clear_display()
-tm.brightness(BRIGHTNESS_LEVELS[last_level])
-
-
-# ====================== FILTER / SETTINGS ACCESS ======================
-
-def apply_filter_param(filters, filt, param, value):
-    """Set a CamillaDSP filter parameter, silently ignoring filters that are
-    missing from the active config (configs need not define every filter)."""
-    f = filters.get(filt)
-    if not isinstance(f, dict):
-        return
-    params = f.get("parameters")
-    if not isinstance(params, dict):
-        return
-    params[param] = value
-
-
-def active_filter_names(config):
-    """Names of the filters really used by the pipeline. A filter defined in
-    `filters:` but not listed in an (enabled) Filter step has no effect on the sound."""
-    names = set()
-    for step in config.get("pipeline") or []:
-        if isinstance(step, dict) and step.get("type") == "Filter" and not step.get("bypassed"):
-            step_names = step.get("names")
-            if isinstance(step_names, list):
-                names.update(n for n in step_names if isinstance(n, str))
-    return names
-
-
-def get_filter_params(config, filt):
-    """Return the 'parameters' dict of a filter, or None if the filter is missing
-    from the config or not used by its pipeline."""
-    if filt not in active_filter_names(config):
-        return None
-    f = (config.get("filters") or {}).get(filt)
-    params = f.get("parameters") if isinstance(f, dict) else None
-    return params if isinstance(params, dict) else None
-
-
-def get_filter_param(config, filt, param):
-    """Return a filter parameter, or None if the filter/parameter is missing."""
-    params = get_filter_params(config, filt)
-    return params.get(param) if params is not None else None
-
-
-def config_key(path):
-    """Settings key of a config file: its name without directory or extension."""
-    return os.path.splitext(os.path.basename(path))[0]
-
-
-def get_tone(config):
-    """Current tone values of a config (only for filters that really exist)."""
-    tone = {}
-    for key, (filt, param) in TONE_PARAMS.items():
-        value = get_filter_param(config, filt, param)
-        if value is not None:
-            tone[key] = value
-    return tone
-
-
-def apply_tone(filters, tone):
-    """Apply a saved tone dict to the filters of a config."""
-    for key, (filt, param) in TONE_PARAMS.items():
-        if key in tone:
-            apply_filter_param(filters, filt, param, tone[key])
-
-
-def load_settings():
-    try:
-        with open(SETTINGS_PATH) as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    configs = data.get("configs")
-    last_config = data.get("last_config")
-    return {
-        "configs": configs if isinstance(configs, dict) else {},
-        "last_config": last_config if isinstance(last_config, dict) else {},
-        "last_tone_tilt": data.get("last_tone_tilt", "tone"),
-    }
-
-
-def write_settings():
-    """Write settings.json atomically (no half-written file on power loss)."""
-    tmp_path = SETTINGS_PATH + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(settings, f, indent=4, ensure_ascii=False)
-    os.replace(tmp_path, SETTINGS_PATH)
-
-
-def save_audio_settings(config):
-    """Store the tone and the loudness of the active config, then write
-    settings.json. Always per config: how the values are shared between
-    configs is decided by SAVE_MODE in change_config, which copies them into
-    the new config at switch time."""
-    if not TONE_ACTIVE:
-        return
-    if current_config_key:
-        entry = get_tone(config)
-        entry["prev"] = {key: prev_values[key] for key in TONE_PARAMS}
-        ref = get_filter_param(config, *LOUDNESS_FILTER)
-        if ref is not None:
-            entry["loudness_ref"] = ref
-            entry["prev"]["loudness_ref"] = prev_values["loudness_ref"]
-        settings["configs"][current_config_key] = entry
-    settings["last_tone_tilt"] = last_tone_tilt
-    write_settings()
-
-
-def load_prev_values(saved=None):
-    """Load the ENTER-key restore values (the four gains and the loudness) from
-    the saved entry of a config (defaults if none)."""
-    saved_prev = saved.get("prev") if saved else None
-    if not isinstance(saved_prev, dict):
-        saved_prev = {}
-    for key in TONE_PARAMS:
-        prev_values[key] = saved_prev.get(key, 0)
-    prev_values["loudness_ref"] = saved_prev.get("loudness_ref", DEFAULT_LOUDNESS_REF)
-
-
-def apply_saved_values(filters, saved):
-    """Apply the saved tone and the saved loudness of a config to a `filters`
-    dict (filters missing from the config are ignored). Which values are in
-    `saved` is decided by SAVE_MODE in change_config, which may copy another
-    config's values into it before this call."""
-    if saved:
-        apply_tone(filters, saved)
-        if "loudness_ref" in saved:
-            apply_filter_param(filters, *LOUDNESS_FILTER, saved["loudness_ref"])
-
-
-def is_complete_config(cfg):
-    """True si cfg a la section obligatoire 'devices' non vide.
-    CamillaDSP rejette toute config sans 'devices'."""
-    return (isinstance(cfg, dict)
-            and isinstance(cfg.get("devices"), dict)
-            and bool(cfg["devices"]))
-
-def init_tone():
-    """Apply the saved tone and loudness of the config CamillaDSP started with.
-    The config is pushed to CamillaDSP even when nothing is saved: on this setup
-    that push is what makes CamillaDSP start processing at boot (and the players
-    that depend on it only start after that)."""
-    global current_config_key
-    path = cdsp.config.file_path()
-    if not path:
-        return
-    current_config_key = config_key(path)
-    saved = settings["configs"].get(current_config_key)
-    load_prev_values(saved)
-    if is_complete_config(config_active):
-        filters = config_active.get("filters")
-        apply_saved_values(filters if isinstance(filters, dict) else {}, saved)
-        cdsp.config.set_active(config_active)
-
-
-settings = load_settings()
-last_tone_tilt = settings["last_tone_tilt"]
-load_prev_values()
-if TONE_ACTIVE:
-    init_tone()
-
-
-# ====================== DISPLAY ======================
 
 def fmt_gain(value):
     """2-character value for the display; '--' if the filter is absent."""
     return "--" if value is None else f"{round(value):2}"
+
+
+def fmt_loudness(value):
+    """Format the loudness reference level for the display:
+    '---' if the filter is absent, ' No' if loudness is off (-100), otherwise
+    the rounded value right-aligned on 3 characters."""
+    if value is None:
+        return "---"
+    if round(value) == -100:
+        return " No"
+    return f"{round(value):3}"
+
+
+def tilt_step(value):
+    """Convert the tilt gain (dB) to its displayed step (TILT_DB_STEP per step),
+    or None if the filter is absent. Propagating None (instead of returning 0)
+    is what lets fmt_gain render '--' for an absent tilt."""
+    return None if value is None else round(value / TILT_DB_STEP)
+
+
+def _strip_accents(s):
+    """Convert accented characters to their base letters (é -> e, à -> a, ...)."""
+    return "".join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+    )
+
+
+def _tm1637_char_ok(c):
+    """True if the character can be displayed: 0-9, A-Z, a-z, space, dash,
+    star, and _ and | (mapped to their own segments in encode_string_extended).
+    Everything else is filtered out before encoding, to avoid a ValueError."""
+    o = ord(c)
+    return (o == 32 or o == 42 or o == 45
+            or 48 <= o <= 57 or 65 <= o <= 90 or 97 <= o <= 122
+            or c == '_' or c == '|')
+
+
+def _filter_display_label(s):
+    """Remove every character that cannot be displayed (_ and | are kept)."""
+    return "".join(c for c in s if _tm1637_char_ok(c))
+
+
+def get_config_display_label():
+    """Return the 3-character label shown on the display for the active config.
+    - If the active config has a title: use it as-is (accents converted,
+      unprintable characters filtered, _ and | kept and mapped to segments).
+    - Otherwise: use the file name (extension removed, _ and | kept, then
+      the same conversions and filtering)."""
+    title = cdsp.config.title()
+    if title:
+        label = title.strip()
+    else:
+        path = cdsp.config.file_path()
+        label = os.path.splitext(os.path.basename(path))[0] if path else "---"
+    label = _strip_accents(label)
+    label = _filter_display_label(label)
+    if not label:
+        label = "---"
+    return label[:3].ljust(3)
 
 
 def display_volume_info(current_volume=None, is_muted=None):
@@ -1218,14 +1829,22 @@ def display_volume_info(current_volume=None, is_muted=None):
         shown = "HI" if pct >= 100 else f"{pct:02}"
         blank_volume_when_mute, volume_str = False, f"{config_path} {shown}"
 
-    segs = tm.encode_string(volume_str)
+    segs = encode_string_extended(tm, volume_str)
 
-    if any(get_filter_param(config_active, f, "gain") for f in GAIN_KEYS.values()):
+    # Read all five parameters in a single pipeline traversal (was 5 separate
+    # calls to get_filter_param, each of which re-scanned the pipeline).
+    p = get_all_tone_params(config_active)
+    if any(p[k] for k in ("bass", "treble", "tilt", "presence")):
         segs[3] |= 0x01    # top horizontal segment (A) on the 4th character: tone settings active
 
-    loud = get_filter_param(config_active, "Loudness", "reference_level")
-    if loud is not None and round(loud) != -100:
+    if p["loudness"] is not None and round(p["loudness"]) != -100:
         segs[3] |= 0x08    # bottom horizontal segment (D) on the 4th character: loudness active
+
+    # 4th character middle horizontal segment (G, 0x40), blinking: the active
+    # config was chosen OUTSIDE this script (CamillaDSP GUI). It plays its file
+    # values, and what is set on it with the remote is temporary: it is not saved.
+    if current_config_external and blink_on():
+        segs[3] |= 0x40
 
     # 3rd character dot: CONF MANUAL blink (only when auto OFF)
     if ENABLE_TOSLINK_SWITCH and not toslink_auto_enabled and blink_on():
@@ -1246,58 +1865,34 @@ def display_volume_info(current_volume=None, is_muted=None):
 
 def display_tone_info():
     global last_displayed
-    bass_gain = get_filter_param(config_active, "Bass", "gain")
-    treble_gain = get_filter_param(config_active, "Treble", "gain")
-    show(f"{fmt_gain(bass_gain)}B{fmt_gain(treble_gain)}T")
+    p = get_all_tone_params(config_active)
+    show(f"{fmt_gain(p['bass'])}B{fmt_gain(p['treble'])}T")
     last_displayed = "tone"
 
 
 def display_loudness_info():
     global last_displayed
-    loudness_ref = get_filter_param(config_active, "Loudness", "reference_level")
-    if loudness_ref is None:
-        value_str = "---"        # no Loudness filter in this config
-    elif round(loudness_ref) == -100:
-        value_str = " No"        # loudness switched off (-100)
-    else:
-        value_str = f"{round(loudness_ref)}"
-    show(f"{value_str:>3} Ld")      # right-aligned on 3 characters: always 6 in total
+    p = get_all_tone_params(config_active)
+    show(f"{fmt_loudness(p['loudness'])} Ld")
     last_displayed = "loudness"
 
 
 def display_tilt_info():
     global last_displayed
-    tilt_gain = get_filter_param(config_active, "Tilt", "gain")
-    presence_gain = get_filter_param(config_active, "Presence", "gain")
-    # displayed in steps, actual gain = step * TILT_DB_STEP dB
-    tilt_step = None if tilt_gain is None else round(tilt_gain / TILT_DB_STEP)
-    show(f"{fmt_gain(tilt_step)}T{fmt_gain(presence_gain)}P")
+    p = get_all_tone_params(config_active)
+    show(f"{fmt_gain(tilt_step(p['tilt']))}T{fmt_gain(p['presence'])}P")
     last_displayed = "tilt"
 
 
 def tone_summary_frames():
     """Return the 6-char frames for the tone, tilt and loudness screens,
     built exactly like display_tone_info(), display_tilt_info() and
-    display_loudness_info() do."""
-    bass = get_filter_param(config_active, "Bass", "gain")
-    treble = get_filter_param(config_active, "Treble", "gain")
-    tilt = get_filter_param(config_active, "Tilt", "gain")
-    presence = get_filter_param(config_active, "Presence", "gain")
-    loud = get_filter_param(config_active, "Loudness", "reference_level")
-
-    tilt_step = None if tilt is None else round(tilt / TILT_DB_STEP)
-
-    if loud is None:
-        loud_str = "---"
-    elif round(loud) == -100:
-        loud_str = " No"
-    else:
-        loud_str = f"{round(loud)}"
-
+    display_loudness_info() do (same helpers, same rendering)."""
+    p = get_all_tone_params(config_active)
     return [
-        f"{fmt_gain(bass)}B{fmt_gain(treble)}T",
-        f"{fmt_gain(tilt_step)}T{fmt_gain(presence)}P",
-        f"{loud_str:>3} Ld",
+        f"{fmt_gain(p['bass'])}B{fmt_gain(p['treble'])}T",
+        f"{fmt_gain(tilt_step(p['tilt']))}T{fmt_gain(p['presence'])}P",
+        f"{fmt_loudness(p['loudness'])} Ld",
     ]
 
 
@@ -1307,488 +1902,38 @@ def show_tone_summary():
     scroll_frames(tone_summary_frames(), frame_delay=1.2, end_pause=0)
 
 
-# ====================== REMOTE KEY ACTIONS ======================
-
-def change_volume_from_key(key, current_volume, volume_step=1):
-    """Move one step on the 0..100 scale (LMS / Squeezelite curve).
-    `current_volume` is the CamillaDSP main volume in dB."""
-    pct = db_to_pct(current_volume)
-    delta = -volume_step if key == KEY_BINDINGS['VOLUMEDOWN'] else volume_step
-    new_pct = clamp(pct + delta, 0, 100)
-
-    if new_pct != pct:
-        new_volume = pct_to_db(new_pct)
-        cdsp.volume.set_main_volume(new_volume)
-        display_volume_info(new_volume)
+# ---------- Brightness (ambient light sensor) ----------
+adc_buffer = b""                # Incomplete serial data waiting for its newline
 
 
-_volume_release_task = None     # Pending "end of the volume key" task (see schedule_volume_release)
+def adc_to_brightness(adc_value):
+    """Convert an ADC reading to a display brightness, with hysteresis."""
+    global last_level
 
-
-def cancel_volume_release():
-    """Cancel the pending end-of-volume-key task, if any (a volume key was pressed again)."""
-    global _volume_release_task
-    task, _volume_release_task = _volume_release_task, None
-    if task is not None and not task.done():
-        task.cancel()
-
-
-async def _volume_release_coro():
-    """VOLUME_PEEK_S after the release: the volume key is no longer "held", the
-    volume screen is redrawn (a muted state shows "--" again)."""
-    global is_volume_key_held
-    await asyncio.sleep(VOLUME_PEEK_S)
-    is_volume_key_held = False
-    if last_displayed == "volume" and not display_is_off and not scroll_active():
-        display_volume_info()
-
-
-def schedule_volume_release():
-    """Called when a volume key is released."""
-    global _volume_release_task
-    cancel_volume_release()
-    _volume_release_task = asyncio.create_task(_volume_release_coro())
-
-
-def handle_arrow_keys(key):
-    """Adjust the parameters of the screen currently displayed."""
-    up, down = KEY_BINDINGS['UP'], KEY_BINDINGS['DOWN']
-
-    if last_displayed == "loudness":
-        loudness_params = get_filter_params(config_active, "Loudness")
-        if loudness_params is not None and key in (up, down):   # LEFT / RIGHT do nothing here
-            ref_level = loudness_params.get('reference_level', 0) + (LOUDNESS_STEP if key == up else -LOUDNESS_STEP)
-            loudness_params['reference_level'] = clamp(ref_level, LOUDNESS_MIN, LOUDNESS_MAX)
-            cdsp.config.set_active(config_active)
-            display_loudness_info()
-
-    elif last_displayed in ARROW_ADJUST:
-        filt, step, limit = ARROW_ADJUST[last_displayed][key]
-        params = get_filter_params(config_active, filt)
-        if params is not None:      # filter absent from this config: the key does nothing
-            params['gain'] = clamp(params.get('gain', 0) + step, -limit, limit)
-            cdsp.config.set_active(config_active)
-            (display_tilt_info if last_displayed == "tilt" else display_tone_info)()
-
+    for i, threshold in enumerate(ADC_LEVELS):
+        if adc_value < threshold:
+            target_level = i
+            break
     else:
-        if last_tone_tilt == "tilt":
-            display_tilt_info()
-        else:
-            display_tone_info()
+        target_level = len(BRIGHTNESS_LEVELS) - 1
 
+    if target_level > last_level and adc_value > ADC_LEVELS[last_level] * (1 + HYSTERESIS_RATIO):
+        last_level = target_level
+    elif target_level < last_level and adc_value < ADC_LEVELS[target_level] * (1 - HYSTERESIS_RATIO):
+        last_level = target_level
 
-def handle_enter_press(screen):
-    """Short ENTER press.
-    - tone / tilt screen: bass, treble, tilt and presence are ALL set to 0,
-      or ALL restored to their previous values if they are already all at 0.
-    - loudness screen: loudness is switched off (-100) or restored."""
-    if screen in ("tone", "tilt"):
-        params = {key: get_filter_params(config_active, filt) for key, filt in GAIN_KEYS.items()}
-        existing = {key: p for key, p in params.items() if p is not None}
-        if not existing:
-            return
-
-        if all(p.get('gain', 0) == 0 for p in existing.values()):
-            # Everything is at 0: restore the previous values
-            for key, p in existing.items():
-                p['gain'] = prev_values[key]
-            prev_values.update(dict.fromkeys(GAIN_KEYS, 0))
-        else:
-            # Remember the current values, then set everything to 0
-            for key, p in params.items():
-                prev_values[key] = p.get('gain', 0) if p is not None else 0
-            for p in existing.values():
-                p['gain'] = 0
-
-        cdsp.config.set_active(config_active)
-        if screen == "tone":
-            display_tone_info()
-        else:
-            display_tilt_info()
-
-    elif screen == "loudness":
-        loudness_params = get_filter_params(config_active, "Loudness")
-        if loudness_params is not None:
-            if loudness_params.get('reference_level') == -100:      # -100 = loudness off
-                loudness_params['reference_level'] = prev_values["loudness_ref"]
-                prev_values["loudness_ref"] = -100
-            else:
-                prev_values["loudness_ref"] = loudness_params.get('reference_level', DEFAULT_LOUDNESS_REF)
-                loudness_params['reference_level'] = -100
-            cdsp.config.set_active(config_active)
-            display_loudness_info()
-
-
-def send_lms_command(command, quiet=False):
-    """Send a command to Logitech Media Server, identifying the player with
-    player_id().
-    Uses its own socket (no shared state), so it is safe to run in a thread.
-    The reply is read until LMS closes the connection (after our "exit").
-    quiet=True: do not log a failure (for commands sent in a loop)."""
-    try:
-        mac = quote(player_id(), safe="")
-
-        with socket.create_connection(LMS_ADDR, timeout=5) as sock:
-            sock.sendall(f"{mac} {command}\r\nexit\r\n".encode("utf-8"))
-            chunks = []
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            return b"".join(chunks).decode("utf-8").strip()
-
-    except Exception as e:
-        if not quiet:
-            log.error("LMS command failed: %s", e)
-        return None
-
-
-_lms_unreachable = False        # True while LMS does not answer (to log the change of state only)
-
-
-def lms_is_playing() -> bool:
-    """True if LMS is in 'play' mode for this player.
-    Called in a loop by monitor_tv_toslink: it only logs the changes of state
-    (LMS unreachable / reachable again), never every failed request."""
-    global _lms_unreachable
-    response = send_lms_command("mode ?", quiet=True)
-    if not response:
-        if not _lms_unreachable:
-            log.warning("[LMS] unreachable or empty reply, assuming not playing")
-            _lms_unreachable = True
-        return False
-    if _lms_unreachable:
-        log.info("[LMS] reachable again")
-        _lms_unreachable = False
-    parts = unquote(response).split()
-    return bool(parts) and parts[-1] == "play"
-
-# ========================== REMOTE =============================
-
-
-async def remote_watcher():
-    """Wait for the remote, serve it until it disconnects, then start over."""
-    while True:
-        device = find_remote()
-        if device is None:
-            await asyncio.sleep(1)
-            continue
-        try:
-            await remote_events(device)     # returns when the remote disconnects
-        finally:
-            device.close()                  # also releases the grab
-        log.info("Remote disconnected, waiting for it to come back...")
-
-
-# ====================== DSP CONFIGURATION ======================
-
-async def change_config(cdsp, config_pattern, cycle=True):
-    """Switch config within the group of files matching the pattern.
-    cycle=True : go to the next file of the group if the active config belongs to it.
-    Otherwise (or if cycle=False): go to the last config used in this group.
-    How the tone and the loudness are shared between configs is decided by
-    SAVE_MODE (see the SETTINGS block). The values are always saved per config;
-    SAVE_MODE only controls what is copied into the new config before it is applied.
-    The new config is published into vol_state (title, path and the parsed config)
-    so that the other tasks notice the change.
-    Returns the title of the new config if a switch was performed, None otherwise."""
-    global config_active, current_config_key
-
-    group = os.path.basename(config_pattern)[:1]
-    config_files = sorted(glob.glob(config_pattern))
-    if not config_files:
-        return None
-    current_config = cdsp.config.file_path()
-    if cycle and current_config in config_files:
-        index = config_files.index(current_config)
-        new_config_path = config_files[(index + 1) % len(config_files)]
-    else:
-        last_key = settings["last_config"].get(group)
-        new_config_path = next(
-            (p for p in config_files if config_key(p) == last_key),
-            config_files[0],
-        )
-    if new_config_path == current_config:
-        return None
-
-    # Remember the tone and loudness of the config we are leaving (and write them to disk)
-    save_audio_settings(config_active)
-
-    # The config we leave is, by definition, the last one used in its group: remember
-    # it now, so that coming back to this group (TV on/off, BACK / HOMEPAGE) lands on
-    # it and finds its latest values - even when it is the config the script started with.
-    if current_config:
-        settings["last_config"][_prefix_of(current_config)] = config_key(current_config)
-
-    # Protection 3: abort if the new config cannot be read or does not parse to a dict
-    try:
-        new_config_data = cdsp.config.read_and_parse_file(new_config_path)
-    except Exception as e:
-        log.error("Cannot read %s: %s", new_config_path, e)
-        return None
-    if not isinstance(new_config_data, dict):
-        log.error("Config %s is invalid, aborting switch", new_config_path)
-        return None
-
-    filters = new_config_data.get('filters')
-    if not isinstance(filters, dict):
-        filters = {}
-        new_config_data['filters'] = filters
-
-    new_key = config_key(new_config_path)
-    new_series = _prefix_of(new_config_path)
-
-    # SAVE_MODE: depending on the mode and on whether the new config is in the same
-    # group as the one we are leaving, copy the values saved for the config we are
-    # leaving into settings["configs"][new_key] BEFORE applying, so that
-    # apply_saved_values below picks the copy up.
-    #   all_config       : never copy, B keeps its own values.
-    #   all_group        : same group -> copy tone + loudness.
-    #   half             : same group -> copy the loudness only (the tone stays per config).
-    #   same_everywhere  : always copy tone + loudness, whatever the group.
-    if SAVE_MODE != "all_config":
-        same_group = (new_series == _prefix_of(current_config))
-        old_entry = settings["configs"].get(current_config_key)
-        if isinstance(old_entry, dict):
-            if SAVE_MODE == "all_group" and same_group:
-                settings["configs"][new_key] = dict(old_entry)
-                write_settings()
-            elif SAVE_MODE == "half" and same_group:
-                entry_b = settings["configs"].get(new_key)
-                if not isinstance(entry_b, dict):
-                    entry_b = {}
-                if "loudness_ref" in old_entry:
-                    entry_b["loudness_ref"] = old_entry["loudness_ref"]
-                if isinstance(old_entry.get("prev"), dict):
-                    entry_b.setdefault("prev", {})["loudness_ref"] = (
-                        old_entry["prev"].get("loudness_ref", DEFAULT_LOUDNESS_REF))
-                settings["configs"][new_key] = entry_b
-                write_settings()
-            elif SAVE_MODE == "same_everywhere":
-                settings["configs"][new_key] = dict(old_entry)
-                write_settings()
-
-    # Saved values for this config (possibly overwritten by the copy above);
-    # if none, the values from the .yml are kept
-    saved = settings["configs"].get(new_key)
-    apply_saved_values(filters, saved)
-
-    # Make relative filter file names absolute
-    config_dir = os.path.dirname(os.path.abspath(new_config_path))
-    for f in filters.values():
-        params = f.get("parameters") if isinstance(f, dict) else None
-        filename = params.get("filename") if isinstance(params, dict) else None
-        if isinstance(filename, str) and filename and not os.path.isabs(filename):
-            params["filename"] = os.path.normpath(os.path.join(config_dir, filename))
-
-    # Protection 4: only update the local state if CamillaDSP accepted the config
-    try:
-        cdsp.config.set_active(new_config_data)
-        cdsp.config.set_file_path(new_config_path)
-    except Exception as e:
-        log.error("Failed to apply config %s: %s", new_config_path, e)
-        return None
-
-    config_active = new_config_data
-    current_config_key = new_key
-
-    load_prev_values(saved)
-
-    # Remember this config as the last used of its group (survives TV on/off and restarts)
-    if group in CONFIG_GROUPS:
-        settings["last_config"][group] = new_key
-        write_settings()
-
-    # Let the other tasks know right away (title, path, parsed config) instead of
-    # waiting for the next cdsp_poller cycle. The active group (_ or |) is derived
-    # from the published path, there is no separate prefix variable to keep in sync.
-    vol_state.publish(
-        vol_state.db, vol_state.muted,
-        title=new_config_data.get("title"),
-        config_path=new_config_path,
-        config_data=new_config_data,
-    )
-
-    # Wait until CamillaDSP has finished loading the new config, so that
-    # cdsp.config.title() returns the NEW title (or "" if it has none),
-    # not the previous one.
-    await asyncio.sleep(0.1)
-
-    # A config switch is a visible event: it replaces any running message
-    cancel_scroll()
-    display_volume_info()
-    return new_config_data.get("title")
-
-
-# ====================== POWER ======================
-
-def toggle_power():
-    global auto_power_enabled, is_waiting_for_sound
-
-    if not auto_power_enabled or is_waiting_for_sound:
-        # Rearm the automatism, relay ON (trigger active, amps follow sound)
-        auto_power_enabled = True
-        lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
-        log.info("[POWER] Auto mode re-armed, relay ON")
-        scroll_message("POWER AUTO")
-        is_waiting_for_sound = False
-    else:
-        # Disengage the automatism, force the relay OFF (amps off)
-        auto_power_enabled = False
-        lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
-        log.info("[POWER] Relay forced OFF (auto mode disengaged)")
-        scroll_message("POWER OFF")
-
-
-def toggle_toslink_auto():
-    """Enable / disable the TOSLINK automatism (long press on HOMEPAGE)."""
-    global toslink_auto_enabled
-    toslink_auto_enabled = not toslink_auto_enabled
-    log.info("[TOSLINK] Automatism %s", "ON" if toslink_auto_enabled else "OFF")
-    scroll_message("CONF AUTO" if toslink_auto_enabled else "CONF MANUAL")
-
-
-async def return_to_volume_later(delay=0):
-    """Go back to the volume screen after a scrolling message, unless another
-    screen has been shown in the meantime (a key was pressed), another message
-    has started, or the display has been blanked."""
-    await asyncio.sleep(delay)
-    if last_displayed == "message" and not display_is_off and not scroll_active():
-        display_volume_info()
-
-
-# ====================== CAMILLADSP CONNECTION ======================
-
-def reconnect_cdsp():
-    """Close and reopen the main connection. It is the SAME `cdsp` object, so
-    every existing call keeps working."""
-    try:
-        cdsp.disconnect()
-    except Exception:
-        pass
-    cdsp.connect()
-
-
-def resync_after_reconnect():
-    """After a CamillaDSP restart: re-read the active config, re-apply the
-    saved tone and loudness, and push the config back (same push as at boot)."""
-    global config_active, current_config_key
-    new_active = cdsp.config.active() or {}
-    if isinstance(new_active, dict) and new_active:
-        config_active = new_active
-    path = cdsp.config.file_path()
-    current_config_key = config_key(path) if path else None
-    saved = settings["configs"].get(current_config_key) if current_config_key else None
-    load_prev_values(saved)
-    if TONE_ACTIVE and is_complete_config(config_active):
-        filters = config_active.get("filters")
-        apply_saved_values(filters if isinstance(filters, dict) else {}, saved)
-        cdsp.config.set_active(config_active)
-
-
-# ====================== BACKGROUND TASKS ======================
-
-async def supervised(name, factory):
-    """Restart a task that crashes, instead of bringing the whole script down."""
-    while True:
-        try:
-            await factory()
-            return                          # normal end (e.g. auto_poweroff after the shutdown, or TOSLINK detection disabled)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Task '%s' crashed, restarting in %g s", name, TASK_RESTART_DELAY_S)
-            await asyncio.sleep(TASK_RESTART_DELAY_S)
-
-
-async def cdsp_poller():
-    """Periodic reader of the CamillaDSP volume / mute / title / config path.
-    Publishes into vol_state; volume_watcher_loop, monitor_tv_toslink and the
-    LMS bridge consume it.
-    On error: automatic reconnection, the script keeps running."""
-    n = 0
-    failures = 0
-    while True:
-        try:
-            t0 = time.monotonic()           # start of the read (stale-reading guard)
-            db = cdsp.volume.main_volume()
-            muted = bool(cdsp.volume.main_mute())
-            title = path = None
-            if n % TITLE_EVERY == 0:
-                title = cdsp.config.title()
-                path = cdsp.config.file_path()
-            n += 1
-            vol_state.publish(db, muted, title, config_path=path, stamp=t0)
-            if failures:
-                log.info("CamillaDSP reachable again")
-                failures = 0
-        except Exception as e:
-            failures += 1
-            if failures == 1 or failures % 20 == 0:
-                log.warning("CamillaDSP unreachable (%s), reconnecting...", e)
-            await asyncio.sleep(CDSP_RECONNECT_DELAY_S)
-            try:
-                reconnect_cdsp()
-                resync_after_reconnect()
-                log.info("CamillaDSP connection restored")
-            except Exception as e2:
-                log.warning("Reconnection failed (%s)", e2)
-            continue
-        await asyncio.sleep(POLL_INTERVAL_S)
-
-
-async def lms_bridge_task():
-    """Run the LMS <-> CamillaDSP volume bridge (see LmsBridge above).
-    Only the player detection is retried here (no network interface yet at
-    boot); the bridge restarts itself after any error, and `supervised`
-    restarts this task if it ever crashes."""
-    player = None
-    warned = False
-    while player is None:
-        try:
-            player = player_id()
-        except Exception as e:
-            if not warned:             # one log line, not one every LMS_RETRY_S
-                log.warning("[LMS sync] cannot find the player (%s), retrying every %s s",
-                            e, LMS_RETRY_S)
-                warned = True
-            await asyncio.sleep(LMS_RETRY_S)
-
-    bridge = LmsBridge(
-        player, vol_state,
-        set_volume_db=cdsp.volume.set_main_volume,
-        set_mute=cdsp.volume.set_main_mute,
-        lms_addr=LMS_ADDR, debug=LMS_SYNC_DEBUG,
-        restore_window_s=LMS_RESTORE_WINDOW_S,
-        connect_timeout_s=LMS_CONNECT_TIMEOUT_S)
-    await bridge.run_forever(retry_s=LMS_RETRY_S)
-
-
-async def silence_monitor():
-    """Single reader of the CamillaDSP levels: refreshes `silent_now` once per
-    second and records in `silent_since` when the current silence began.
-    auto_poweroff, display_manager_loop and monitor_tv_toslink read these
-    variables instead of each querying CamillaDSP themselves.
-    On a read error the previous value is kept (no power cut because of a glitch)."""
-    global silent_now, silent_since
-    while True:
-        try:
-            now_silent = is_silent()
-            if now_silent and not silent_now:
-                silent_since = time.monotonic()     # silence just began
-            elif not now_silent:
-                silent_since = None
-            silent_now = now_silent
-        except Exception as e:
-            log.warning("Silence monitor: cannot read levels (%s)", e)
-        await asyncio.sleep(1)
+    return BRIGHTNESS_LEVELS[last_level]
 
 
 async def adc_reader_loop():
     """Read the ambient light sensor without ever blocking the event loop.
     Only the most recent complete line received since the last pass is used."""
     global adc_buffer
+
+    if ser is None:
+        log.info("Ambient light sensor unavailable; using fallback brightness")
+        return
+
     last_brightness = -1
 
     while True:
@@ -1815,76 +1960,7 @@ async def adc_reader_loop():
         await asyncio.sleep(0.1)
 
 
-async def volume_watcher_loop():
-    """Consume vol_state (no direct CamillaDSP reads any more): redraw the
-    display when volume / mute / title change, and resync the local state when
-    the config changes, so that the script does not later overwrite the active
-    config with an outdated copy."""
-    global config_active, current_config_key
-
-    ev = vol_state.subscribe()
-    while vol_state.db is None:
-        await ev.wait()
-        ev.clear()
-    last_volume, last_mute, last_title = vol_state.db, vol_state.muted, vol_state.title
-    last_warned_title = None
-
-    while True:
-        await ev.wait()
-        ev.clear()
-        current_volume, current_mute = vol_state.db, vol_state.muted
-        current_title = vol_state.title
-
-        # Empty titles are ignored by vol_state (CamillaDSP can briefly report "" during a reload)
-        title_changed = bool(current_title) and current_title != last_title
-        if current_title:
-            last_title = current_title
-
-        if title_changed:
-            # INTERNAL switch: change_config published the parsed config in
-            # vol_state.config_data. Use it instead of re-reading cdsp.config.active(),
-            # which can still return the PREVIOUS config while CamillaDSP is applying
-            # the new one. It is only trusted if it is the config the title announces:
-            # a published config that was never consumed (same title as the previous
-            # config, or no title) must not be taken for a later, external change.
-            published, vol_state.config_data = vol_state.config_data, None
-            if published is not None and published.get("title") == current_title:
-                new_active = published
-            else:
-                # EXTERNAL change (CamillaDSP UI, another client): give CamillaDSP
-                # time to finish loading before reading.
-                await asyncio.sleep(0.3)
-                # Protection 2: never let config_active become None
-                try:
-                    new_active = cdsp.config.active() or {}
-                except Exception as e:
-                    log.warning("Volume watcher: could not fetch active config (%s)", e)
-                    new_active = None
-
-            if is_complete_config(new_active):
-                config_active = new_active
-                path = cdsp.config.file_path()
-                current_config_key = config_key(path) if path else None
-                saved = settings["configs"].get(current_config_key) if current_config_key else None
-                load_prev_values(saved)
-                last_warned_title = None
-                log.debug("Config title changed to '%s'", current_title)
-
-            else:
-                if current_title != last_warned_title:
-                    log.warning("Config changed but active config is incomplete; keeping previous (title=%r)", current_title)
-                    last_warned_title = current_title
-
-        if current_volume != last_volume or current_mute != last_mute or title_changed:
-            last_volume = current_volume
-            last_mute = current_mute
-            # Redraw only if the volume screen is shown, no volume key is held and
-            # no message is scrolling (the end of the scroll redraws the volume itself)
-            if (last_displayed == "volume" and not is_volume_key_held
-                    and not scroll_active() and not display_is_off):
-                display_volume_info(current_volume, current_mute)
-
-
+# ---------- Display housekeeping loops ----------
 async def display_manager_loop():
     """Housekeeping of the display, once per second: return to the volume screen
     after SCREEN_RETURN_DELAY s without key press, blanking after a long quiet
@@ -1919,63 +1995,17 @@ async def display_manager_loop():
 
         await asyncio.sleep(1.0)
 
-async def auto_poweroff():
-    """Switch the power relay off after POWER_OFF_DELAY minutes without sound and
-    without key press, back on when sound returns, and halt the Raspberry Pi
-    after HALT_DELAY hours of (audio) silence."""
-    global is_waiting_for_sound
-    power_off_done = False          # the relay cut has already been handled for this quiet period
-    seen_activity = last_activity   # to notice a key press and re-arm the cut
-
-    while True:
-        await asyncio.sleep(1)
-
-        # A key press restarts the countdown, so the cut can happen again
-        if last_activity != seen_activity:
-            seen_activity = last_activity
-            power_off_done = False
-
-        if silent_now:
-            if (quiet_age() >= POWER_OFF_DELAY * 60
-                    and not power_off_done and not is_waiting_for_sound):
-                power_off_done = True
-                if auto_power_enabled:
-                    lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
-                    scroll_message("POWER SAVE")
-                    is_waiting_for_sound = True  # Wait for sound or POWER key to switch back on
-                    # Let the message finish (no fixed delay to keep in sync with it).
-                    # If a key cancelled it, the user is there: do not blank.
-                    finished = await wait_scroll()
-                    if finished and silent_now and is_waiting_for_sound:
-                        blank_display()
-                # else: relay already forced off, nothing to cut. The display is
-                # blanked by display_manager_loop (normal delay, then WAKE_DISPLAY_DELAY after a key press)
-
-            # The Pi halt only depends on audio silence, not on key presses
-            if silence_age() >= HALT_DELAY * 3600:
-                shutdown_system()
-                break
-
-        else:
-            power_off_done = False
-            if (auto_power_enabled and is_waiting_for_sound
-                    and lgpio.gpio_read(h, POWER_GPIO) == 0):
-                lgpio.gpio_write(h, POWER_GPIO, lgpio.HIGH)
-                if not scroll_active():          # a running message redraws the volume itself
-                    display_volume_info()
-                is_waiting_for_sound = False
-            elif not auto_power_enabled and lgpio.gpio_read(h, POWER_GPIO) == 1:
-                lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
-
 
 async def blink_loop():
     """1 s tick, aligned on the clock, that redraws the volume screen while a
-    dot must blink (CONF MANUAL dot on the 3rd character, POWER OFF dot on the
-    4th character). The phase itself comes from blink_on() at draw time."""
+    dot must blink (external config middle bar on the 4th character, CONF MANUAL
+    dot on the 3rd character, POWER OFF dot on the 4th character). The phase
+    itself comes from blink_on() at draw time."""
     while True:
         await asyncio.sleep(1.0 - time.monotonic() % 1.0)
 
-        blinking = ((ENABLE_TOSLINK_SWITCH and not toslink_auto_enabled)
+        blinking = (current_config_external
+                    or (ENABLE_TOSLINK_SWITCH and not toslink_auto_enabled)
                     or (ENABLE_AUTO_POWEROFF and not auto_power_enabled))
 
         # Only when the volume screen is at rest: never wake a blanked display,
@@ -1986,6 +2016,30 @@ async def blink_loop():
                 and not scroll_active()
                 and not is_volume_key_held):
             display_volume_info()
+
+
+# =====================================================================
+#  TOSLINK - automatic _ / | config switching
+#  Needs ENABLE_TOSLINK_SWITCH.
+# =====================================================================
+
+toslink_auto_enabled = True     # TOSLINK automatism active (toggled by a long HOMEPAGE press)
+toslink_ready = False           # True once monitor_tv_toslink has found its "_*" and "|*" config files
+
+
+def toslink_active():
+    """True when the TOSLINK automatism can run: the feature is enabled AND
+    monitor_tv_toslink found its config files. Otherwise BACK / HOMEPAGE behave
+    as with ENABLE_TOSLINK_SWITCH = False."""
+    return ENABLE_TOSLINK_SWITCH and toslink_ready
+
+
+def toggle_toslink_auto():
+    """Enable / disable the TOSLINK automatism (long press on HOMEPAGE)."""
+    global toslink_auto_enabled
+    toslink_auto_enabled = not toslink_auto_enabled
+    log.info("[TOSLINK] Automatism %s", "ON" if toslink_auto_enabled else "OFF")
+    scroll_message("CONF AUTO" if toslink_auto_enabled else "CONF MANUAL")
 
 
 # --------------------- Config switching: TOSLINK mode ---------------------
@@ -2248,6 +2302,168 @@ async def monitor_tv_toslink():
             await asyncio.sleep(2.0)
 
 
+# =====================================================================
+#  REMOTE - keys
+#  Needs ENABLE_REMOTE.
+# =====================================================================
+
+
+# ---------- State of the keys ----------
+key_hold_counter = 0            # Key-repeat events of the key being held (remote_events only).
+                                # A repeat counter on purpose (HOLD_* thresholds are in events), not a clock.
+is_volume_key_held = False      # True from a volume key press until VOLUME_PEEK_S after its release
+enter_display_at_press = None   # Screen shown when ENTER was pressed (to tell short/long press apart)
+
+
+# ---------- Key actions ----------
+def change_volume_from_key(key, current_volume, volume_step=1):
+    """Move one step on the 0..100 scale (LMS / Squeezelite curve).
+    `current_volume` is the CamillaDSP main volume in dB."""
+    pct = db_to_pct(current_volume)
+    delta = -volume_step if key == KEY_BINDINGS['VOLUMEDOWN'] else volume_step
+    new_pct = clamp(pct + delta, 0, 100)
+
+    if new_pct != pct:
+        new_volume = pct_to_db(new_pct)
+        cdsp.volume.set_main_volume(new_volume)
+        display_volume_info(new_volume)
+
+
+_volume_release_task = None     # Pending "end of the volume key" task (see schedule_volume_release)
+
+
+def cancel_volume_release():
+    """Cancel the pending end-of-volume-key task, if any (a volume key was pressed again)."""
+    global _volume_release_task
+    task, _volume_release_task = _volume_release_task, None
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def _volume_release_coro():
+    """VOLUME_PEEK_S after the release: the volume key is no longer "held", the
+    volume screen is redrawn (a muted state shows "--" again)."""
+    global is_volume_key_held
+    await asyncio.sleep(VOLUME_PEEK_S)
+    is_volume_key_held = False
+    if last_displayed == "volume" and not display_is_off and not scroll_active():
+        display_volume_info()
+
+
+def schedule_volume_release():
+    """Called when a volume key is released."""
+    global _volume_release_task
+    cancel_volume_release()
+    _volume_release_task = asyncio.create_task(_volume_release_coro())
+
+
+def handle_arrow_keys(key):
+    """Adjust the parameters of the screen currently displayed."""
+    up, down = KEY_BINDINGS['UP'], KEY_BINDINGS['DOWN']
+
+    if last_displayed == "loudness":
+        loudness_params = get_filter_params(config_active, "Loudness")
+        if loudness_params is not None and key in (up, down):   # LEFT / RIGHT do nothing here
+            ref_level = loudness_params.get('reference_level', 0) + (LOUDNESS_STEP if key == up else -LOUDNESS_STEP)
+            loudness_params['reference_level'] = clamp(ref_level, LOUDNESS_MIN, LOUDNESS_MAX)
+            cdsp.config.set_active(config_active)
+            display_loudness_info()
+
+    elif last_displayed in ARROW_ADJUST:
+        filt, step, limit = ARROW_ADJUST[last_displayed][key]
+        params = get_filter_params(config_active, filt)
+        if params is not None:      # filter absent from this config: the key does nothing
+            params['gain'] = clamp(params.get('gain', 0) + step, -limit, limit)
+            cdsp.config.set_active(config_active)
+            (display_tilt_info if last_displayed == "tilt" else display_tone_info)()
+
+    else:
+        if last_tone_tilt == "tilt":
+            display_tilt_info()
+        else:
+            display_tone_info()
+
+
+def handle_enter_press(screen):
+    """Short ENTER press.
+    - tone / tilt screen: bass, treble, tilt and presence are ALL set to 0,
+      or ALL restored to their previous values if they are already all at 0.
+    - loudness screen: loudness is switched off (-100) or restored."""
+    if screen in ("tone", "tilt"):
+        params = {key: get_filter_params(config_active, filt) for key, filt in GAIN_KEYS.items()}
+        existing = {key: p for key, p in params.items() if p is not None}
+        if not existing:
+            return
+
+        if all(p.get('gain', 0) == 0 for p in existing.values()):
+            # Everything is at 0: restore the previous values
+            for key, p in existing.items():
+                p['gain'] = prev_values[key]
+            prev_values.update(dict.fromkeys(GAIN_KEYS, 0))
+        else:
+            # Remember the current values, then set everything to 0
+            for key, p in params.items():
+                prev_values[key] = p.get('gain', 0) if p is not None else 0
+            for p in existing.values():
+                p['gain'] = 0
+
+        cdsp.config.set_active(config_active)
+        if screen == "tone":
+            display_tone_info()
+        else:
+            display_tilt_info()
+
+    elif screen == "loudness":
+        loudness_params = get_filter_params(config_active, "Loudness")
+        if loudness_params is not None:
+            if loudness_params.get('reference_level') == -100:      # -100 = loudness off
+                loudness_params['reference_level'] = prev_values["loudness_ref"]
+                prev_values["loudness_ref"] = -100
+            else:
+                prev_values["loudness_ref"] = loudness_params.get('reference_level', DEFAULT_LOUDNESS_REF)
+                loudness_params['reference_level'] = -100
+            cdsp.config.set_active(config_active)
+            display_loudness_info()
+
+
+# ---------- Remote device and key events ----------
+def find_remote():
+    """Return the remote input device (grabbed), or None if it is not available."""
+    for path in evdev.list_devices():
+        try:
+            device = evdev.InputDevice(path)
+        except OSError:                 # device vanished between list and open
+            continue
+        if device.name != REMOTE_NAME:
+            device.close()
+            continue
+        try:
+            # Exclusive access: the kernel stops delivering this device's events
+            # to anyone else (logind no longer sees the remote's KEY_POWER)
+            device.grab()
+        except OSError as e:            # EBUSY: another process holds it / ENODEV: gone
+            log.warning("Cannot grab '%s' (%s), will retry", REMOTE_NAME, e)
+            device.close()
+            continue
+        log.info("'%s' found at %s.", REMOTE_NAME, path)
+        return device
+    return None
+
+
+async def remote_watcher():
+    """Wait for the remote, serve it until it disconnects, then start over."""
+    while True:
+        device = find_remote()
+        if device is None:
+            await asyncio.sleep(1)
+            continue
+        try:
+            await remote_events(device)     # returns when the remote disconnects
+        finally:
+            device.close()                  # also releases the grab
+        log.info("Remote disconnected, waiting for it to come back...")
+
+
 async def remote_events(device):
     global last_displayed, key_hold_counter, is_volume_key_held
     global last_tone_tilt, enter_display_at_press
@@ -2435,7 +2651,76 @@ async def remote_events(device):
             await asyncio.sleep(0.2)
 
 
-# ====================== SHUTDOWN / MAIN ======================
+# =====================================================================
+#  STARTUP - module-level initialisation
+#  Runs once, at import, in this order: serial, CamillaDSP (waits until it answers),
+#  GPIO, display, settings. Do not reorder.
+# =====================================================================
+
+# Ambient light sensor: initial brightness level
+ser = None
+adc_value_init = 1500   # fallback if the sensor is absent (or the display is disabled)
+
+if ENABLE_DISPLAY:
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        try:
+            adc_value_init = int(ser.readline().decode().strip())
+        except ValueError:
+            pass
+        ser.timeout = 0
+    except serial.SerialException as e:
+        log.warning("Ambient light sensor unavailable: %s", e)
+
+last_level = next(
+    (i for i, t in enumerate(ADC_LEVELS) if adc_value_init < t),
+    len(BRIGHTNESS_LEVELS) - 1,
+)
+
+# CamillaDSP — always needed: the "at least one feature" check in the
+# FEATURES block guarantees that at least one option requires it.
+cdsp = CamillaClient(*CAMILLA_ADDR)
+config_active = {}
+
+# Wait for CamillaDSP instead of crashing if it is not up yet.
+# bootlocal.sh launches us in the background, so this loop never
+# blocks the boot. It exits as soon as CamillaDSP answers.
+while True:
+    try:
+        cdsp.connect()
+        cdsp.general.reload()
+        break
+    except Exception as e:
+        log.warning("CamillaDSP not reachable (%s), waiting %g s",
+                    e, CDSP_RECONNECT_DELAY_S)
+        time.sleep(CDSP_RECONNECT_DELAY_S)
+
+# Protection 1: never let config_active be None at startup
+config_active = cdsp.config.active() or {}
+
+# GPIO
+h = None
+if USE_GPIO:
+    h = lgpio.gpiochip_open(0)
+    lgpio.gpio_claim_output(h, POWER_GPIO, 0)   # Initial level LOW: no LOW -> HIGH glitch on the relay
+    time.sleep(1)                   # Keep the relay off so the A70 can re-arm
+    lgpio.gpio_write(h, POWER_GPIO, 1)
+
+# TM1637 display
+tm = TM1637(clk=CLK, dio=DIO) if ENABLE_DISPLAY else NullDisplay()
+clear_display()
+tm.brightness(BRIGHTNESS_LEVELS[last_level])
+settings = load_settings()
+last_tone_tilt = settings["last_tone_tilt"]
+load_prev_values()
+if TONE_ACTIVE:
+    init_tone()
+
+
+# =====================================================================
+#  SHUTDOWN / MAIN
+#  Signal handlers, then main(): the tasks are started according to the FEATURES switches.
+# =====================================================================
 
 def exit_gracefully(signum, frame):
     """Save the settings, cut the relay and release the GPIO on SIGINT/SIGTERM."""
@@ -2469,8 +2754,9 @@ async def main():
     def spawn(name, factory):
         tasks.append(asyncio.create_task(supervised(name, factory)))
 
-    # Always: the periodic reader of volume / mute / title (shared through vol_state)
-    # and the only place that reconnects to CamillaDSP, which every feature needs
+    # Always: the periodic reader of volume / mute / config path / active config
+    # (shared through vol_state) and the only place that reconnects to
+    # CamillaDSP, which every feature needs
     spawn("cdsp-poller", cdsp_poller)
     if ENABLE_AUTO_POWEROFF or ENABLE_DISPLAY or ENABLE_TOSLINK_SWITCH:
         # Single reader of the CamillaDSP levels, shared through `silent_now` / `silent_since`
@@ -2480,7 +2766,7 @@ async def main():
     if ENABLE_DISPLAY:
         spawn("display", display_manager_loop)
         spawn("adc", adc_reader_loop)
-    if ENABLE_DISPLAY and (ENABLE_AUTO_POWEROFF or ENABLE_TOSLINK_SWITCH):
+    if ENABLE_DISPLAY:
         # 1 s tick that redraws the volume screen while a dot must blink
         spawn("blink", blink_loop)
     if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH:

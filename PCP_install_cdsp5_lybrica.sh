@@ -5,7 +5,8 @@
 #   1) CamillaDSP 5.x + CamillaGUI  (Squeezelite -> loopback -> CamillaDSP -> DAC)
 #                                   installed as the CDSPpiCore.tcz extension
 #   2) LyBriCa + BLE HID bridge     (TM1637 display, remote, LMS sync; patches pcp-bt.tcz)
-#   3) ESP32C3                      (UART + GPIO overlays, pcp.cfg, shutdown monitor)
+#   3) ESP32C3                      (UART + GPIO overlays, GPIO 12 TV relay line,
+#                                   pcp.cfg, shutdown monitor)
 #
 # Usage (SSH, user tc):
 #   sh install_pcp.sh      -> interactive menu (no parameters)
@@ -939,6 +940,7 @@ patch_pcp_bt() {
 #   dtoverlay=gpio-poweroff,gpiopin=26,active_low=1
 #   dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down
 #   enable_uart=1
+#   gpio=12=ip,np
 # Then sets the matching GPIO options in pcp.cfg and installs
 # shutdown-monitor.tcz.
 #
@@ -962,10 +964,14 @@ configure_esp32c3() {
     echo '       (GPIO 16: shutdown request from the ESP32)'
     echo '   enable_uart=1'
     echo '       (UART on GPIO 14/15, link with the ESP32)'
+    echo '   gpio=12=ip,np'
+    echo '       (GPIO 12: TV relay input, left floating at boot so the relay'
+    echo '        board is not activated before lybrica.py takes over)'
     echo ''
     echo ' Nothing is removed. Meant for a fresh install: on a bare Raspberry Pi'
-    echo ' these GPIOs are free (GPIO 14/15 = UART, GPIO 16 and 26 = plain GPIOs).'
+    echo ' these GPIOs are free (GPIO 14/15 = UART, GPIO 12, 16 and 26 = plain GPIOs).'
     echo ' If you use a HAT or another add-on board, check its pinout first.'
+    echo ' The GPIO 12 line is harmless if no TV relay is wired to it.'
     echo ''
     echo ' Expected setup (ESP32C3 + relay):'
     echo '   1. A physical button is wired to the ESP32.'
@@ -994,8 +1000,9 @@ configure_esp32c3() {
     ESP_SCRIPT=/tmp/fix_gpio_overlays.sh
     cat > "$ESP_SCRIPT" <<'GPIO_SCRIPT_EOF'
 #!/bin/sh
-# Add the gpio-poweroff (GPIO 26) and gpio-shutdown (GPIO 16) overlays and
-# enable the UART, only for the lines that are not already in config.txt.
+# Add the gpio-poweroff (GPIO 26) and gpio-shutdown (GPIO 16) overlays,
+# enable the UART and leave GPIO 12 floating at boot (TV relay input),
+# only for the lines that are not already in config.txt.
 
 set -e
 
@@ -1049,6 +1056,7 @@ add_line() {
 add_line "dtoverlay=gpio-poweroff,gpiopin=26,active_low=1"
 add_line "dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down"
 add_line "enable_uart=1"
+add_line "gpio=12=ip,np"
 
 echo ">>> $CONFIG, last lines:"
 tail -10 "$CONFIG"
@@ -1207,7 +1215,7 @@ while true; do
     echo "=============================================="
     echo "  1) CamillaDSP + CamillaGUI"
     echo "  2) LyBriCa + BLE HID bridge (patches pcp-bt.tcz)"
-    echo "  3) ESP32C3 (GPIO overlays, shutdown monitor)"
+    echo "  3) ESP32C3 (GPIO overlays, GPIO 12 TV relay line, shutdown monitor)"
     echo "  R) Reboot now"
     echo "  Q) Quit"
     echo "----------------------------------------------"

@@ -43,6 +43,9 @@ ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input.
                                #        HOMEPAGE = next "|" config.
                                # If no "_*" or no "|*" config file exists, the automatism
                                # cannot run: the keys then behave as with False.
+ENABLE_TV_RELAY       = False  # Relay on GPIO 12: active (input pulled to ground) as long as a
+                               # "|*" config is active, inactive (high impedance) otherwise.
+                               # Independent of the POWER relay.
 
 
 # ---------------------------------------------------------------------
@@ -52,11 +55,11 @@ ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input.
 
 # At least one feature must be enabled, otherwise the script has nothing to do
 if not (ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_AUTO_POWEROFF
-        or ENABLE_TOSLINK_SWITCH or ENABLE_LMS_SYNC):
+        or ENABLE_TOSLINK_SWITCH or ENABLE_LMS_SYNC or ENABLE_TV_RELAY):
     raise ValueError("No feature enabled: turn on at least one option in the FEATURES block")
 
 TONE_ACTIVE = ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH   # tone is saved / restored per config
-USE_GPIO    = ENABLE_AUTO_POWEROFF                     # TOSLINK detection needs no GPIO
+USE_GPIO    = ENABLE_AUTO_POWEROFF or ENABLE_TV_RELAY  # TOSLINK detection needs no GPIO
 
 
 # ---------------------------------------------------------------------
@@ -139,6 +142,11 @@ POWER_OFF_DELAY = 2         # Minutes without sound AND without key press before
                             # (needs ENABLE_AUTO_POWEROFF); also the delay before the display is blanked
                             # (needs ENABLE_DISPLAY). A key press restarts the countdown.
 HALT_DELAY = 48             # Hours of continuous silence before the Raspberry Pi shuts down (needs ENABLE_AUTO_POWEROFF)
+
+TV_RELAY_GPIO = 12          # Optocoupler board input of the "|" group relay (needs ENABLE_TV_RELAY)
+                            # LOW (ground) = relay active, high impedance = inactive.
+                            # To avoid a pulse while the Pi boots, add "gpio=12=ip,np" to config.txt
+                            # (on piCorePlayer: /mnt/mmcblk0p1/config.txt).
 
 
 # ---------------------- Audio analysis ----------------------
@@ -299,7 +307,7 @@ TILT_MAX_STEPS = 3          # Tilt: -3 .. +3 displayed steps (TILT_DB_STEP dB ea
 TILT_DB_STEP = 2            # Real dB applied per displayed tilt step
 LOUDNESS_MIN, LOUDNESS_MAX = -50, -10   # Loudness reference level range in dB (stay above -100, which means "off")
 LOUDNESS_STEP = 5           # Loudness: dB per key press
-DEFAULT_LOUDNESS_REF = -20  # Loudness level restored by ENTER when no previous value is saved
+DEFAULT_LOUDNESS_REF = -30  # Loudness level restored by ENTER when no previous value is saved
 
 
 # ---------------------------------------------------------------------
@@ -550,6 +558,43 @@ current_config_external = False # True while the active config was chosen OUTSID
                                 # client): its tone / loudness are neither saved nor copied to the next config
 
 
+# ---------- TV relay (config group "|") ----------
+tv_relay_on = None              # Known state (None = never written): the GPIO is only written on a change
+
+
+def release_tv_relay():
+    """Release the line as an input without pull (high impedance): relay inactive."""
+    if not ENABLE_TV_RELAY or h is None:
+        return
+    try:
+        lgpio.gpio_free(h, TV_RELAY_GPIO)
+    except Exception:
+        pass
+    lgpio.gpio_claim_input(h, TV_RELAY_GPIO)     # flags 0 = no pull
+
+
+def update_tv_relay():
+    """Relay active (GPIO to ground) if the active config starts with '|',
+    inactive (high impedance) otherwise. Called after every change of
+    current_config_key. If the config is not identified, nothing changes."""
+    global tv_relay_on
+    if not ENABLE_TV_RELAY or not current_config_key:
+        return
+    want = current_config_key.startswith('|')
+    if want == tv_relay_on:
+        return
+    try:
+        lgpio.gpio_free(h, TV_RELAY_GPIO)
+    except Exception:
+        pass
+    if want:
+        lgpio.gpio_claim_output(h, TV_RELAY_GPIO, 0)    # ground -> active
+    else:
+        lgpio.gpio_claim_input(h, TV_RELAY_GPIO)        # high impedance -> inactive
+    tv_relay_on = want
+    log.info("[TV RELAY] %s (config %s)", "ON" if want else "OFF", current_config_key)
+
+
 def apply_filter_param(filters, filt, param, value):
     """Set a CamillaDSP filter parameter, silently ignoring filters that are
     missing from the active config (configs need not define every filter)."""
@@ -765,6 +810,7 @@ def resync_after_reconnect():
     if isinstance(new_active, dict) and new_active:
         config_active = new_active
     current_config_key = new_key
+    update_tv_relay()
     saved = settings["configs"].get(current_config_key) if current_config_key else None
     load_prev_values(saved)
     if TONE_ACTIVE and is_complete_config(config_active):
@@ -979,6 +1025,7 @@ async def change_config(cdsp, config_pattern, cycle=True):
     config_active = new_config_data
     current_config_key = new_key
     current_config_external = False     # this config was chosen here
+    update_tv_relay()
 
     load_prev_values(saved)
 
@@ -1115,6 +1162,7 @@ async def volume_watcher_loop():
                 config_active = new_active
                 current_config_key = new_key
                 current_config_external = True
+                update_tv_relay()
 
                 # Reset prev_values so ENTER does not restore the values of the
                 # config we just left.
@@ -1503,9 +1551,11 @@ def toggle_power():
 
 
 def shutdown_system():
-    """Cut the power relay (if managed) and halt the Raspberry Pi."""
+    """Cut the power relay (if managed), release the TV relay (if managed) and
+    halt the Raspberry Pi."""
     if ENABLE_AUTO_POWEROFF:
         lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
+    release_tv_relay()
     cancel_scroll()                 # nothing may overwrite the HALT message
     show(" HALT ")
     os.system("sudo poweroff")
@@ -2702,9 +2752,12 @@ config_active = cdsp.config.active() or {}
 h = None
 if USE_GPIO:
     h = lgpio.gpiochip_open(0)
-    lgpio.gpio_claim_output(h, POWER_GPIO, 0)   # Initial level LOW: no LOW -> HIGH glitch on the relay
-    time.sleep(1)                   # Keep the relay off so the A70 can re-arm
-    lgpio.gpio_write(h, POWER_GPIO, 1)
+    if ENABLE_TV_RELAY:
+        lgpio.gpio_claim_input(h, TV_RELAY_GPIO)    # inactive (high impedance) from the start
+    if ENABLE_AUTO_POWEROFF:
+        lgpio.gpio_claim_output(h, POWER_GPIO, 0)   # Initial level LOW: no LOW -> HIGH glitch on the relay
+        time.sleep(1)                   # Keep the relay off so the A70 can re-arm
+        lgpio.gpio_write(h, POWER_GPIO, 1)
 
 # TM1637 display
 tm = TM1637(clk=CLK, dio=DIO) if ENABLE_DISPLAY else NullDisplay()
@@ -2715,6 +2768,14 @@ last_tone_tilt = settings["last_tone_tilt"]
 load_prev_values()
 if TONE_ACTIVE:
     init_tone()
+
+# TV relay: follow the config the script started with
+if ENABLE_TV_RELAY:
+    if current_config_key is None:          # init_tone did not run (TONE_ACTIVE False)
+        _p = cdsp.config.file_path()
+        if _p:
+            current_config_key = config_key(_p)
+    update_tv_relay()
 
 
 # =====================================================================
@@ -2729,6 +2790,7 @@ def exit_gracefully(signum, frame):
         if ENABLE_AUTO_POWEROFF:
             lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
             time.sleep(0.5)
+        release_tv_relay()
         if h is not None:
             lgpio.gpiochip_close(h)
         log.info("Gracefully shutting down the service...")
@@ -2769,8 +2831,9 @@ async def main():
     if ENABLE_DISPLAY:
         # 1 s tick that redraws the volume screen while a dot must blink
         spawn("blink", blink_loop)
-    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH:
+    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH or ENABLE_TV_RELAY:
         # Redraws the display and resyncs config_active after an external change
+        # (also keeps the TV relay in step with an external config change)
         spawn("volume-watcher", volume_watcher_loop)
     if ENABLE_LMS_SYNC:
         spawn("lms-bridge", lms_bridge_task)

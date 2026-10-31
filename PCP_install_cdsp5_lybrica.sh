@@ -108,8 +108,8 @@ PCP_CFG=/usr/local/etc/pcp/pcp.cfg
 if [ "$DAC_FROM_PCP" = "yes" ] && [ -r "$PCP_CFG" ]; then
     PCP_OUT=$(sed -n 's/^OUTPUT="\(.*\)"/\1/p' "$PCP_CFG" | head -n 1)
     PCP_OUT=$(echo "$PCP_OUT" | sed -E 's/^plughw:/hw:/; s/^hw:CARD=([^,]*),DEV=([0-9]+)$/hw:\1,\2/; s/^hw:CARD=([^,]*)$/hw:\1,0/')
-    # DAC already set in an existing loopback.yml (script re-run)
-    EXISTING_CFG=/mnt/mmcblk0p2/tce/camilladsp/configs/loopback.yml
+    # DAC already set in an existing _A-loopback.yml (script re-run)
+    EXISTING_CFG=/mnt/mmcblk0p2/tce/camilladsp/configs/_A-loopback.yml
     EXISTING_DAC=""
     if [ -r "$EXISTING_CFG" ]; then
         EXISTING_DAC=$(awk '/^  playback:/{f=1;next} f && /^    device:/{gsub(/^    device:[ ]*"?/,""); gsub(/"?[ ]*$/,""); print; exit}' "$EXISTING_CFG")
@@ -119,7 +119,7 @@ if [ "$DAC_FROM_PCP" = "yes" ] && [ -r "$PCP_CFG" ]; then
         *Loopback*|"")
             if [ -n "$EXISTING_DAC" ]; then
                 DAC_DEVICE="$EXISTING_DAC"
-                echo ">>> pcp.cfg OUTPUT is empty or already the loopback: DAC taken from loopback.yml: $DAC_DEVICE"
+                echo ">>> pcp.cfg OUTPUT is empty or already the loopback: DAC taken from _A-loopback.yml: $DAC_DEVICE"
             else
                 echo ">>> pcp.cfg OUTPUT is empty or already the loopback: keeping DAC_DEVICE=$DAC_DEVICE"
             fi ;;
@@ -129,7 +129,7 @@ if [ "$DAC_FROM_PCP" = "yes" ] && [ -r "$PCP_CFG" ]; then
         *)
             if [ -n "$EXISTING_DAC" ]; then
                 DAC_DEVICE="$EXISTING_DAC"
-                echo "!!! WARNING: pcp.cfg OUTPUT ('$PCP_OUT') is not a hw: device: DAC taken from loopback.yml: $DAC_DEVICE"
+                echo "!!! WARNING: pcp.cfg OUTPUT ('$PCP_OUT') is not a hw: device: DAC taken from _A-loopback.yml: $DAC_DEVICE"
             else
                 echo "!!! WARNING: pcp.cfg OUTPUT ('$PCP_OUT') is not a hw: device: keeping DAC_DEVICE=$DAC_DEVICE"
             fi ;;
@@ -207,7 +207,7 @@ aplay -l | grep -qi loopback || die "Loopback card missing after modprobe."
 ### --- 3. CamillaDSP config and statefile ----------------------------------
 # Minimal pass-through config: Loopback,1 (capture) -> 0 dB gain -> DAC.
 # Capture on Loopback,1 because Squeezelite plays on Loopback,0.
-cat > "$BASE/configs/loopback.yml" <<EOF
+cat > "$BASE/configs/_A-loopback.yml" <<EOF
 ---
 devices:
   samplerate: ${SAMPLERATE}
@@ -236,12 +236,12 @@ pipeline:
     names: [gain0]
 title: Setup
 EOF
-cp "$BASE/configs/loopback.yml" "$BASE/default_config.yml"
+cp "$BASE/configs/_A-loopback.yml" "$BASE/default_config.yml"
 
-if "$CDSP_BIN" -c "$BASE/configs/loopback.yml"; then
-    echo ">>> Config loopback.yml: valid."
+if "$CDSP_BIN" -c "$BASE/configs/_A-loopback.yml"; then
+    echo ">>> Config _A-loopback.yml: valid."
 else
-    echo "!!! WARNING: CamillaDSP considers loopback.yml invalid (see message above)."
+    echo "!!! WARNING: CamillaDSP considers _A-loopback.yml invalid (see message above)."
 fi
 
 DAC_CARD=${DAC_DEVICE#plughw:}
@@ -272,7 +272,7 @@ fi
 
 # Complete statefile: without mute/volume, CamillaDSP 4.x/5.x rejects the file
 cat > "$BASE/camilladsp_statefile.yml" <<EOF
-config_path: $BASE/configs/loopback.yml
+config_path: $BASE/configs/_A-loopback.yml
 mute:
 - false
 - false

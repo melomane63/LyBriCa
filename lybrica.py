@@ -229,21 +229,24 @@ KEY_BINDINGS = {
     'PLAYPAUSE':     'KEY_PLAYPAUSE',    # Pause (short press) / stop (long press) - LMS
     'PREVIOUSSONG':  'KEY_PREVIOUSSONG', # Previous song (short press) / rewind (long press) - LMS
     'NEXTSONG':      'KEY_NEXTSONG',     # Next song (short press) / fast-forward (long press) - LMS
-    'UP':            'KEY_UP',           # Bass + (tone screen) / loudness + (loudness screen)
+    'UP':            'KEY_UP',           # Tone screen: Bass +1
+                                         # Loudness screen: loudness +
                                          # (needs ENABLE_DISPLAY)
-    'DOWN':          'KEY_DOWN',         # Bass - (tone screen) / loudness - (loudness screen)
+    'DOWN':          'KEY_DOWN',         # Tone screen: Bass -1
+                                         # Loudness screen: loudness -
                                          # (needs ENABLE_DISPLAY)
-    'LEFT':          'KEY_LEFT',         # Treble - (tone screen only, no effect on loudness)
+    'LEFT':          'KEY_LEFT',         # Tone screen: Treble -1
                                          # (needs ENABLE_DISPLAY)
-    'RIGHT':         'KEY_RIGHT',        # Treble + (tone screen only, no effect on loudness)
+    'RIGHT':         'KEY_RIGHT',        # Tone screen: Treble +1
                                          # (needs ENABLE_DISPLAY)
     'POWER':         'KEY_POWER',        # Long press: toggle relay (needs ENABLE_AUTO_POWEROFF)
                                          # Very long press: shutdown (always)
     'ENTER':         'KEY_ENTER',        # Short: bass/treble all 0 or restored (tone screen)
                                          #        loudness on/off (loudness screen)
                                          #        nothing on the volume screen
-                                         # Long:  toggles Tone <-> Loudness
-                                         #        (from the volume screen: goes to Loudness)
+                                         # Long:  volume   -> Loudness
+                                         #        tone     -> cycle the tone anchor preset
+                                         #        loudness -> Volume (exit)
     'BACK':          'KEY_BACK',         # Cycle within the active group ("_A-", "_B-", "_C-"...)
                                          # Whatever the TOSLINK mode (auto ON, auto OFF, feature off).
     'HOMEPAGE':      'KEY_HOMEPAGE',     # TOSLINK switch ON : long press = automatism on / off
@@ -253,15 +256,18 @@ KEY_BINDINGS = {
 }
 
 # Hold durations, in key-repeat events (40ms each )
-HOLD_TOGGLE_POWER = 2       # POWER: toggle the relay ~ 1s
+HOLD_TOGGLE_POWER = 10       # POWER: toggle the relay ~ 1s
 HOLD_SHUTDOWN = 200         # POWER: shut the Raspberry Pi down - 8s
 HOLD_STOP = 10              # PLAY/PAUSE: stop
 HOLD_SEEK = 10              # NEXT/PREVIOUS: seeking starts
-HOLD_SHOW_LOUDNESS = 15     # ENTER: toggles Tone <-> Loudness
-                            # (from the volume screen: goes to Loudness)
+HOLD_SHOW_LOUDNESS = 15     # ENTER long:
+                            #   volume   -> Loudness
+                            #   tone     -> cycle the tone anchor preset
+                            #   loudness -> Volume (exit)
 SEEK_STEP_FORWARD_S = 30    # Seconds jumped forward at each seek (NEXTSONG)
 SEEK_STEP_BACKWARD_S = 10   # Seconds jumped backward at each seek (PREVIOUSSONG)
-SEEK_INTERVAL_S = 0.8       # Seconds between two seeks while the key is held (10 s / 0.5 s = 20x speed)
+SEEK_INTERVAL_S = 0.8       # Seconds between two seeks while the key is held (10 s / 0.8 s = 12.5x speed)
+ARROW_REPEAT_EVERY = 5     # Arrow keys: one action every: value * 40 ms
 
 # Hold duration, in real seconds (independent of the remote's repeat rate)
 HOLD_TOGGLE_AUTO_S = 1.0    # HOMEPAGE: long press to enable / disable the TOSLINK automatism
@@ -311,11 +317,84 @@ SAVE_MODE = "half"   # "all_config" | "all_group" | "half" | "same_everywhere"
 if SAVE_MODE not in ("all_config", "all_group", "half", "same_everywhere"):
     raise ValueError(f"Unknown SAVE_MODE {SAVE_MODE!r}")
 
-# Adjustment range for Bass and Treble (the display has 2 digits)
-TONE_MAX_DB = 9             # Bass / treble: -9 .. +9 dB
 LOUDNESS_MIN, LOUDNESS_MAX = -50, -10   # Loudness reference level range in dB (stay above -100, which means "off")
 LOUDNESS_STEP = 5           # Loudness: dB per key press
 DEFAULT_LOUDNESS_REF = -30  # Loudness level restored by ENTER when no previous value is saved
+
+
+# ---------------------- Tone DSP profile ----------------------
+# The user enters Bass and Treble directly with the arrow keys. The DSP
+# parameters (frequencies, Q per filter, compensation) are derived from
+# those two gains by blending between two anchors:
+#
+#   Tilt anchor (t=0): on the N/S axis (bass = -treble), the two filters
+#     form a perfect see-saw with equal Q=0.35 and a geometric pivot at
+#     620 Hz. Used when the two gains are opposite.
+#
+#   Tone anchor (t=1): on the diagonals and beyond (one gain dominates
+#     the other), the filters become classical Baxandall shelves with
+#     fixed Q. The exact frequencies and Q come from the active preset
+#     in TONE_PRESETS below.
+#
+# The blending factor t is the angular distance to N/S, normalised:
+#   t = 0 on N/S (bass = -treble)
+#   t = 1 from 45° away from N/S (diagonals, E/W)
+# Frequencies and Q are interpolated logarithmically between anchors.
+
+TILT_BASS_FREQ   = 110.0
+TILT_TREBLE_FREQ = 3500.0
+TILT_NS_Q        = 0.35     # Q on both filters at t=0
+
+# Tone anchor presets, selectable at runtime with a long ENTER press on the
+# tone screen. Each preset defines the frequencies and Q of the two filters
+# at the tone anchor (t=1). At the tilt anchor (t=0) the values are fixed
+# (TILT_BASS_FREQ, TILT_TREBLE_FREQ, TILT_NS_Q); interpolation between
+# anchors uses compute_dsp_params().
+#
+#   Preset 0 (default): frequencies match the tilt anchor. Only Q morphs
+#                       along the path (0.35 -> 0.7 on both filters).
+#   Preset 1:           Baxandall frequencies. Frequencies and Q both morph.
+TONE_PRESETS = [
+    {   # preset 0
+        "bass_freq":   110.0,
+        "treble_freq": 3500.0,
+        "bass_q":      0.7,
+        "treble_q":    0.7,
+    },
+    {   # preset 1
+        "bass_freq":   85.0,
+        "treble_freq": 6500.0,
+        "bass_q":      0.9,
+        "treble_q":    0.7,
+    },
+]
+
+# Runtime: which preset is active. Changed by the long ENTER press on the
+# tone screen, persisted in settings.json so that a restart resumes on the
+# last preset used. Default 0 at first launch (or if the saved value is
+# out of range for the current TONE_PRESETS list).
+tone_preset_idx = 0
+
+
+# ---------------------- Loudness compensation ----------------------
+# The compensation gain keeps the perceived loudness roughly constant when
+# the user boosts or cuts both filters. The model is symmetric in the two
+# gains:
+#   - At N/S (bass = -treble): the two filters form a tilt. The energy is
+#     redistributed, not added or removed; the perceived level is unchanged;
+#     no compensation is needed (comp = 0).
+#   - At E/W (bass = treble): the two filters add up to a global boost or
+#     cut. The perceived level changes by the same amount; full compensation
+#     is applied (comp = -0.25 * 2 * ±6 = ∓3).
+#   - In between: linear interpolation, proportional to (bass + treble).
+#
+# This is the special case k_bass = k_treble = 0.25 of a general linear
+# model comp = -(k_bass*bass + k_treble*treble). Any asymmetric weighting
+# would break the zero on N/S, which is why the symmetric model is used.
+
+# Name of the Gain filter used for loudness compensation.
+# Must match the filter name in the YAML pipeline.
+COMP_FILTER = "Compensation"
 
 
 # ---------------------------------------------------------------------
@@ -324,6 +403,11 @@ DEFAULT_LOUDNESS_REF = -30  # Loudness level restored by ENTER when no previous 
 #  things silently. Kept here only because it is shared across
 #  multiple functions.
 # ---------------------------------------------------------------------
+
+# Bass / Treble range, common to both filters.
+# Also keep it ≤ 9.0 to preserve the 6-char display layout
+# (a negative gain below -9 would need 3 characters).
+TONE_MAX_DB = 6.0
 
 TASK_RESTART_DELAY_S = 2.0  # Seconds before a background task that crashed is restarted
 
@@ -678,6 +762,141 @@ def apply_tone(filters, tone):
             apply_filter_param(filters, filt, param, tone[key])
 
 
+# ---------- Tone DSP profile (tilt <-> tone interpolation) ----------
+# The DSP parameters are derived from the current bass / treble gains by
+# blending between two anchors along the direction of the (bass, treble)
+# point relative to the N/S axis. See the SETTINGS block for details.
+
+def interp_log(v0, v1, t):
+    """Geometric (log-linear) interpolation. What the ear perceives is the
+    ratio between values, not their difference, so a linear-in-log ramp gives
+    perceptually even steps."""
+    return v0 * (v1 / v0) ** t
+
+
+def compute_dsp_params(bass, treble):
+    """Blend between the tilt and tone anchors based on the direction of
+    (bass, treble) relative to the N/S axis. Returns
+    (bass_freq, bass_q, treble_freq, treble_q), all rounded.
+
+    t = 0 : on N/S (bass = -treble)          -> tilt anchor
+    t = 1 : 45° or more from N/S             -> tone anchor
+    Logarithmic interpolation for both frequencies and Q.
+
+    The tone anchor values come from TONE_PRESETS[tone_preset_idx], which
+    can be toggled at runtime with a long ENTER press on the tone screen.
+
+    Note: with bass == treble == 0, atan2(0, 0) returns 0 (Python
+    convention), giving t = 1 -> tone anchor. The values are inaudible
+    anyway since gain is 0 on both filters."""
+    angle = math.degrees(math.atan2(treble, bass)) % 360
+    d = abs((angle - 135.0) % 180.0)
+    if d > 90.0:
+        d = 180.0 - d
+    t = min(1.0, d / 45.0)
+
+    preset = TONE_PRESETS[tone_preset_idx % len(TONE_PRESETS)]
+
+    bass_freq   = interp_log(TILT_BASS_FREQ,   preset["bass_freq"],   t)
+    treble_freq = interp_log(TILT_TREBLE_FREQ, preset["treble_freq"], t)
+    bass_q      = interp_log(TILT_NS_Q,        preset["bass_q"],      t)
+    treble_q    = interp_log(TILT_NS_Q,        preset["treble_q"],    t)
+
+    return (round(bass_freq, 1), round(bass_q, 2),
+            round(treble_freq, 1), round(treble_q, 2))
+
+
+def compute_comp(bass, treble):
+    """Loudness compensation, symmetric in the two gains.
+    - Model: comp = -0.25*(bass + treble), clamped to ±3 dB.
+    - At N/S (bass and treble opposite): comp = 0. The two filters form a
+      tilt, which preserves loudness; no compensation is needed.
+    - At E/W (bass and treble equal): comp = ∓3. The two filters add up to
+      a global boost/cut, which changes the perceived level; the full
+      compensation is applied.
+    - On the diagonals: intermediate, proportional to the sum."""
+    return round(clamp(-0.25 * (bass + treble), -3.0, 3.0), 1)
+
+
+def apply_tone_to_config(config):
+    """Apply tone processing to a config dict in place.
+    Frequencies and Q per filter are derived from the direction of the
+    (bass, treble) point (see compute_dsp_params). Compensation is the
+    weighted loudness-constant formula (see compute_comp)."""
+    filters = config.get("filters")
+    if not isinstance(filters, dict):
+        return
+
+    bass   = get_filter_param(config, "Bass",   "gain") or 0.0
+    treble = get_filter_param(config, "Treble", "gain") or 0.0
+
+    bass_freq, bass_q, treble_freq, treble_q = compute_dsp_params(bass, treble)
+    comp = compute_comp(bass, treble)
+
+    apply_filter_param(filters, "Bass",   "freq", bass_freq)
+    apply_filter_param(filters, "Bass",   "q",    bass_q)
+    apply_filter_param(filters, "Treble", "freq", treble_freq)
+    apply_filter_param(filters, "Treble", "q",    treble_q)
+    apply_filter_param(filters, COMP_FILTER, "gain", comp)
+
+
+TONE_FILTERS = ("Bass", "Treble", COMP_FILTER)
+
+
+def _push_filters(filter_names):
+    """Send only the requested filters via PatchConfig.
+    Each filter is sent WHOLE (PatchConfig replaces the leaf object)."""
+    filters = config_active.get("filters") or {}
+    patch_filters = {name: filters[name] for name in filter_names if name in filters}
+    if not patch_filters:
+        return
+    cdsp.config.patch({"filters": patch_filters})
+    vol_state.publish(vol_state.db, vol_state.muted,
+                      config_data=config_active)
+
+def apply_tone_processing():
+    """Apply the tone profile to the active config and push ONLY the
+    affected filters to CamillaDSP (no full pipeline reload)."""
+    apply_tone_to_config(config_active)
+    _push_filters(TONE_FILTERS)
+
+
+def toggle_tone_preset():
+    """Cycle to the next tone anchor preset, re-apply the DSP profile and
+    show the new values as a scrolling message. Called by the long ENTER
+    press on the tone screen. After the message, the display returns to the
+    tone screen so the user can keep adjusting.
+    Only the values of the target preset are shown, never the current ones.
+    Format: '<label> - <q>/<freq> - <q>/<freq>'.
+    The new preset index is persisted in settings.json so that a restart
+    resumes on the last preset used."""
+    global tone_preset_idx
+    tone_preset_idx = (tone_preset_idx + 1) % len(TONE_PRESETS)
+    preset = TONE_PRESETS[tone_preset_idx]
+
+    log.info("[TONE] Preset %d: bass %g Hz Q %g, treble %g Hz Q %g",
+             tone_preset_idx,
+             preset["bass_freq"], preset["bass_q"],
+             preset["treble_freq"], preset["treble_q"])
+
+    apply_tone_processing()
+
+    # Persist the new preset index so that a restart resumes on the last
+    # preset used by the operator.
+    settings["tone_preset_idx"] = tone_preset_idx
+    write_settings()
+
+    # Two labelled couples: '<label> - <q>/<freq> - <q>/<freq>'.
+    #   Preset 0 -> "Def"   (default)
+    #   Preset 1 -> "Alt"   (alternate)
+    # The '.' in the Q values is rendered by _scroll_coro_dp as a DP marker
+    # on the preceding digit. '/' is rendered via _EXTRA_SEGMENTS.
+    label = "Def" if tone_preset_idx == 0 else "Alt"
+    msg = (f"{label} {preset['bass_q']:.1f}-{int(preset['bass_freq'])}"
+           f" / {preset['treble_q']:.1f}-{int(preset['treble_freq'])}")
+    scroll_message_dp(msg, on_finish=display_tone_info)
+
+
 def load_settings():
     try:
         with open(SETTINGS_PATH) as f:
@@ -688,9 +907,18 @@ def load_settings():
         data = {}
     configs = data.get("configs")
     last_config = data.get("last_config")
+
+    # Tone preset index: must be a valid index into TONE_PRESETS.
+    # Default 0 if absent, not an int, or out of range (e.g. the preset
+    # list was shortened by the user between two runs).
+    preset_idx = data.get("tone_preset_idx", 0)
+    if not isinstance(preset_idx, int) or not (0 <= preset_idx < len(TONE_PRESETS)):
+        preset_idx = 0
+
     return {
         "configs": configs if isinstance(configs, dict) else {},
         "last_config": last_config if isinstance(last_config, dict) else {},
+        "tone_preset_idx": preset_idx,
     }
 
 
@@ -755,7 +983,10 @@ def init_tone():
     """Apply the saved tone and loudness of the config CamillaDSP started with.
     The config is pushed to CamillaDSP even when nothing is saved: on this setup
     that push is what makes CamillaDSP start processing at boot (and the players
-    that depend on it only start after that)."""
+    that depend on it only start after that).
+    apply_tone_processing() also applies the DSP profile (freq / q / comp),
+    so the filter parameters match the code even on a config whose YAML was
+    written with other values."""
     global current_config_key
     path = cdsp.config.file_path()
     if not path:
@@ -766,7 +997,7 @@ def init_tone():
     if is_complete_config(config_active):
         filters = config_active.get("filters")
         apply_saved_values(filters if isinstance(filters, dict) else {}, saved)
-        cdsp.config.set_active(config_active)
+        apply_tone_processing()
 
 
 # ---------- CamillaDSP connection, polling and task supervision ----------
@@ -812,6 +1043,8 @@ def resync_after_reconnect():
         filters = config_active.get("filters")
         if not current_config_external:
             apply_saved_values(filters if isinstance(filters, dict) else {}, saved)
+            # Re-derive freq / q / comp after restoring saved tone
+            apply_tone_to_config(config_active)
         cdsp.config.set_active(config_active)
 
 
@@ -1030,6 +1263,11 @@ async def change_config(cdsp, config_pattern, cycle=True):
     saved = settings["configs"].get(new_key)
     apply_saved_values(filters, saved)
 
+    # Re-derive freq / q / comp from the new gains.
+    # This must happen AFTER apply_saved_values (which may have changed the
+    # gains) and BEFORE set_active (so CamillaDSP receives the final values).
+    apply_tone_to_config(new_config_data)
+
     # Make relative filter file names absolute
     config_dir = os.path.dirname(os.path.abspath(new_config_path))
     for f in filters.values():
@@ -1075,7 +1313,7 @@ async def change_config(cdsp, config_pattern, cycle=True):
 
     # A config switch is a visible event. If a scroll is running (CONF AUTO,
     # POWER OFF, ...), leave it alone: its end-of-scroll callback
-    # (return_to_volume_later) will redraw the volume screen with the new
+    # (return_to_screen_later) will redraw the volume screen with the new
     # config, which is already published into vol_state. Manual callers
     # (BACK, HOMEPAGE, cycle_group) have already cancelled the scroll at the
     # key-press level, so this only affects automatic switches.
@@ -1126,6 +1364,7 @@ async def volume_watcher_loop():
             # already did save, apply, set_active, set_file_path,
             # current_config_key, current_config_external = False, and display.
             published, vol_state.config_data = vol_state.config_data, None
+
             if published is not None:
                 last_active = current_active
                 resync_retries = 0
@@ -1689,6 +1928,7 @@ def swap(segs):
 _EXTRA_SEGMENTS = {
     '_': 0x08,
     '|': 0x06,
+    '/': 0x52,   # E + G + B: diagonal from bottom-left through middle to top-right
 }
 
 
@@ -1755,10 +1995,9 @@ async def wait_scroll():
     return not task.cancelled()
 
 
-def _start_scroll(coro):
+def _start_scroll(coro, on_finish=None):
     """Run a display coroutine as THE scrolling task (cancels the previous one).
-    When it ends normally, the volume screen comes back, unless another scroll
-    has taken over or the task was cancelled."""
+    When it ends normally, `on_finish` is called (default: the volume screen)."""
     global _scroll_task, last_displayed
     cancel_scroll()
     last_displayed = "message"
@@ -1768,7 +2007,7 @@ def _start_scroll(coro):
     def _on_done(t):
         if t.cancelled() or t is not _scroll_task:
             return
-        asyncio.create_task(return_to_volume_later(0))
+        asyncio.create_task(return_to_screen_later(on_finish, 0))
 
     task.add_done_callback(_on_done)
 
@@ -1783,24 +2022,74 @@ async def _scroll_coro(text, frame_delay, end_pause):
     await asyncio.sleep(end_pause)
 
 
-def scroll_message(text, frame_delay=None, end_pause=None):
-    """Start scrolling `text` on the display (cancels any previous scroll).
-    After the scroll, falls back to the volume screen."""
+async def _scroll_coro_dp(text, frame_delay, end_pause):
+    """Scroll `text` through the 6-char display, treating '.' as a decimal-point
+    MARKER: the '.' itself is never displayed as a character, instead the DP
+    segment (0x80) of the preceding digit is lit. Used for tone preset messages
+    such as '110-0.7  3500-0.7'. Cancellable."""
+    # Convert to a list of (char, dp_lit) pairs. A '.' turns the previous
+    # entry's dp_lit on, and is itself dropped from the list.
+    items = []
+    for c in text:
+        if c == "." and items:
+            items[-1] = (items[-1][0], True)
+        else:
+            items.append((c, False))
+
+    # Pad with spaces for a clean entry and exit from the window.
+    items = [(" ", False)] + items + [(" ", False)] * 6
+
+    for i in range(len(items) - 5):
+        segs = bytearray(6)
+        for j in range(6):
+            c, dp = items[i + j]
+            if c in _EXTRA_SEGMENTS:
+                segs[j] = _EXTRA_SEGMENTS[c]
+            else:
+                segs[j] = tm.encode_char(c)
+            if dp:
+                segs[j] |= 0x80
+        tm.write(swap(segs))
+        await asyncio.sleep(frame_delay)
+    await asyncio.sleep(end_pause)
+
+
+def scroll_message(text, frame_delay=None, end_pause=None, on_finish=None):
+    """Start scrolling text on the display (cancels any previous scroll).
+    When the scroll finishes normally, `on_finish` is called (default:
+    the volume screen)."""
     if not ENABLE_DISPLAY:
         return
-    _start_scroll(_scroll_coro(
-        text,
-        SCROLL_FRAME_DELAY if frame_delay is None else frame_delay,
-        SCROLL_END_PAUSE if end_pause is None else end_pause))
+    _start_scroll(
+        _scroll_coro(
+            text,
+            SCROLL_FRAME_DELAY if frame_delay is None else frame_delay,
+            SCROLL_END_PAUSE if end_pause is None else end_pause),
+        on_finish=on_finish)
 
 
-async def return_to_volume_later(delay=0):
-    """Go back to the volume screen after a scrolling message, unless another
-    screen has been shown in the meantime (a key was pressed), another message
-    has started, or the display has been blanked."""
+def scroll_message_dp(text, frame_delay=None, end_pause=None, on_finish=None):
+    """Like scroll_message, but '.' is interpreted as a decimal-point
+    marker (see _scroll_coro_dp). Use this for any message containing
+    decimal values, e.g. '110-0.7  3500-0.7'. When the scroll finishes
+    normally, `on_finish` is called (default: the volume screen)."""
+    if not ENABLE_DISPLAY:
+        return
+    _start_scroll(
+        _scroll_coro_dp(
+            text,
+            SCROLL_FRAME_DELAY if frame_delay is None else frame_delay,
+            SCROLL_END_PAUSE if end_pause is None else end_pause),
+        on_finish=on_finish)
+
+
+async def return_to_screen_later(redraw, delay=0):
+    """Redraw a screen after a scroll. `redraw` is the function to call
+    (e.g. display_tone_info), or None for the default volume screen.
+    Skipped if another screen has been shown or the display is blanked."""
     await asyncio.sleep(delay)
     if last_displayed == "message" and not display_is_off and not scroll_active():
-        display_volume_info()
+        (redraw or display_volume_info)()
 
 
 # ---------- Screens ----------
@@ -1811,8 +2100,15 @@ def blink_on():
 
 
 def fmt_gain(value):
-    """2-character value for the display, aligned left; '--' if the filter is absent."""
-    return "--" if value is None else f"{round(value):<2}"
+    """2-character display value: integer part only, '--' if the filter is
+    absent. In this single-input version the gains are always integers, so
+    this simply formats them; the '-' is preserved for negative values."""
+    if value is None:
+        return "--"
+    v = round(value)
+    if v >= 0:
+        return f"{v:<2}"           # "0 ", "6 ", "12"
+    return f"-{abs(v)}"            # "-6", "-3"
 
 
 def fmt_loudness(value):
@@ -1893,9 +2189,14 @@ def display_volume_info(current_volume=None, is_muted=None):
         return                  # no display: do not query CamillaDSP for nothing
 
     if current_volume is None:
-        current_volume = cdsp.volume.main_volume()
+        current_volume = vol_state.db
+        if current_volume is None:
+            current_volume = cdsp.volume.main_volume()
+
     if is_muted is None:
-        is_muted = cdsp.volume.main_mute()
+        is_muted = vol_state.muted
+        if is_muted is None:
+            is_muted = cdsp.volume.main_mute()
 
     config_label = get_config_display_label()
 
@@ -1949,6 +2250,9 @@ def display_volume_info(current_volume=None, is_muted=None):
 
 
 def display_tone_info():
+    """Show the two tone gains. Layout: 'B{xx}T{yy}'.
+    The gains are always integers in this single-input version, so the DP
+    (decimal point) is never used here."""
     global last_displayed
     p = get_all_tone_params(config_active)
     show(f"B{fmt_gain(p['bass'])}T{fmt_gain(p['treble'])}")
@@ -2173,7 +2477,7 @@ def read_toslink_capture_params():
         return None
 
 
-def _levels(data, fmt, channels=2):
+def _levels(data, fmt, channels):
     """Peak and RMS level, in dBFS, of a buffer of samples in the CamillaDSP
     format `fmt`. Returns (peak_db, rms_db), or (None, None) if it is empty.
     Like the levels CamillaDSP reports (and is_silent() uses), the RMS is the one
@@ -2417,15 +2721,18 @@ enter_display_at_press = None   # Screen shown when ENTER was pressed (to tell s
 # ---------- Key actions ----------
 def change_volume_from_key(key, current_volume, volume_step=1):
     """Move one step on the 0..100 scale (LMS / Squeezelite curve).
-    `current_volume` is the CamillaDSP main volume in dB."""
+    Return the resulting CamillaDSP volume in dB."""
     pct = db_to_pct(current_volume)
-    delta = -volume_step if key == KEY_BINDINGS['VOLUMEDOWN'] else volume_step
+    delta = -1 if key == KEY_BINDINGS['VOLUMEDOWN'] else 1
     new_pct = clamp(pct + delta, 0, 100)
 
     if new_pct != pct:
         new_volume = pct_to_db(new_pct)
         cdsp.volume.set_main_volume(new_volume)
         display_volume_info(new_volume)
+        return new_volume
+
+    return current_volume
 
 
 _volume_release_task = None     # Pending "end of the volume key" task (see schedule_volume_release)
@@ -2457,15 +2764,21 @@ def schedule_volume_release():
 
 
 def handle_arrow_keys(key):
-    """Adjust the parameters of the screen currently displayed."""
+    """Adjust the parameters of the screen currently displayed.
+    On the tone screen, the four arrows enter Bass and Treble directly:
+      UP/DOWN     : Bass   +/- 1
+      RIGHT/LEFT  : Treble +/- 1
+    The DSP profile (freq / q / comp) is then recomputed by
+    apply_tone_processing()."""
     up, down = KEY_BINDINGS['UP'], KEY_BINDINGS['DOWN']
 
     if last_displayed == "loudness":
         loudness_params = get_filter_params(config_active, "Loudness")
         if loudness_params is not None and key in (up, down):   # LEFT / RIGHT do nothing here
-            ref_level = loudness_params.get('reference_level', 0) + (LOUDNESS_STEP if key == up else -LOUDNESS_STEP)
+            ref_level = loudness_params.get('reference_level', 0) + (
+                LOUDNESS_STEP if key == up else -LOUDNESS_STEP)
             loudness_params['reference_level'] = clamp(ref_level, LOUDNESS_MIN, LOUDNESS_MAX)
-            cdsp.config.set_active(config_active)
+            _push_filters(("Loudness",))
             display_loudness_info()
 
     elif last_displayed == "tone":
@@ -2473,7 +2786,9 @@ def handle_arrow_keys(key):
         params = get_filter_params(config_active, filt)
         if params is not None:      # filter absent from this config: the key does nothing
             params['gain'] = clamp(params.get('gain', 0) + step, -limit, limit)
-            cdsp.config.set_active(config_active)
+            # Recompute Q and Compensation from the new Bass/Treble gains,
+            # then push the config to CamillaDSP.
+            apply_tone_processing()
             display_tone_info()
 
     else:
@@ -2506,7 +2821,8 @@ def handle_enter_press(screen):
             for p in existing.values():
                 p['gain'] = 0
 
-        cdsp.config.set_active(config_active)
+        # Recompute Q and Compensation from the new gains, then push.
+        apply_tone_processing()
         display_tone_info()
 
     elif screen == "loudness":
@@ -2518,7 +2834,7 @@ def handle_enter_press(screen):
             else:
                 prev_values["loudness_ref"] = loudness_params.get('reference_level', DEFAULT_LOUDNESS_REF)
                 loudness_params['reference_level'] = -100
-            cdsp.config.set_active(config_active)
+            _push_filters(("Loudness",))
             display_loudness_info()
 
 
@@ -2568,6 +2884,7 @@ async def remote_events(device):
     home_press_time = 0.0           # moment HOMEPAGE was pressed (long-press detection, TOSLINK ON)
     home_toggled = False            # the HOMEPAGE long press has already been handled
     volume_repeat_count = 0         # repeats since the last applied volume step (VOLUME_SLOWDOWN)
+    arrow_repeat_count = 0          # repeats since the last arrow step (ARROW_REPEAT_EVERY)
     swallowed_key = None            # key that only woke the display: ignored until released
     while True:
         try:
@@ -2615,7 +2932,7 @@ async def remote_events(device):
                         if ENABLE_DISPLAY and (last_displayed != "volume" or blank_volume_when_mute):
                             display_volume_info(current_volume, is_muted)
                         else:
-                            change_volume_from_key(key, current_volume)
+                            current_volume = change_volume_from_key(key, current_volume)
 
                     # `in`, not `==`: evdev returns a list when a code has several names
                     elif KEY_BINDINGS['MUTE'] in key:
@@ -2624,10 +2941,11 @@ async def remote_events(device):
                         is_volume_key_held = False
                         is_muted = not cdsp.volume.main_mute()
                         cdsp.volume.set_main_mute(is_muted)
-                        display_volume_info(cdsp.volume.main_volume(), is_muted)
+                        display_volume_info(vol_state.db, is_muted)
 
                     elif ENABLE_DISPLAY and key in (KEY_BINDINGS['UP'], KEY_BINDINGS['DOWN'],
                                                     KEY_BINDINGS['RIGHT'], KEY_BINDINGS['LEFT']):
+                        arrow_repeat_count = 0
                         handle_arrow_keys(key)
 
                     elif key == KEY_BINDINGS['BACK']:
@@ -2650,12 +2968,19 @@ async def remote_events(device):
 
                 elif attrib.keystate == 2:  # Key held down
 
+
                     if key in volume_keys:
-                        # One step every VOLUME_SLOWDOWN repeats of the remote
                         volume_repeat_count += 1
                         if volume_repeat_count >= VOLUME_SLOWDOWN[key]:
                             volume_repeat_count = 0
-                            change_volume_from_key(key, cdsp.volume.main_volume())
+                            current_volume = change_volume_from_key(key, current_volume)
+
+                    elif ENABLE_DISPLAY and key in (KEY_BINDINGS['UP'], KEY_BINDINGS['DOWN'],
+                                                     KEY_BINDINGS['RIGHT'], KEY_BINDINGS['LEFT']):
+                        arrow_repeat_count += 1
+                        if arrow_repeat_count >= ARROW_REPEAT_EVERY:
+                            arrow_repeat_count = 0
+                            handle_arrow_keys(key)
 
                     elif key in (KEY_BINDINGS['PREVIOUSSONG'], KEY_BINDINGS['NEXTSONG']):
                         key_hold_counter += 1
@@ -2691,10 +3016,17 @@ async def remote_events(device):
                     elif key == KEY_BINDINGS['ENTER']:
                         key_hold_counter += 1
                         if key_hold_counter == HOLD_SHOW_LOUDNESS:
-                            if enter_display_at_press == "loudness":
-                                display_tone_info()
-                            else:  # "volume" or "tone"
+                            # ENTER long:
+                            #   volume   -> Loudness
+                            #   tone     -> cycle the tone anchor preset
+                            #               (message shows values, returns to the tone screen)
+                            #   loudness -> Volume (exit the loudness screen)
+                            if enter_display_at_press == "volume":
                                 display_loudness_info()
+                            elif enter_display_at_press == "tone":
+                                toggle_tone_preset()
+                            elif enter_display_at_press == "loudness":
+                                display_volume_info()
 
                 elif attrib.keystate == 0:  # Key released
 
@@ -2802,6 +3134,7 @@ clear_display()
 tm.brightness(BRIGHTNESS_LEVELS[last_level])
 settings = load_settings()
 load_prev_values()
+tone_preset_idx = settings["tone_preset_idx"]   # resume on the last preset used
 if TONE_ACTIVE:
     init_tone()
 

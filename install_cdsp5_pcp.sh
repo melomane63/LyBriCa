@@ -1,12 +1,15 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# install_pcp.sh - CamillaDSP installer for piCorePlayer (menu)
+# install_cdsp5_pcp.sh - CamillaDSP 5.x + CamillaGUI installer for piCorePlayer
+#
+# Fork of piCoreCDSP by JWahle (https://github.com/JWahle/piCoreCDSP)
+# License: MIT
 #
 #   1) CamillaDSP 5.x + CamillaGUI  (Squeezelite -> loopback -> CamillaDSP -> DAC)
 #                                   installed as the CDSPpiCore.tcz extension
 #
 # Usage (SSH, user tc):
-#   sh install_pcp.sh      -> interactive menu (no parameters)
+#   sh install_cdsp5_pcp.sh      -> interactive menu (no parameters)
 #
 # The step runs in its own process: an error does not stop the menu,
 # and nothing is saved (pcp bu) if that step fails.

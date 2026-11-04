@@ -31,8 +31,8 @@ button and the BLE remote, and sends ambient-light readings to the Pi.
 
 | File | Purpose |
 |---|---|
-| [`install_cdsp5_pcp.sh`](https://github.com/melomane63/LyBriCa/blob/main/install_cdsp5_pcp.sh) | piCorePlayer: installs CamillaDSP 5 + CamillaGUI |
-| [`install_lybrica_pcp.sh`](https://github.com/melomane63/LyBriCa/blob/main/install_lybrica_pcp.sh) | piCorePlayer: installs LyBriCa, the BLE HID bridge and the ESP32 boot settings |
+| [`install_cdsp5_pcp.sh`](https://github.com/melomane63/LyBriCa/blob/main/install_cdsp5_pcp.sh) | piCorePlayer: installs CamillaDSP, CamillaGUI V5 with loopbacl ( no alsa_cdsp) |
+| [`install_lybrica_pcp.sh`](https://github.com/melomane63/LyBriCa/blob/main/install_lybrica_pcp.sh) | piCorePlayer: installs LyBriCa with dependency and set gpios |
 | [`rpiOs_install_cdsp5_lybrica.sh`](https://github.com/melomane63/LyBriCa/blob/main/rpiOs_install_cdsp5_lybrica.sh) | Raspberry Pi OS: menu installer for everything (CamillaDSP, Lyrion, Squeezelite, LyBriCa...) |
 | [`lybrica.py`](https://github.com/melomane63/LyBriCa/blob/main/lybrica.py) | The LyBriCa script itself |
 

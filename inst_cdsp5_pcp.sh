@@ -1,849 +1,472 @@
-#!/bin/bash
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# install_pcp.sh - CamillaDSP installer for piCorePlayer (menu)
+#
+#   1) CamillaDSP 5.x + CamillaGUI  (Squeezelite -> loopback -> CamillaDSP -> DAC)
+#                                   installed as the CDSPpiCore.tcz extension
+#
+# Usage (SSH, user tc):
+#   sh install_pcp.sh      -> interactive menu (no parameters)
+#
+# The step runs in its own process: an error does not stop the menu,
+# and nothing is saved (pcp bu) if that step fails.
+# ---------------------------------------------------------------------------
 
-# Exit on error
+SELF="$0"
+HOME_DIR=/home/tc
+# NOTE: /opt/bootlocal.sh is NOT read, written or used by this installer.
+
+# Exit code a step returns when the user cancels it (shown as SKIPPED).
+SKIP_RC=10
+
+say()  { echo "==> $*"; }
+fail() { echo "ERROR: $*" >&2; exit 1; }
+
+###########################################################################
+# CENTRALIZED URLS AND VERSIONS
+# All remote resources fetched by this script are listed here.
+# To upgrade a component, change ONLY the matching variable below.
+###########################################################################
+
+# --- 1) CamillaDSP + CamillaGUI -----------------------------------------
+CDSP_VER="5.0.0-beta.2"          # CamillaDSP release tag
+GUI_VER="5.0.0-beta.2"           # camillagui-backend release tag
+
+# Binary archives (arch suffix is appended at runtime: aarch64|armv7)
+CDSP_URL_BASE="https://github.com/HEnquist/camilladsp/releases/download/v${CDSP_VER}"
+CDSP_URL_ARCH="camilladsp-linux-%s.tar.gz"      # %s = aarch64|armv7
+
+GUI_URL_BASE="https://github.com/HEnquist/camillagui-backend/releases/download/v${GUI_VER}"
+GUI_URL_ARCH="camillagui_linux_%s.tar.gz"       # %s = aarch64|armv7
+
+# --- pCP extension names (for reference) --------------------------------
+EXT_CDSP="CDSPpiCore.tcz"
+
+###########################################################################
+# 1) CAMILLADSP  (extension version)
+#
+# Layout:
+#   CDSPpiCore.tcz (read-only, rebuilt at each run)
+#     /usr/local/bin/camilladsp
+#     /usr/local/camillagui/camillagui        (+ symlink config -> $BASE/camillagui/config)
+#     /usr/local/tce.installed/CDSPpiCore     (start script, run as root)
+#   /mnt/mmcblk0p2/tce/camilladsp (persistent data, outside the extension)
+#     configs/ coeffs/ default_config.yml camilladsp_statefile.yml
+#     camillagui/config/ (camillagui.yml, gui-config.yml)
+###########################################################################
+install_camilladsp() {
 set -e
 
-# =============================================================================
-# Global download URLs
-# =============================================================================
-CDSP_URL="https://github.com/HEnquist/camilladsp/releases/download/v5.0.0-beta.2/camilladsp-linux-aarch64.tar.gz"
-GUI_URL="https://github.com/HEnquist/camillagui-backend/releases/download/v5.0.0-beta.2/camillagui_linux_aarch64.tar.gz"
-PYCAMILLADSP_URL="git+https://github.com/HEnquist/pycamilladsp.git@next5"
-LMS_URL="https://downloads.lms-community.org/LyrionMusicServer_v9.1.1/lyrionmusicserver_9.1.1_arm.deb"
+### ======================= CONFIG ==========================================
+# CDSP_VER and GUI_VER are defined globally at the top of this file.
+DAC_FROM_PCP="yes"               # "yes": take the DAC from OUTPUT in pcp.cfg (read BEFORE it is switched to the loopback)
+DAC_DEVICE="null"                # fallback DAC: ALSA "null" output (silence); replace with the real DAC (e.g. hw:CARDNAME,0, see /proc/asound/cards)
+SAMPLERATE=48000                 # fixed pipeline sample rate
+CAPTURE_FORMAT="S32_LE"          # loopback side (what Squeezelite writes)
+PLAYBACK_FORMAT="S16_LE"         # DAC side (see /proc/asound/card0/stream0)
+SQ_RATES="48000-48000"           # Squeezelite -r: fixed rate (same as SAMPLERATE)
+SQ_UPSAMPLE="hLE"                # Squeezelite -R: resampling options
+SQ_ALSA_PARAMS="::::"            # Squeezelite -a: all 5 fields empty (defaults)
+### =========================================================================
 
-# Extract versions from URLs (for menu display)
-CDSP_VERSION="${CDSP_URL#*/download/v}"
-CDSP_VERSION="${CDSP_VERSION%%/*}"
+normalize_fmt() {
+    echo "$1" | sed -E 's/^([SF][0-9]+)(_[0-9]+)?LE$/\1\2_LE/'
+}
+CAPTURE_FORMAT=$(normalize_fmt "$CAPTURE_FORMAT")
+PLAYBACK_FORMAT=$(normalize_fmt "$PLAYBACK_FORMAT")
 
-LMS_VERSION="${LMS_URL#*/LyrionMusicServer_v}"
-LMS_VERSION="${LMS_VERSION%%/*}"
+PCP_CFG=/usr/local/etc/pcp/pcp.cfg
+if [ "$DAC_FROM_PCP" = "yes" ] && [ -r "$PCP_CFG" ]; then
+    PCP_OUT=$(sed -n 's/^OUTPUT="\(.*\)"/\1/p' "$PCP_CFG" | head -n 1)
+    PCP_OUT=$(echo "$PCP_OUT" | sed -E 's/^plughw:/hw:/; s/^hw:CARD=([^,]*),DEV=([0-9]+)$/hw:\1,\2/; s/^hw:CARD=([^,]*)$/hw:\1,0/')
+    # DAC already set in an existing _A-loopback.yml (script re-run)
+    EXISTING_CFG=/mnt/mmcblk0p2/tce/camilladsp/configs/_A-loopback.yml
+    EXISTING_DAC=""
+    if [ -r "$EXISTING_CFG" ]; then
+        EXISTING_DAC=$(awk '/^  playback:/{f=1;next} f && /^    device:/{gsub(/^    device:[ ]*"?/,""); gsub(/"?[ ]*$/,""); print; exit}' "$EXISTING_CFG")
+        case "$EXISTING_DAC" in *Loopback*) EXISTING_DAC="" ;; esac
+    fi
+    case "$PCP_OUT" in
+        *Loopback*|"")
+            if [ -n "$EXISTING_DAC" ]; then
+                DAC_DEVICE="$EXISTING_DAC"
+                echo ">>> pcp.cfg OUTPUT is empty or already the loopback: DAC taken from _A-loopback.yml: $DAC_DEVICE"
+            else
+                echo ">>> pcp.cfg OUTPUT is empty or already the loopback: keeping DAC_DEVICE=$DAC_DEVICE"
+            fi ;;
+        hw:*)
+            DAC_DEVICE="$PCP_OUT"
+            echo ">>> DAC taken from pcp.cfg: $DAC_DEVICE" ;;
+        *)
+            if [ -n "$EXISTING_DAC" ]; then
+                DAC_DEVICE="$EXISTING_DAC"
+                echo "!!! WARNING: pcp.cfg OUTPUT ('$PCP_OUT') is not a hw: device: DAC taken from _A-loopback.yml: $DAC_DEVICE"
+            else
+                echo "!!! WARNING: pcp.cfg OUTPUT ('$PCP_OUT') is not a hw: device: keeping DAC_DEVICE=$DAC_DEVICE"
+            fi ;;
+    esac
+fi
 
-# =============================================================================
-# Function to update and upgrade the system
-# =============================================================================
-upgrade_system() {
-    echo "🔄 Updating and upgrading system..."
-    sudo apt update && sudo apt upgrade -y
-    ###sudo apt install -y git wget curl python3-pip python3-venv python3-dev build-essential systemd libasound2-dev
-    sudo apt install -y wget systemd
+BASE=/mnt/mmcblk0p2/tce/camilladsp
+TMPDIR_CDSP=/tmp/install_camilladsp
+OPT=/etc/sysconfig/tcedir/optional
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+### --- Sanity checks --------------------------------------------------------
+REQUIRED_MB=150
+AVAILABLE_MB=$(/bin/df -m /dev/mmcblk0p2 | awk 'NR==2 { print $4 }')
+if [ "$AVAILABLE_MB" -le "$REQUIRED_MB" ]; then
+    die "Not enough space (${AVAILABLE_MB} MB). Enlarge the partition: Main Page > Additional functions > Resize FS"
+fi
+
+# (No more refusal if CDSPpiCore.tcz exists: it is simply replaced.)
+
+if [ -d "$TMPDIR_CDSP" ]; then
+    die "Reboot before re-running ($TMPDIR_CDSP already exists)."
+fi
+
+if [ "$(uname -m)" = "aarch64" ]; then
+    ARCH_SUFFIX="aarch64"
+else
+    ARCH_SUFFIX="armv7"
+fi
+echo ">>> Architecture: $(uname -m) -> camilladsp-linux-$ARCH_SUFFIX binary"
+
+mkdir -p "$TMPDIR_CDSP"
+
+install_if_missing() {
+    if ! tce-status -i | grep -q "$1" ; then
+        pcp-load -wil "$1"
+    fi
 }
 
-# =============================================================================
-# Helper: write a systemd service file, protecting manual edits
-# =============================================================================
-write_service_protected() {
-    local service_name="$1"
-    local service_file="$2"
-    local service_content="$3"
-
-    if [ ! -f "$service_file" ]; then
-        echo "📝 Creating ${service_name}..."
-        echo "$service_content" | sudo tee "$service_file" > /dev/null
-        echo "✅ ${service_name} written."
-        return 0
+# Same, but temporary: downloaded to /tmp, gone after the next reboot.
+install_temporarily_if_missing() {
+    if ! tce-status -i | grep -q "$1" ; then
+        pcp-load -wil -t /tmp "$1"
     fi
-
-    if [ "$(sudo cat "$service_file")" = "$service_content" ]; then
-        echo "✅ ${service_name} already up to date, skipping."
-        return 0
-    fi
-
-    echo "⚠  ${service_name} exists but differs from the script's version."
-    read -p "Overwrite ${service_name}? (y/n): " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        echo "↩  Keeping existing ${service_name} (manual edits preserved)."
-        return 1
-    fi
-
-    # Backup with timestamp before overwriting
-    local backup_file="${service_file}.$(date +%Y%m%d-%H%M%S).bak"
-    echo "💾 Backing up to ${backup_file}..."
-    sudo cp "$service_file" "$backup_file"
-
-    # Keep only the 5 most recent backups for this service
-    sudo bash -c "ls -t '${service_file}'.*.bak 2>/dev/null | tail -n +6 | xargs -r rm -f"
-
-    echo "$service_content" | sudo tee "$service_file" > /dev/null
-    echo "✅ ${service_name} overwritten (backup: ${backup_file})."
-    return 0
 }
 
-# =============================================================================
-# Function to install Lybrica
-# (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)
-# =============================================================================
-install_lybrica() {
-    echo "🎮 Installing Lybrica (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)..."
+set -v
 
-    # -------------------------------------------------------------------------
-    # 0. Lybrica-specific dependencies
-    # -------------------------------------------------------------------------
-    echo "📦 Installing Lybrica dependencies..."
-    sudo apt install -y git curl python3-pip python3-venv python3-dev build-essential libasound2-dev python3-audioop-lts
+### --- 1. Directories and CamillaDSP binary --------------------------------
+EXT="$TMPDIR_CDSP/ext"
+mkdir -p "$EXT/usr/local/bin" "$EXT/usr/local/camillagui" "$EXT/usr/local/tce.installed"
+CDSP_BIN="$EXT/usr/local/bin/camilladsp"
 
-    # -------------------------------------------------------------------------
-    # 1. Configure /boot/firmware/config.txt and cmdline.txt
-    # -------------------------------------------------------------------------
-    echo "⚙  Configuring /boot/firmware/config.txt..."
+# Persistent data (outside the extension)
+mkdir -p "$BASE/configs" "$BASE/coeffs" "$BASE/camillagui/config"
 
-    CONFIG_FILE="/boot/firmware/config.txt"
+cd "$TMPDIR_CDSP"
+CDSP_ASSET=$(printf "$CDSP_URL_ARCH" "$ARCH_SUFFIX")
+CDSP_URL="${CDSP_URL_BASE}/${CDSP_ASSET}"
+echo ">>> CamillaDSP: $CDSP_URL"
+wget -O camilladsp.tar.gz "$CDSP_URL"
+tar -xzf camilladsp.tar.gz -C "$EXT/usr/local/bin"
+rm -f camilladsp.tar.gz
+chmod +x "$CDSP_BIN"
+"$CDSP_BIN" --version
 
-    if sudo grep -q "^#installed-by-lybrica" "$CONFIG_FILE" 2>/dev/null; then
-        echo "ℹ  Lybrica already installed (found #installed-by-lybrica in config.txt). Skipping config.txt rewrite."
-    else
-        sudo cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+### --- 2. Module ALSA loopback ---------------------------------------------
+if ! sudo modprobe snd-aloop 2>/dev/null; then
+    install_if_missing "alsa-modules-$(uname -r)" || true
+    sudo modprobe snd-aloop || die "snd-aloop not found. Look for the ALSA modules extension matching your kernel (tce-ab)."
+fi
+aplay -l | grep -qi loopback || die "Loopback card missing after modprobe."
 
-        sudo tee "$CONFIG_FILE" > /dev/null <<'EOL'
-# For more options and information see
-# http://rptl.io/configtxt
-# Some settings may impact device functionality. See link above for details
+### --- 3. CamillaDSP config and statefile ----------------------------------
+# Minimal pass-through config: Loopback,1 (capture) -> 0 dB gain -> DAC.
+# Capture on Loopback,1 because Squeezelite plays on Loopback,0.
+cat > "$BASE/configs/_A-loopback.yml" <<EOF
+---
+devices:
+  samplerate: ${SAMPLERATE}
+  chunksize: 1024
+  queuelimit: 4
+  capture:
+    type: Alsa
+    channels: 2
+    device: "hw:Loopback,1"
+    format: ${CAPTURE_FORMAT}
+  playback:
+    type: Alsa
+    channels: 2
+    device: "${DAC_DEVICE}"
+    format: ${PLAYBACK_FORMAT}
 
-# Uncomment some or all of these to enable the optional hardware interfaces
+filters:
+  gain0:
+    type: Gain
+    parameters:
+      gain: 0.0
 
-# Enable audio (loads snd_bcm2835)
-
-# Additional overlays and parameters are documented
-# /boot/firmware/overlays/README
-
-# Automatically load overlays for detected cameras
-#camera_auto_detect=1
-
-# Automatically load overlays for detected DSI displays
-#display_auto_detect=1
-
-# Automatically load initramfs files, if found
-auto_initramfs=1
-
-# Enable DRM VC4 V3D driver
-max_framebuffers=2
-
-# Don't have the firmware create an initial video= setting in cmdline.txt.
-# Use the kernel's default instead.
-disable_fw_kms_setup=1
-
-# Run in 64-bit mode
-arm_64bit=1
-
-# Disable compensation for displays with overscan
-disable_overscan=1
-
-# Run as fast as firmware / board allows
-arm_boost=1
-
-[cm4]
-# Enable host mode on the 2711 built-in XHCI USB controller.
-# This line should be removed if the legacy DWC2 controller is required
-# (e.g. for USB device mode) or if USB support is not required.
-otg_mode=1
-
-[cm5]
-
-[all]
-dtparam=audio=off
-dtoverlay=gpio-poweroff,gpiopin=26,active_low=1
-dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down
-enable_uart=1
-gpio=12=ip,np
-
-#installed-by-lybrica
-EOL
-
-        echo "✅ /boot/firmware/config.txt rewritten!"
-    fi
-
-    CMDLINE_FILE="/boot/firmware/cmdline.txt"
-    if [ -f "$CMDLINE_FILE" ]; then
-        if ! sudo grep -q "console=serial0" "$CMDLINE_FILE"; then
-            echo "ℹ  cmdline.txt already clean (no serial console)."
-        else
-            sudo cp "$CMDLINE_FILE" "${CMDLINE_FILE}.bak"
-            sudo sed -i 's/console=serial0,[0-9]* //' "$CMDLINE_FILE"
-            echo "✅ cmdline.txt cleaned (serial console removed)."
-        fi
-    fi
-
-    # -------------------------------------------------------------------------
-    # 2. User groups & venv
-    # -------------------------------------------------------------------------
-    sudo usermod -aG dialout,gpio,input,spi,i2c,audio "$USER"
-
-    # -------------------------------------------------------------------------
-    # 2b. Sudoers rule (no protection, trivial content)
-    # -------------------------------------------------------------------------
-    echo "🔐 Adding sudoers rule for passwordless shutdown..."
-    SUDOERS_TMP=$(mktemp)
-    echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" > "$SUDOERS_TMP"
-    if ! sudo visudo -c -f "$SUDOERS_TMP" > /dev/null; then
-       rm -f "$SUDOERS_TMP"
-       echo "❌ Invalid sudoers rule, nothing installed."
-       exit 1
-    fi
-    sudo install -m 440 -o root -g root "$SUDOERS_TMP" /etc/sudoers.d/lybrica
-    rm -f "$SUDOERS_TMP"
-
-    if [ ! -d "/opt/venv" ]; then
-        sudo mkdir -p /opt/venv
-        sudo python3 -m venv --system-site-packages /opt/venv
-    fi
-    sudo /opt/venv/bin/pip install --upgrade pip
-
-    # -------------------------------------------------------------------------
-    # 3. Dependencies
-    # -------------------------------------------------------------------------
-    sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5 pyalsaaudio
-
-    PYVER=$(/opt/venv/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-
-    if /opt/venv/bin/pip show camilladsp &> /dev/null; then
-        echo "✅ camilladsp (pycamilladsp) already installed, skipping."
-    else
-        echo "📦 Installing camilladsp from $PYCAMILLADSP_URL..."
-        sudo /opt/venv/bin/pip install "$PYCAMILLADSP_URL"
-    fi
-
-    # -------------------------------------------------------------------------
-    # 4. Download scripts
-    # -------------------------------------------------------------------------
-    SAVED_REMOTE_NAME=""
-    if [ -f "$HOME/scripts/lybrica.py" ]; then
-        SAVED_REMOTE_NAME=$(/opt/venv/bin/python3 - "$HOME/scripts/lybrica.py" <<'EOF' || true
-import ast
-import re
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as f:
-    text = f.read()
-
-m = re.search(
-    r"""^REMOTE_NAME\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')""",
-    text,
-    re.MULTILINE,
-)
-if m:
-    print(ast.literal_eval(m.group(1)))
+pipeline:
+  - type: Filter
+    channels: [0, 1]
+    names: [gain0]
+title: Setup
 EOF
-)
-    fi
+cp "$BASE/configs/_A-loopback.yml" "$BASE/default_config.yml"
 
-    # Backup existing lybrica.py before re-downloading
-    if [ -f "$HOME/scripts/lybrica.py" ]; then
-        BACKUP_LYBRICA="$HOME/scripts/lybrica.py.$(date +%Y%m%d-%H%M%S).bak"
-        echo "💾 Backing up existing lybrica.py to ${BACKUP_LYBRICA}..."
-        cp "$HOME/scripts/lybrica.py" "$BACKUP_LYBRICA"
-        # Keep only the 5 most recent backups
-        ls -t "$HOME/scripts"/lybrica.py.*.bak 2>/dev/null | tail -n +6 | xargs -r rm -f
-    fi
+if "$CDSP_BIN" -c "$BASE/configs/_A-loopback.yml"; then
+    echo ">>> Config _A-loopback.yml: valid."
+else
+    echo "!!! WARNING: CamillaDSP considers _A-loopback.yml invalid (see message above)."
+fi
 
-    echo "📥 Downloading lybrica.py from GitHub..."
-    mkdir -p "$HOME/scripts"
-    wget -q https://raw.githubusercontent.com/melomane63/LyBriCa/main/lybrica.py -O "$HOME/scripts/lybrica.py"
-
-    if [ -n "$SAVED_REMOTE_NAME" ]; then
-        if /opt/venv/bin/python3 - "$HOME/scripts/lybrica.py" "$SAVED_REMOTE_NAME" <<'EOF'
-import json
-import re
-import sys
-
-script, name = sys.argv[1], sys.argv[2]
-with open(script, encoding="utf-8") as f:
-    text = f.read()
-
-pattern = re.compile(
-    r"""^(REMOTE_NAME\s*=\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')""",
-    re.MULTILINE,
-)
-new_text, count = pattern.subn(
-    lambda m: m.group(1) + json.dumps(name, ensure_ascii=False), text, count=1
-)
-if count == 0:
-    sys.exit(1)
-
-with open(script, "w", encoding="utf-8") as f:
-    f.write(new_text)
-EOF
-        then
-            echo "✅ REMOTE_NAME \"$SAVED_REMOTE_NAME\" kept from the previous lybrica.py."
-        else
-            echo "⚠  Could not restore REMOTE_NAME \"$SAVED_REMOTE_NAME\": run option 8 (Pair Bluetooth Remote)."
-        fi
-    fi
-
-    # tm1637_lgpio.py: check the FILE, not the camilladsp package
-    TM1637_FILE="/opt/venv/lib/python${PYVER}/site-packages/tm1637_lgpio.py"
-    if [ -f "$TM1637_FILE" ]; then
-        echo "✅ tm1637_lgpio.py already installed, skipping."
+DAC_CARD=${DAC_DEVICE#plughw:}
+DAC_CARD=${DAC_CARD#hw:}
+DAC_CARD=${DAC_CARD%%,*}
+if [ -r "/proc/asound/$DAC_CARD/stream0" ]; then
+    case "$PLAYBACK_FORMAT" in
+        S24_3_LE) PB_FMT_PROC="S24_3LE" ;;
+        S24_4_LE) PB_FMT_PROC="S24_LE" ;;
+        *)        PB_FMT_PROC="$PLAYBACK_FORMAT" ;;
+    esac
+    PB_SECTION=$(sed -n '/^Playback:/,/^Capture:/p' "/proc/asound/$DAC_CARD/stream0")
+    if echo "$PB_SECTION" | grep -q "Format: $PB_FMT_PROC"; then
+        echo ">>> DAC: format $PLAYBACK_FORMAT accepted."
     else
-        echo "📥 Downloading tm1637_lgpio.py from GitHub..."
-        wget -q https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py -O /tmp/tm1637_lgpio.py
-        sudo cp /tmp/tm1637_lgpio.py "$TM1637_FILE"
-        rm -f /tmp/tm1637_lgpio.py
+        echo "!!! WARNING: DAC does not advertise $PLAYBACK_FORMAT. Advertised formats:"
+        echo "$PB_SECTION" | grep "Format:" | sort -u
     fi
-
-    # -------------------------------------------------------------------------
-    # 5. systemd service (protected)
-    # -------------------------------------------------------------------------
-    SERVICE_FILE="/etc/systemd/system/lybrica.service"
-    SERVICE_CONTENT=$(cat <<EOL
-[Unit]
-Description=Lybrica (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)
-After=default.target
-
-[Service]
-User=$USER
-Type=simple
-WorkingDirectory=$HOME/scripts
-ExecStart=/opt/venv/bin/python3 $HOME/scripts/lybrica.py
-Restart=on-failure
-RestartSec=5
-KillMode=control-group
-KillSignal=SIGTERM
-TimeoutStopSec=10
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=lybrica
-
-[Install]
-WantedBy=default.target
-EOL
-)
-
-    write_service_protected "lybrica.service" "$SERVICE_FILE" "$SERVICE_CONTENT" || true
-
-    sudo systemctl daemon-reload
-    sudo systemctl enable lybrica.service
-    sudo systemctl restart lybrica.service
-    echo "✅ Lybrica service configured and restarted with /opt/venv/bin/python3 !"
-}
-
-# =============================================================================
-# Function to install CamillaDSP & CamillaGUI (64-bit / aarch64, v5)
-# =============================================================================
-install_camilladsp() {
-    echo "🎛 Installing CamillaDSP (aarch64, v${CDSP_VERSION})..."
-
-    if [ "$(uname -m)" != "aarch64" ]; then
-        echo "❌ Ce script ne fournit que des binaires aarch64 (64 bits)."
-        echo "   Architecture détectée : $(uname -m). Utilise un OS Raspberry Pi OS 64 bits."
-        return 1
+    if echo "$PB_SECTION" | grep "Rates:" | grep -q "$SAMPLERATE"; then
+        echo ">>> DAC: sample rate $SAMPLERATE Hz accepted."
+    else
+        echo "!!! WARNING: DAC does not advertise $SAMPLERATE Hz. Advertised rates:"
+        echo "$PB_SECTION" | grep "Rates:" | sort -u
     fi
+else
+    echo ">>> No stream0 for '$DAC_CARD' (non-USB card or null device?): DAC formats not checked."
+fi
 
-    mkdir -p ~/camilladsp ~/camilladsp/coeffs ~/camilladsp/configs
-
-    # --- CamillaDSP installed? --------------------------------------------
-    if command -v camilladsp &> /dev/null; then
-        CDSP_INSTALLED=$(camilladsp --version 2>/dev/null | awk '{print $2}')
-
-        if dpkg --compare-versions "$CDSP_INSTALLED" eq "$CDSP_VERSION" 2>/dev/null; then
-            VER_STATE="same as"
-        elif dpkg --compare-versions "$CDSP_INSTALLED" lt "$CDSP_VERSION" 2>/dev/null; then
-            VER_STATE="older than"
-        else
-            VER_STATE="newer than"
-        fi
-
-        echo "ℹ  CamillaDSP is already installed: v${CDSP_INSTALLED} (${VER_STATE} target v${CDSP_VERSION})."
-        read -p "Reinstall CamillaDSP & CamillaGUI? (y/n): " confirm
-        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-            echo "↩  Cancelled."
-            return 1
-        fi
-    fi
-
-    # --- CamillaDSP binary -------------------------------------------------
-    echo "📥 CamillaDSP : $CDSP_URL"
-    wget "$CDSP_URL" -O ~/camilladsp/camilladsp-linux-aarch64.tar.gz \
-        || { echo "❌ Téléchargement CamillaDSP échoué"; return 1; }
-    sudo tar -xvf ~/camilladsp/camilladsp-linux-aarch64.tar.gz -C /usr/local/bin/
-    rm -f ~/camilladsp/camilladsp-linux-aarch64.tar.gz
-
-    # --- CamillaGUI binary -------------------------------------------------
-    echo "🖥️  Installing CamillaGUI (aarch64, v${CDSP_VERSION})..."
-    echo "📥 CamillaGUI : $GUI_URL"
-    wget "$GUI_URL" -O /tmp/camillagui_linux_aarch64.tar.gz \
-        || { echo "❌ Téléchargement CamillaGUI échoué"; return 1; }
-
-    sudo mkdir -p /opt/camillagui_backend
-    sudo tar -xzf /tmp/camillagui_linux_aarch64.tar.gz -C /opt/camillagui_backend/
-    rm -f /tmp/camillagui_linux_aarch64.tar.gz
-
-    if [ ! -f /opt/camillagui_backend/camillagui ]; then
-        echo "❌ Binaire 'camillagui' introuvable dans /opt/camillagui_backend/."
-        return 1
-    fi
-    sudo chmod +x /opt/camillagui_backend/camillagui
-    sudo chown -R "$USER":"$USER" /opt/camillagui_backend 2>/dev/null || true
-
-    # --- Service systemd CamillaDSP (protected) ---------------------------
-    CDSP_SERVICE_FILE="/etc/systemd/system/camilladsp.service"
-    CDSP_SERVICE_CONTENT=$(cat <<EOL
-[Unit]
-Description=CamillaDSP
-After=default.target
-StartLimitIntervalSec=10
-StartLimitBurst=10
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=~
-ExecStart=camilladsp -s camilladsp/statefile.yml -w -g-40 -o camilladsp/camilladsp.log -p 1234
-Restart=always
-RestartSec=1
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=camilladsp
-CPUSchedulingPolicy=fifo
-CPUSchedulingPriority=10
-
-[Install]
-WantedBy=default.target
-EOL
-)
-
-    write_service_protected "camilladsp.service" "$CDSP_SERVICE_FILE" "$CDSP_SERVICE_CONTENT" || true
-
-    # --- Service systemd CamillaGUI (protected) ---------------------------
-    GUI_SERVICE_FILE="/etc/systemd/system/camillagui.service"
-    GUI_SERVICE_CONTENT=$(cat <<EOL
-[Unit]
-Description=CamillaDSP Backend and GUI
-After=default.target
-
-[Service]
-Type=idle
-User=$USER
-WorkingDirectory=/opt/camillagui_backend
-ExecStart=/opt/camillagui_backend/camillagui
-
-[Install]
-WantedBy=default.target
-EOL
-)
-
-    write_service_protected "camillagui.service" "$GUI_SERVICE_FILE" "$GUI_SERVICE_CONTENT" || true
-
-    # --- Statefile CamillaDSP (protected) ---------------------------------
-    STATEFILE="$HOME/camilladsp/statefile.yml"
-    STATEFILE_CONTENT=$(cat <<EOL
-config_path: "/home/$USER/camilladsp/configs/_Setup.yml"
+# Complete statefile: without mute/volume, CamillaDSP 4.x/5.x rejects the file
+cat > "$BASE/camilladsp_statefile.yml" <<EOF
+config_path: $BASE/configs/_A-loopback.yml
 mute:
+- false
+- false
+- false
 - false
 - false
 volume:
 - -40.0
 - 0.0
-EOL
-)
-
-    if [ ! -f "$STATEFILE" ]; then
-        echo "📝 Creating statefile.yml..."
-        echo "$STATEFILE_CONTENT" > "$STATEFILE"
-        echo "✅ statefile.yml created."
-    elif [ "$(cat "$STATEFILE")" = "$STATEFILE_CONTENT" ]; then
-        echo "✅ statefile.yml already up to date, skipping."
-    else
-        echo "⚠  statefile.yml exists but differs from the script's version."
-        read -p "Overwrite statefile.yml? (y/n): " confirm
-        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-            cp "$STATEFILE" "${STATEFILE}.$(date +%Y%m%d-%H%M%S).bak"
-            echo "$STATEFILE_CONTENT" > "$STATEFILE"
-            echo "✅ statefile.yml overwritten (backup saved)."
-        else
-            echo "↩  Keeping existing statefile.yml (manual edits preserved)."
-        fi
-    fi
-
-    # --- Config par défaut CamillaDSP (protected) -------------------------
-    SETUPFILE="$HOME/camilladsp/configs/_Setup.yml"
-    SETUPFILE_CONTENT=$(cat <<EOL
-devices:
-  samplerate: 48000
-  chunksize: 512
-  queuelimit: 4
-  capture:
-    type: Alsa
-    channels: 2
-    device: "plughw:Loopback,1,0"
-    format: S32_LE
-  playback:
-    type: Alsa
-    channels: 2
-    device: "default"
-    format: S16_LE
-title: Setup
-EOL
-)
-
-    if [ ! -f "$SETUPFILE" ]; then
-        echo "📝 Creating _Setup.yml..."
-        echo "$SETUPFILE_CONTENT" > "$SETUPFILE"
-        echo "✅ _Setup.yml created."
-    elif [ "$(cat "$SETUPFILE")" = "$SETUPFILE_CONTENT" ]; then
-        echo "✅ _Setup.yml already up to date, skipping."
-    else
-        echo "⚠  _Setup.yml exists but differs from the script's version."
-        read -p "Overwrite _Setup.yml? (y/n): " confirm
-        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-            cp "$SETUPFILE" "${SETUPFILE}.$(date +%Y%m%d-%H%M%S).bak"
-            echo "$SETUPFILE_CONTENT" > "$SETUPFILE"
-            echo "✅ _Setup.yml overwritten (backup saved)."
-        else
-            echo "↩  Keeping existing _Setup.yml (manual edits preserved)."
-        fi
-    fi
-
-    # --- Module ALSA loopback ----------------------------------------------
-    if ! grep -q "^snd-aloop" /etc/modules-load.d/snd-aloop.conf 2>/dev/null; then
-        echo "snd-aloop" | sudo tee -a /etc/modules-load.d/snd-aloop.conf
-    fi
-    sudo modprobe snd-aloop
-
-    # --- Activation et démarrage -------------------------------------------
-    sudo systemctl daemon-reload
-    sudo systemctl enable camilladsp camillagui
-    sudo systemctl restart camilladsp camillagui
-
-    echo "✅ CamillaDSP v${CDSP_VERSION} (~/camilladsp) et CamillaGUI v${CDSP_VERSION} (/opt/camillagui_backend/camillagui) configurés et redémarrés !"
-}
-
-# =============================================================================
-# Function to install Lyrion Media Server
-# =============================================================================
-install_lyrion() {
-    INSTALLED=$(dpkg-query -W -f='${Version}' lyrionmusicserver 2>/dev/null || true)
-
-    if [ -z "$INSTALLED" ]; then
-        echo "🎵 Lyrion Media Server not installed, installing v${LMS_VERSION}..."
-    else
-        if dpkg --compare-versions "$INSTALLED" eq "$LMS_VERSION" 2>/dev/null; then
-            echo "ℹ  Lyrion Media Server v${INSTALLED} is already installed (same as target)."
-        elif dpkg --compare-versions "$INSTALLED" lt "$LMS_VERSION" 2>/dev/null; then
-            echo "ℹ  Installed version (v${INSTALLED}) is OLDER than target (v${LMS_VERSION})."
-        else
-            echo "⚠  Installed version (v${INSTALLED}) is NEWER than target (v${LMS_VERSION})."
-        fi
-        read -p "Reinstall with v${LMS_VERSION}? (y/n): " confirm
-        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-            echo "↩  Cancelled, keeping v${INSTALLED}."
-            return 1
-        fi
-    fi
-
-    echo "🎵 Installing Lyrion Media Server (v${LMS_VERSION})..."
-    wget "$LMS_URL" -O ~/lyrionmusicserver_arm.deb
-    sudo dpkg -i ~/lyrionmusicserver_arm.deb || sudo apt --fix-broken install -y
-    echo "✅ Lyrion Media Server v${LMS_VERSION} installed!"
-}
-
-# =============================================================================
-# Function to install Squeezelite
-# =============================================================================
-install_squeezelite() {
-    SQUEEZELITE_CONF="/etc/default/squeezelite"
-
-    if dpkg -l squeezelite 2>/dev/null | grep -q "^ii"; then
-        INSTALLED_VER=$(dpkg-query -W -f='${Version}' squeezelite 2>/dev/null || true)
-        echo "ℹ  Squeezelite is already installed (v${INSTALLED_VER})."
-        echo ""
-        echo "📋 Current Squeezelite parameters (from ${SQUEEZELITE_CONF}):"
-        if [ -f "$SQUEEZELITE_CONF" ]; then
-            grep -E '^[A-Z_]+=' "$SQUEEZELITE_CONF" | sed 's/^/   /'
-        else
-            echo "   (file not found)"
-        fi
-        echo ""
-
-        read -p "Reinstall Squeezelite? (y/n): " confirm
-        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-            echo "↩  Cancelled, keeping current installation."
-            return 1
-        fi
-        REINSTALL_FLAG="--reinstall"
-    else
-        echo "🔊 Installing Squeezelite..."
-        REINSTALL_FLAG=""
-    fi
-
-    sudo apt install -y $REINSTALL_FLAG squeezelite
-
-    # Safely update Squeezelite output device
-    sudo sed -i '/^SL_OPTIONS=/d;/^SL_SOUNDCARD=/d;/^SB_EXTRA_ARGS=/d' "$SQUEEZELITE_CONF"
-    echo -e 'SL_SOUNDCARD="hw:Loopback,0"\nSB_EXTRA_ARGS="-W -C 5 -r 48000-48000 -R hLE"' | sudo tee -a "$SQUEEZELITE_CONF" > /dev/null
-
-    sudo systemctl restart squeezelite
-
-    echo ""
-    echo "✅ Squeezelite installed and configured!"
-    echo ""
-    echo "📋 Current Squeezelite parameters (from ${SQUEEZELITE_CONF}):"
-    grep -E '^[A-Z_]+=' "$SQUEEZELITE_CONF" | sed 's/^/   /'
-    echo ""
-}
-
-# =============================================================================
-# Function to mount USB drive
-# =============================================================================
-mount_usb_drive() {
-    echo "💾 Setting up USB Drive auto-mount..."
-    sudo mkdir -p /mnt/usb
-
-    USB_UUID=$(sudo blkid -s UUID -o value /dev/sda1 2>/dev/null || true)
-
-    if [ -z "$USB_UUID" ]; then
-        echo "⚠  No USB drive automatically detected on /dev/sda1."
-        read -p "Enter your USB drive UUID manually: " USB_UUID
-    else
-        echo "✅ USB drive automatically detected with UUID: $USB_UUID"
-    fi
-
-    if [ -n "$USB_UUID" ]; then
-        sudo sed -i 's|.* /mnt/usb .*||g' /etc/fstab
-        sudo sed -i '/^$/d' /etc/fstab
-
-        echo "UUID=$USB_UUID /mnt/usb auto defaults,nofail,x-systemd.device-timeout=1,noatime 0 0" | sudo tee -a /etc/fstab
-
-        sudo mount -a
-        echo "✅ USB Drive mounted at /mnt/usb with UUID $USB_UUID!"
-    else
-        echo "❌ Error: No valid UUID could be configured."
-    fi
-}
-
-# =============================================================================
-# Function to set sound card output
-# =============================================================================
-set_sound_card() {
-    echo "🔊 Launching alsamixer to configure the sound card..."
-    echo "   (Press Esc or 'q' to exit once settings are done)"
-    alsamixer
-    echo "💾 Saving ALSA settings..."
-    sudo alsactl store
-    echo "✅ ALSA settings saved!"
-}
-
-# =============================================================================
-# Function to pair Bluetooth Remote using bluetuith
-# =============================================================================
-pair_bluetooth_remote() {
-    LYBRICA_SCRIPT="${LYBRICA_SCRIPT:-$HOME/scripts/lybrica.py}"
-    VENV_PYTHON="${VENV_PYTHON:-/opt/venv/bin/python3}"
-
-    echo "🔗 Preparing Bluetooth Remote pairing interface..."
-
-    sudo rfkill unblock bluetooth
-    sudo systemctl restart bluetooth
-    sleep 2
-
-    bluetoothctl power on
-
-    if ! command -v bluetuith &> /dev/null; then
-        echo "📦 Installing bluetuith..."
-        wget https://github.com/bluetuith-org/bluetuith/releases/download/v0.2.7/bluetuith_0.2.7_Linux_arm64.tar.gz -O ~/bluetuith.tar.gz
-        tar -xzf ~/bluetuith.tar.gz -C ~/ bluetuith
-        sudo mv ~/bluetuith /usr/bin/bluetuith
-        sudo chmod +x /usr/bin/bluetuith
-        rm -f ~/bluetuith.tar.gz
-    fi
-
-    echo ""
-    echo "💡 Instructions:"
-    echo "   1. The bluetuith interface will open."
-    echo "   2. Put your remote control into pairing mode (flashing LED)."
-    echo "   3. Use the arrow keys to find your remote, press Enter to Pair, then Connect."
-    echo "   4. Press 'q' to exit the interface when done."
-    echo ""
-    read -p "Press Enter to launch bluetuith..."
-
-    bluetuith
-
-    echo "✅ Bluetooth setup interface closed."
-
-    echo ""
-    echo "🔍 Detecting input devices..."
-    echo "   The remote should now be connected. Press a key on it if needed."
-    read -rp "Press Enter to scan..."
-
-    local -a lines
-    mapfile -t lines < <("$VENV_PYTHON" - <<'EOF'
-import evdev
-from evdev import ecodes as e
-
-names = ['KEY_VOLUMEDOWN', 'KEY_VOLUMEUP', 'KEY_MUTE', 'KEY_PLAYPAUSE', 'KEY_PREVIOUSSONG',
-         'KEY_NEXTSONG', 'KEY_UP', 'KEY_DOWN', 'KEY_LEFT', 'KEY_RIGHT', 'KEY_POWER',
-         'KEY_ENTER', 'KEY_BACK', 'KEY_HOMEPAGE']
-codes = {e.ecodes[n] for n in names}
-
-rows = []
-for p in evdev.list_devices():
-    d = evdev.InputDevice(p)
-    keys = d.capabilities().get(e.EV_KEY, [])
-    rows.append((len(codes & set(keys)), p, d.name))
-
-for score, p, name in sorted(rows, key=lambda r: (-r[0], r[1])):
-    print(f"{p}\t{name}\t{score}/{len(codes)}")
+- 0.0
+- 0.0
+- 0.0
 EOF
-)
 
-    if [ "${#lines[@]}" -eq 0 ]; then
-        echo "❌ No input device found (is the remote connected? is evdev installed in the venv?)"
-        return 1
-    fi
+### --- 4. CamillaGUI (single executable) -----------------------------------
+GUI_BIN="$EXT/usr/local/camillagui/camillagui"
+case "$ARCH_SUFFIX" in
+    aarch64) GUI_ARCH="aarch64" ;;
+    *)       GUI_ARCH="armv7" ;;
+esac
+GUI_ASSET=$(printf "$GUI_URL_ARCH" "$GUI_ARCH")
+GUI_URL="${GUI_URL_BASE}/${GUI_ASSET}"
 
-    echo ""
-    echo "Input devices found (best match for the remote first):"
-    local i dev_path dev_name dev_keys
-    for i in "${!lines[@]}"; do
-        IFS=$'\t' read -r dev_path dev_name dev_keys <<< "${lines[$i]}"
-        printf "   %d) %-26s %-8s %s\n" "$((i + 1))" "$dev_name" "$dev_keys" "$dev_path"
-    done
-    echo ""
+echo ">>> GUI: $GUI_URL"
+GUI_TMP="$TMPDIR_CDSP/gui"
+mkdir -p "$GUI_TMP"
+wget -O "$TMPDIR_CDSP/camillagui.tar.gz" "$GUI_URL" || die "GUI download failed: $GUI_URL"
+tar -xzf "$TMPDIR_CDSP/camillagui.tar.gz" -C "$GUI_TMP"
+rm -f "$TMPDIR_CDSP/camillagui.tar.gz"
 
-    local choice
-    while true; do
-        read -rp "Choose your remote [1-${#lines[@]}] (Enter = 1): " choice
-        choice="${choice:-1}"
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#lines[@]} )); then
-            break
-        fi
-        echo "Invalid choice."
-    done
+GUI_FOUND=$(find "$GUI_TMP" -type f -name camillagui | head -n 1)
+[ -n "$GUI_FOUND" ] || die "camillagui executable not found in the archive."
+cp "$GUI_FOUND" "$GUI_BIN"
+chmod +x "$GUI_BIN"
 
-    IFS=$'\t' read -r dev_path dev_name dev_keys <<< "${lines[$((choice - 1))]}"
-    echo "➡  Selected: $dev_name ($dev_keys keys)"
-    if (( ${dev_keys%%/*} < 10 )); then
-        echo "⚠  This device supports few of the remote keys: check that it is really the remote."
-    fi
+# If the archive ships a default gui-config.yml, use it only when none exists yet
+GUI_CFG_FOUND=$(find "$GUI_TMP" -type f -name gui-config.yml | head -n 1)
+if [ -n "$GUI_CFG_FOUND" ] && [ ! -f "$BASE/camillagui/config/gui-config.yml" ]; then
+    cp "$GUI_CFG_FOUND" "$BASE/camillagui/config/gui-config.yml"
+fi
 
-    if [ ! -f "$LYBRICA_SCRIPT" ]; then
-        echo "⚠  $LYBRICA_SCRIPT not found. Set this line manually in lybrica.py:"
-        echo "   REMOTE_NAME = \"$dev_name\""
-        return 1
-    fi
+( cd "$BASE/camillagui" && "$GUI_BIN" --help > /dev/null ) \
+    || die "The GUI executable does not run on this system."
 
-    if "$VENV_PYTHON" - "$LYBRICA_SCRIPT" "$dev_name" <<'EOF'
-import json
-import re
-import sys
-
-script, name = sys.argv[1], sys.argv[2]
-with open(script, encoding="utf-8") as f:
-    text = f.read()
-
-pattern = re.compile(
-    r"""^(REMOTE_NAME\s*=\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')""",
-    re.MULTILINE,
-)
-new_text, count = pattern.subn(
-    lambda m: m.group(1) + json.dumps(name, ensure_ascii=False), text, count=1
-)
-if count == 0:
-    sys.exit(1)
-
-with open(script, "w", encoding="utf-8") as f:
-    f.write(new_text)
+# camillagui.yml is rewritten each time (fixed paths).
+# gui-config.yml is NOT touched: the GUI settings survive an update.
+cat > "$BASE/camillagui/config/camillagui.yml" <<EOF
+---
+camilla_host: "127.0.0.1"
+camilla_port: 1234
+bind_address: "0.0.0.0"
+port: 5000
+ssl_certificate: null
+ssl_private_key: null
+gui_config_file: null
+config_dir: "$BASE/configs"
+coeff_dir: "$BASE/coeffs"
+default_config: "$BASE/default_config.yml"
+statefile_path: "$BASE/camilladsp_statefile.yml"
+log_file: "/tmp/camilladsp.log"
+on_set_active_config: null
+on_get_active_config: null
+supported_capture_types: ["Alsa", "Stdin"]
+supported_playback_types: ["Alsa"]
 EOF
-    then
-        echo "✅ REMOTE_NAME set to \"$dev_name\" in $LYBRICA_SCRIPT"
-        echo "🔄 Restarting Lybrica service..."
-        sudo systemctl restart lybrica
-        echo "✅ Lybrica service restarted successfully."
+
+# Symlink inside the extension: works whether the GUI looks for config/
+# next to its executable or in the current directory.
+ln -s "$BASE/camillagui/config" "$EXT/usr/local/camillagui/config"
+
+### --- 5. Startup script (run as root when the extension is loaded) --------
+cat > "$EXT/usr/local/tce.installed/CDSPpiCore" <<'EOF'
+#!/bin/sh
+# Starts CamillaDSP then CamillaGUI (run as root by the extension loader)
+
+BASE=/mnt/mmcblk0p2/tce/camilladsp
+
+# Load the ALSA loopback module before Squeezelite starts
+modprobe snd-aloop
+
+# CamillaDSP: runs as root so that its audio threads can get real-time
+# priority (SCHED_FIFO).
+/usr/local/bin/camilladsp \
+    -w -p 1234 -a 0.0.0.0 \
+    -o /tmp/camilladsp.log \
+    -s "$BASE/camilladsp_statefile.yml" &
+
+# CamillaGUI: no real-time priority needed, runs as tc from the persistent folder
+sudo -u tc sh -c "cd '$BASE/camillagui' && /usr/local/camillagui/camillagui" &
+
+exit 0
+EOF
+chmod 775 "$EXT/usr/local/tce.installed/CDSPpiCore"
+
+### --- 6. Build and register the extension ---------------------------------
+install_temporarily_if_missing squashfs-tools
+TCZ="$TMPDIR_CDSP/$EXT_CDSP"
+mksquashfs "$EXT" "$TCZ" -noappend -all-root
+mv -f "$TCZ" "$OPT/$EXT_CDSP"
+
+# Make sure the kernel modules (snd-aloop) are loaded before our script runs
+ALSA_EXT="alsa-modules-$(uname -r).tcz"
+if [ -f "$OPT/$ALSA_EXT" ]; then
+    echo "$ALSA_EXT" > "$OPT/$EXT_CDSP.dep"
+else
+    echo "!!! WARNING: $OPT/$ALSA_EXT not found: no .dep written, check that snd-aloop is loaded early enough."
+fi
+
+grep -qx "$EXT_CDSP" /etc/sysconfig/tcedir/onboot.lst \
+    || echo "$EXT_CDSP" >> /etc/sysconfig/tcedir/onboot.lst
+
+# Migration: remove the old loose files (bootlocal.sh is NOT touched:
+# CamillaDSP is now started by the extension's tce.installed script).
+rm -f "$BASE/start_camilladsp.sh" "$BASE/camilladsp" "$BASE/camillagui/camillagui"
+
+### --- 7. Squeezelite -> loopback ------------------------------------------
+# Replace VAR="value" if the key exists in pcp.cfg; otherwise warn
+# (so that a wrong variable name never silently creates a useless line).
+set_pcp_cfg() {
+    if grep -q "^$1=" "$PCP_CFG"; then
+        sed "s|^$1=.*|$1=\"$2\"|" -i "$PCP_CFG"
+        echo ">>> pcp.cfg: $1=\"$2\""
     else
-        echo "⚠  Could not update $LYBRICA_SCRIPT (no 'REMOTE_NAME = \"...\"' line, or no write permission)."
-        echo "    Set this line manually in lybrica.py:"
-        echo "    REMOTE_NAME = \"$dev_name\""
-        return 1
+        echo "!!! WARNING: key $1 not found in pcp.cfg, not set. Set it in the pCP web interface."
     fi
 }
 
-# =============================================================================
-# Function to shutdown (with confirmation)
-# =============================================================================
-shutdown_now() {
-    read -p "Shutdown now? (y/n): " choice
-    if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
-        sudo shutdown -h now
-        return 0
-    fi
-    return 1
+set_pcp_cfg OUTPUT      "hw:Loopback,0"
+set_pcp_cfg ALSA_PARAMS "$SQ_ALSA_PARAMS"   # -a  all fields empty
+set_pcp_cfg MAX_RATE    "$SQ_RATES"         # -r  min-max sample rate
+set_pcp_cfg UPSAMPLE    "$SQ_UPSAMPLE"      # -R  resampling options
+
+### --- 8. Cleanup and backup -----------------------------------------------
+rm -rf "$TMPDIR_CDSP"
+pcp backup
+
+set +v
+echo ""
+echo "CamillaDSP extension installed ($EXT_CDSP). Reboot to start it."
+echo "Web interface: http://pcp.local:5000/gui/index.html"
+echo "After reboot, check:"
+echo "  tce-status -i | grep CDSPpiCore"
+echo "  pidof camilladsp camillagui"
+echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): \$(chrt -p \$(basename \$t) | head -1)\"; done"
 }
 
-# =============================================================================
-# Function to quit the script (with confirmation)
-# =============================================================================
-quit_now() {
-    read -p "Quit the script? (y/n): " choice
-    if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
-        echo "Quitting..."
-        return 0
-    fi
-    return 1
+###########################################################################
+# DISPATCH: one step = one process (sh "$SELF" --run <step>)
+###########################################################################
+if [ "$1" = "--run" ]; then
+    case "$2" in
+        camilla) install_camilladsp ;;
+        *) fail "Unknown step: $2" ;;
+    esac
+    exit $?
+fi
+
+[ "$(id -u)" -eq 0 ] && fail "Run this script as user tc, not root."
+
+DONE=""
+
+run_step() {  # $1 = camilla
+    echo
+    echo "############################################################"
+    echo "# Step: $1"
+    echo "############################################################"
+    sh "$SELF" --run "$1"
+    rc=$?
+    case "$rc" in
+        0)        DONE="$DONE $1:OK" ;;
+        "$SKIP_RC") DONE="$DONE $1:SKIPPED" ;;
+        *)        DONE="$DONE $1:FAILED"
+                  echo "!!! Step '$1' failed (see messages above)." >&2 ;;
+    esac
 }
 
-# =============================================================================
-# Main Menu
-# =============================================================================
+do_reboot() {
+    case "$DONE" in
+        *FAILED*) echo "!!! Some steps failed:$DONE" ;;
+    esac
+    printf "Reboot now? [y/N]: "
+    read -r R
+    case "$R" in
+        y|Y) echo "Rebooting..."; pcp reboot; exit 0 ;;
+        *)   echo "Reboot cancelled." ;;
+    esac
+}
+
+run_choice() {
+    for c in "$@"; do
+        case "$c" in
+            1|camilla) run_step camilla ;;
+            r|R)       do_reboot ;;
+            q|Q)       return 1 ;;
+            *) echo "Unknown choice: $c" ;;
+        esac
+    done
+    return 0
+}
+
+summary() {
+    echo
+    if [ -n "$DONE" ]; then
+        echo "Result:$DONE"
+        echo "Reboot to activate everything:  pcp reboot"
+    fi
+}
+
+# Interactive menu
 while true; do
-    echo "============================================"
-    echo "  RaspberryPi OS - Audio Setup Menu   "
-    echo "============================================"
-    echo "1) Upgrade System"
-    echo "2) Install CamillaDSP & GUI (v${CDSP_VERSION})"
-    echo "3) Install Lyrion Media Server (v${LMS_VERSION})"
-    echo "4) Install Squeezelite"
-    echo "5) Configure Sound Levels (alsamixer)"
-    echo "6) Mount USB Drive"
-    echo "7) Install Lybrica (Remote, Display, Trigger, AutoSetconfig, Volume synchronisation)"
-    echo "8) Pair Bluetooth Remote"
-    echo "S) Shutdown System"
-    echo "Q) Quit"
-    echo "============================================"
-    echo "Tip: chain actions with spaces: '2 6 S' = '6 S 2' (numbers ascending, then S, then Q)."
-    read -p "Choose an option [1-8, S, Q]: " -a choices
-
-    if [ "${#choices[@]}" -eq 0 ]; then
-        echo "⚠  No option entered."
-        continue
-    fi
-
-    for option in "${choices[@]}"; do
-        case $option in
-            1|2|3|4|5|6|7|8) ;;
-            S|s|Q|q) ;;
-            *) echo "⚠  Invalid option: '$option'. Nothing executed."; continue 2 ;;
-        esac
-    done
-
-    mapfile -t sorted_numeric < <(printf '%s\n' "${choices[@]}" | grep -E '^[1-8]$' | sort -n -u)
-
-    has_shutdown=false
-    has_quit=false
-    for option in "${choices[@]}"; do
-        case $option in
-            S|s) has_shutdown=true ;;
-            Q|q) has_quit=true ;;
-        esac
-    done
-
-    for option in "${sorted_numeric[@]}"; do
-        case $option in
-            1) upgrade_system || true ;;
-            2) install_camilladsp || true ;;
-            3) install_lyrion || true ;;
-            4) install_squeezelite || true ;;
-            5) set_sound_card || true ;;
-            6) mount_usb_drive || true ;;
-            7) install_lybrica || true ;;
-            8) pair_bluetooth_remote || true ;;
-        esac
-    done
-
-    if $has_shutdown; then
-        shutdown_now && exit 0
-    fi
-    if $has_quit; then
-        quit_now && exit 0
-    fi
-
-    echo ""
-    read -rp "Press Enter to return to the menu..." _
+    echo
+    echo "=============================================="
+    echo "  CamillaDSP installer for piCorePlayer "
+    echo "=============================================="
+    echo "  1) CamillaDSP + CamillaGUI"
+    echo "  R) Reboot now"
+    echo "  Q) Quit"
+    echo "----------------------------------------------"
+    printf "Choice (several allowed, e.g. 1): "
+    read -r CHOICES || break
+    [ -z "$CHOICES" ] && continue
+    # shellcheck disable=SC2086
+    run_choice $CHOICES || break
 done
+
+summary

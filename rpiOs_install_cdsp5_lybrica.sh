@@ -143,6 +143,7 @@ dtparam=audio=off
 dtoverlay=gpio-poweroff,gpiopin=26,active_low=1
 dtoverlay=gpio-shutdown,gpio_pin=16,active_low=0,gpio_pull=down
 enable_uart=1
+gpio=12=ip,np
 
 #installed-by-lybrica
 EOL
@@ -191,13 +192,13 @@ EOL
     # -------------------------------------------------------------------------
     sudo /opt/venv/bin/pip install evdev==1.6.1 lgpio==0.2.2.0 pyserial==3.5 pyalsaaudio
 
-    INSTALL_TM1637=false
+    PYVER=$(/opt/venv/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+
     if /opt/venv/bin/pip show camilladsp &> /dev/null; then
         echo "✅ camilladsp (pycamilladsp) already installed, skipping."
     else
         echo "📦 Installing camilladsp from $PYCAMILLADSP_URL..."
         sudo /opt/venv/bin/pip install "$PYCAMILLADSP_URL"
-        INSTALL_TM1637=true
     fi
 
     # -------------------------------------------------------------------------
@@ -267,14 +268,15 @@ EOF
         fi
     fi
 
-    if $INSTALL_TM1637; then
-        PYVER=$(/opt/venv/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    # tm1637_lgpio.py: check the FILE, not the camilladsp package
+    TM1637_FILE="/opt/venv/lib/python${PYVER}/site-packages/tm1637_lgpio.py"
+    if [ -f "$TM1637_FILE" ]; then
+        echo "✅ tm1637_lgpio.py already installed, skipping."
+    else
         echo "📥 Downloading tm1637_lgpio.py from GitHub..."
         wget -q https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py -O /tmp/tm1637_lgpio.py
-        sudo cp /tmp/tm1637_lgpio.py "/opt/venv/lib/python${PYVER}/site-packages/tm1637_lgpio.py"
+        sudo cp /tmp/tm1637_lgpio.py "$TM1637_FILE"
         rm -f /tmp/tm1637_lgpio.py
-    else
-        echo "✅ tm1637_lgpio.py already installed (with camilladsp), skipping."
     fi
 
     # -------------------------------------------------------------------------

@@ -768,8 +768,6 @@ two files`).
   (CamillaDSP holds the device in group B), and all `_B-*` configs must use the
   same capture input.
 - **Python 3.13+**: needs `audioop-lts`.
-- **Shutdown**: `sudo poweroff` is not checked, and the Raspberry Pi OS
-  installer's sudoers rule does not cover it (see above).
 - **Default configs**: the installers' configs contain no tone filters, so the
   tone and loudness keys do nothing until you add them.
 - **CamillaDSP 5 beta**: both installers use `5.0.0-beta.2` and the `next5`

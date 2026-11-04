@@ -172,7 +172,7 @@ EOL
     # -------------------------------------------------------------------------
     echo "🔐 Adding sudoers rule for passwordless shutdown..."
     SUDOERS_TMP=$(mktemp)
-    echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown" > "$SUDOERS_TMP"
+    echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/poweroff" > "$SUDOERS_TMP"
     if ! sudo visudo -c -f "$SUDOERS_TMP" > /dev/null; then
        rm -f "$SUDOERS_TMP"
        echo "❌ Invalid sudoers rule, nothing installed."

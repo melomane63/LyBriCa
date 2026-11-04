@@ -20,9 +20,9 @@ one can be turned off with a switch at the top of `lybrica.py`:
 
 A disabled feature is never started, and the library it needs is neither
 imported nor required, so LyBriCa can run on a minimal setup (for example
-volume sync only). At least one feature must be enabled.
+volume sync only).
 
-An optional **ESP32-C3 companion** powers the Raspberry Pi, reads a physical
+An optional **ESP32-C3 companion** powers the Raspberry Pi, on /off with the physical
 button and the BLE remote, and sends ambient-light readings to the Pi.
 
 ---

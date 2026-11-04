@@ -475,6 +475,8 @@ screen) and remembered across restarts:
 | Preset **def** | - | Baxandall-like shelves (85 Hz / 6.5 kHz) |
 | Preset **alt** | - | Shelves at 110 Hz / 3.5 kHz |
 
+<img width="1900" height="650" alt="lybrica_response1" src="https://github.com/user-attachments/assets/e2ac4b11-0dfc-4787-adff-db7ff996417d" />
+
 ### Loudness
 
 The loudness screen adjusts the `reference_level` of `L_Loudness` between

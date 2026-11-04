@@ -197,17 +197,60 @@ devices:
     channels: 2
     device: "${DAC_DEVICE}"
     format: ${PLAYBACK_FORMAT}
-
 filters:
-  gain0:
-    type: Gain
+  L_Bass:
+    description: null
     parameters:
-      gain: 0.0
-
+      freq: 110.0
+      gain: 2.0
+      q: 0.7
+      type: Lowshelf
+    type: Biquad
+  L_Compensation:
+    description: null
+    parameters:
+      gain: -1.0
+      inverted: false
+      mute: false
+      scale: dB
+    type: Gain
+  L_Loudness:
+    description: null
+    parameters:
+      attenuate_mid: false
+      fader: Main
+      high_boost: 5.0
+      high_freq: null
+      high_q: null
+      low_boost: 10.0
+      low_freq: null
+      low_q: null
+      reference_level: -30.0
+    type: Loudness
+  L_Treble:
+    description: null
+    parameters:
+      freq: 3500.0
+      gain: 2.0
+      q: 0.7
+      type: Highshelf
+    type: Biquad
+mixers: null
 pipeline:
-  - type: Filter
-    channels: [0, 1]
-    names: [gain0]
+- bypassed: false
+  channels: null
+  description: null
+  names:
+  - L_Bass
+  - L_Compensation
+  - L_Treble
+  type: Filter
+- bypassed: false
+  channels: null
+  description: null
+  names:
+  - L_Loudness
+  type: Filter
 title: Setup
 EOF
 cp "$BASE/configs/_A-loopback.yml" "$BASE/default_config.yml"

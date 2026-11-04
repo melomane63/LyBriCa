@@ -667,7 +667,7 @@ with the light readings on GPIO21.
 3. Once armed, GPIO6 staying LOW for about **10 s** means the Pi is off: the
    relay is cut and the ESP32 restarts, which brings BLE back.
 4. While the Pi runs, a button press asks for a clean shutdown (GPIO10 HIGH, left
-   HIGH until the restart). The remote cannot do this: only the button can.
+   HIGH until the restart).
 
 ### Light sensor
 

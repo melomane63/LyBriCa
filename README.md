@@ -103,6 +103,17 @@ button and the BLE remote, and sends ambient-light readings to the Pi.
 | TOSLINK input | TV audio detection | ALSA capture device |
 | Ambient light sensor | Auto brightness | Via the ESP32 (serial) |
 
+### Raspberry Pi GPIO summary
+
+| Pi GPIO | Function | Set up by |
+|---|---|---|
+| GPIO 4 | Amplifier power relay (`POWER_GPIO`) | `lybrica.py` |
+| **GPIO 12** | **TV relay (`TV_RELAY_GPIO`): to ground while a `_B-*` config is active, high-impedance otherwise** | `lybrica.py`; `gpio=12=ip,np` in `config.txt` (installers) |
+| GPIO 14 / 15 | UART (`/dev/serial0`): GPIO 15 (RXD) receives the ambient light from the ESP32 | `enable_uart=1` (installers) |
+| GPIO 16 | Shutdown request from the ESP32 (`gpio-shutdown`) | `config.txt` overlay (installers) |
+| GPIO 23 / 24 | TM1637 display (CLK / DIO) | `lybrica.py` |
+| GPIO 26 | "Pi is off" signal to the ESP32 (`gpio-poweroff`) | `config.txt` overlay (installers) |
+
 ### ESP32 <-> Pi wiring
 
 Both installers use the same Pi pins:

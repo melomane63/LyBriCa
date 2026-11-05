@@ -31,6 +31,11 @@ ENABLE_REMOTE         = True   # Remote control (all keys: volume, mute, LMS, BA
                                # HOMEPAGE, POWER). If False, no key works at all.
 ENABLE_DISPLAY        = True   # TM1637 display + ambient light sensor
                                # (the tone / loudness keys need it)
+ENABLE_CLOCK          = True   # When the display would normally go blank (silence,
+                               # relay off, no key press), show the time (HHh MM)
+                               # instead. Any key press returns to the volume screen.
+                               # Needs ENABLE_DISPLAY. The system time zone must be
+                               # set (on piCorePlayer: pCP web interface).
 ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input.
                                # True : automatism ON  -> BACK cycles within the active
                                #                          group (any "_X-");
@@ -178,6 +183,7 @@ TOSLINK_DEBUG = False   # Log every TOSLINK probe measurement, to calibrate TOSL
 # ---------------------- Display ----------------------
 
 CLK, DIO = 23, 24           # TM1637 display pins
+
 SCREEN_RETURN_DELAY = 30    # Seconds without key press before returning to the volume screen
 WAKE_DISPLAY_DELAY = 30     # Seconds the display stays on after a key press that woke it while the relay is
                             # already off. Independent of POWER_OFF_DELAY.
@@ -1664,6 +1670,8 @@ async def lms_bridge_task():
 
 auto_power_enabled = True
 is_waiting_for_sound = False
+shutting_down = False           # set once by shutdown_system(): freezes the display
+                                # on the HALT message and disables the clock redraw
 
 
 def relay_is_off():
@@ -1689,6 +1697,8 @@ def toggle_power():
 
 
 def shutdown_system():
+    global shutting_down
+    shutting_down = True        # freeze the display: nothing may overwrite " HALT "
     try:
         save_audio_settings(config_active)
     except Exception as e:
@@ -1731,7 +1741,7 @@ async def auto_poweroff():
                     # there: do not blank.
                     finished = await wait_scroll()
                     if finished and silent_now and is_waiting_for_sound:
-                        blank_display()
+                        sleep_display()
                 # else: relay already forced off, nothing to cut. The display
                 # is blanked by display_manager_loop.
 
@@ -1793,7 +1803,7 @@ def update_tv_relay():
 # =====================================================================
 
 
-last_displayed = None           # "volume", "tone", "tone_select", "loudness", "message"
+last_displayed = None           # "volume", "tone", "tone_select", "loudness", "message", "clock"
 blank_volume_when_mute = False
 display_is_off = False
 
@@ -1856,6 +1866,51 @@ def blank_display():
         return
     clear_display()
     display_is_off = True
+
+
+_last_clock_str = None          # Last string drawn by draw_clock(), used to avoid
+                                # rewriting the TM1637 every second when the
+                                # displayed minute has not changed. Reset to None
+                                # before the first draw after the screen has been
+                                # cleared (see sleep_display).
+
+
+def draw_clock():
+    """Draw HHh MM. Writes only when the displayed text changes (once a minute),
+    so a per-second redraw does not hit the TM1637 bus for nothing."""
+    global _last_clock_str
+    if not ENABLE_DISPLAY:
+        return
+    clock_str = time.strftime("%Hh %M")
+    if clock_str == _last_clock_str:
+        return
+    _last_clock_str = clock_str
+    segs = tm.encode_string(clock_str)
+    segs[2] = 0x74                  # 'h' (segments C, E, F, G): the display reads
+                                    # like "12h 34"
+    tm.write(swap(segs))
+
+
+def sleep_display():
+    """Called when the display should sleep (silence + no key press).
+    With ENABLE_CLOCK: shows the clock and keeps display_is_off True, so any
+    key press still wakes the volume screen. Without: blanks as before.
+    Does nothing once the shutdown has started: the HALT message must stay."""
+    global display_is_off, last_displayed, _last_clock_str
+    if not ENABLE_DISPLAY or shutting_down:
+        return
+    if ENABLE_CLOCK:
+        display_is_off = True
+        last_displayed = "clock"
+        # Force the next draw_clock to redraw from scratch: the previous
+        # clock string was drawn with the same encoding, but the display may
+        # have been cleared in between (blank_display from another path, a
+        # scroll that used the display, ...). Without this reset, draw_clock
+        # would skip the write and the screen would stay blank.
+        _last_clock_str = None
+        draw_clock()
+    else:
+        blank_display()
 
 
 # ---------- Scrolling messages ----------
@@ -2157,7 +2212,7 @@ async def adc_reader_loop():
 
 # ---------- Display housekeeping ----------
 async def display_manager_loop():
-    """Return to volume after SCREEN_RETURN_DELAY s, blank after a long quiet
+    """Return to volume after SCREEN_RETURN_DELAY s, sleep after a long quiet
     period, wake when sound returns. Every delay is a timestamp comparison
     (idle_age / silence_age): none of them depends on the loop rate."""
     while True:
@@ -2171,7 +2226,7 @@ async def display_manager_loop():
             # Relay still on (managed): auto_poweroff cuts it, shows POWER SAVE,
             # then blanks the display itself.
             # Relay off (or not managed): silence must have lasted
-            # POWER_OFF_DELAY, then the display goes off after POWER_OFF_DELAY
+            # POWER_OFF_DELAY, then the display sleeps after POWER_OFF_DELAY
             # without key press, or after WAKE_DISPLAY_DELAY when the relay is
             # already off (key wake-up).
             if not ENABLE_AUTO_POWEROFF or relay_is_off():
@@ -2180,16 +2235,18 @@ async def display_manager_loop():
                 key_delay = WAKE_DISPLAY_DELAY if is_off else normal_delay
                 if (not display_is_off and not scroll_active()
                         and silence_age() >= normal_delay and idle_age() >= key_delay):
-                    blank_display()
-        elif display_is_off:
+                    sleep_display()
+        elif display_is_off and not shutting_down:
             display_volume_info()
 
         await asyncio.sleep(1.0)
 
 
 async def blink_loop():
-    """1 s tick, aligned on the clock, that redraws the volume screen while an
-    indicator must blink. The phase itself comes from blink_on() at draw time."""
+    """1 s tick, aligned on the monotonic clock, that redraws the volume
+    screen while an indicator must blink. The phase itself comes from
+    blink_on() at draw time. Using monotonic is fine here: nothing on screen
+    depends on the wall clock, only the alternating pattern does."""
     while True:
         await asyncio.sleep(1.0 - time.monotonic() % 1.0)
 
@@ -2203,6 +2260,36 @@ async def blink_loop():
                 and not scroll_active()
                 and not is_volume_key_held):
             display_volume_info()
+
+
+async def clock_loop():
+    """Refresh the clock while the display is in clock mode.
+
+    Two independent things happen here:
+
+    1) The wall-clock alignment. The sleep is computed from time.time() (not
+       time.monotonic()): the wake-up happens exactly when the system clock
+       changes second, so the minute flip is not delayed by the monotonic
+       drift. A "HHh MM" display only changes once a minute, but alignment
+       still matters: without it, the flip could happen up to 1 s late.
+
+    2) The de-duplication. draw_clock() itself compares the formatted string
+       with the last one drawn and skips the TM1637 write when the text has
+       not changed. So even if the loop wakes every second, only one bus
+       write happens per minute.
+
+    The `not shutting_down` guard prevents the clock from overwriting the
+    HALT message that shutdown_system() has just displayed: shutdown_system
+    sets shutting_down = True before writing " HALT ", and the loop checks
+    it before every redraw. Without this, the next tick (~1 s later, during
+    the poweroff sequence) would clear the HALT message."""
+    if not ENABLE_DISPLAY or not ENABLE_CLOCK:
+        return
+    while True:
+        await asyncio.sleep(1.0 - time.time() % 1.0)
+        if (display_is_off and last_displayed == "clock"
+                and not scroll_active() and not shutting_down):
+            draw_clock()
 
 
 # =====================================================================
@@ -2972,6 +3059,8 @@ async def main():
         spawn("display", display_manager_loop)
         spawn("adc", adc_reader_loop)
         spawn("blink", blink_loop)
+        if ENABLE_CLOCK:
+            spawn("clock", clock_loop)
     if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH or ENABLE_TV_RELAY:
         # Redraws and resyncs config_active after an external change (also
         # keeps the TV relay in step with an external config change)

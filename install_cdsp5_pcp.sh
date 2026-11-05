@@ -424,6 +424,8 @@ set_pcp_cfg UPSAMPLE    "$SQ_UPSAMPLE"      # -R  resampling options
 
 ### --- 8. Cleanup and backup -----------------------------------------------
 rm -rf "$TMPDIR_CDSP"
+grep -q '^defaults\.pcm\.rate_converter[[:space:]]' /etc/asound.conf \
+    || sudo sed -i '1i defaults.pcm.rate_converter "speexrate_medium"' /etc/asound.conf
 pcp backup
 
 set +v

@@ -1,4 +1,4 @@
-# Lybrica V2.0
+# Lybrica V2.2
 import asyncio
 import functools
 import glob
@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import time
 import unicodedata
@@ -52,6 +53,7 @@ ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input.
 ENABLE_TV_RELAY       = True   # Relay on TV_RELAY_GPIO: active (input pulled to ground) as long
                                # as a "_B-*" config is active, inactive (high impedance)
                                # otherwise. Independent of the POWER relay.
+ENABLE_BT_PAUSE       = True   # In "_B-", pause the Bluetooth source too (AVRCP, bluetoothctl)
 
 
 # At least one feature must be enabled, otherwise the script has nothing to do
@@ -129,6 +131,10 @@ LMS_CONNECT_TIMEOUT_S = 5    # TCP connect timeout to the LMS CLI
 LMS_RETRY_S = 5              # delay before the bridge restarts after an error
 
 
+# ---------------------- Bluetooth pause ----------------------
+BT_CMD_TIMEOUT_S = 4.0      # bluetoothctl can be slow the first time (D-Bus startup)
+
+
 # ---------------------- Power ----------------------
 
 POWER_GPIO = 4              # GPIO controlling the power relay
@@ -148,8 +154,8 @@ TV_RELAY_GPIO = 12          # Optocoupler board input of the "_B-" group relay
 # HALT_DELAY), by the display blanking and by the TOSLINK -> loopback return.
 # It declares silence when the RMS level is below SILENCE_RMS_DB, or when the
 # signal is a steady noise floor (crest below CREST_MIN_DB).
-# CREST_MIN_DB is also used by the TOSLINK probe, which has its own level
-# threshold (TOSLINK_ON_DB).
+# CREST_MIN_DB is also used by the input probes (TOSLINK and loopback), which
+# have their own level threshold (SIGNAL_ON_DB).
 
 SILENCE_RMS_DB = -80.0   # RMS below this -> silence
 CREST_MIN_DB   = 2.0     # peak - rms below this -> steady noise, not audio
@@ -160,24 +166,34 @@ CREST_MIN_DB   = 2.0     # peak - rms below this -> steady noise, not audio
 # group B (TV, files matching "_B-*"), based on what is actually playing.
 # While the automatism is ON, only these two groups can be active: a manual
 # group ("_C-*", "_D-*", ...) is immediately replaced by A or B (see the
-# block comment above TOSLINK_FORMATS).
+# block comment 'Only two groups are recognised...' in the TOSLINK section).
 #
 #   group A active:
 #       TOSLINK audio detected -> switch to B
 #   group B active:
-#       LMS playing + TOSLINK silent -> switch back to A
-#       LMS playing while the TV plays   -> LMS is paused
+#       TOSLINK silent + loopback signal (LMS or Bluetooth) -> switch back to A
+#       loopback signal while the TV plays                  -> pause LMS + BT
 #
 # The automatism can be disabled / enabled at run time with a long press
 # on HOMEPAGE. Enabled at every start.
 #
-# Capture params come from the first "_B-*" file: all files in that group must
-# share the same capture input.
+# The TOSLINK device is read from the first "_B-*" file (its name depends on
+# the hardware and cannot be hardcoded). The loopback is always
+# plughw:Loopback,1,0. Both probes ask for S16_LE / 48000 / 2 channels; plughw
+# adapts if the device is in something else, so the exact format/rate in the
+# config files does not matter for the probes.
 
-TOSLINK_ON_DB = -60.0   # above which audio is considered present (dBFS RMS).
+SIGNAL_ON_DB = -60.0    # above which audio is considered present on a probed input
+                        # (TOSLINK in group A, loopback in group B), dBFS RMS.
                         # Keep it ABOVE SILENCE_RMS_DB, otherwise a signal could be detected
-                        # as TV and then count as silence.
-TOSLINK_DEBUG = False   # Log every TOSLINK probe measurement, to calibrate TOSLINK_ON_DB
+                        # and then count as silence.
+PROBE_DEBUG = False     # Log every input probe measurement, to calibrate SIGNAL_ON_DB
+
+# Probe parameters. Asked for through plughw, which converts if the device
+# is in something else: the probe always reads S16_LE.
+PROBE_DEVICE_LOOPBACK = "plughw:Loopback,1,0"
+PROBE_RATE     = 48000
+PROBE_CHANNELS = 2
 
 
 # ---------------------- Display ----------------------
@@ -218,14 +234,16 @@ KEY_BINDINGS = {
     'UP':            'KEY_UP',           # Tone: BT Bass +1 / TL B- T+ (step depends on gains)
                                          # tone_select: toggle BT / TL. loudness: +
     'DOWN':          'KEY_DOWN',         # Tone: BT Bass -1 / TL B+ T- (step depends on gains)
-                                         # tone_select: toggle def / alt. loudness: -
+                                         # tone_select: toggle def / beo. loudness: -
     'LEFT':          'KEY_LEFT',         # Tone: BT Treble -1 / TL B- T- (step depends on gains)
                                          # tone_select: exit
     'RIGHT':         'KEY_RIGHT',        # Tone: BT Treble +1 / TL B+ T+ (step depends on gains)
                                          # tone_select: exit
     'POWER':         'KEY_POWER',        # Long: toggle relay (needs ENABLE_AUTO_POWEROFF)
                                          # Very long: shutdown (always)
-    'ENTER':         'KEY_ENTER',        # Short: tone reset/restore. Long: volume->Loudness,
+    'ENTER':         'KEY_ENTER',        # Short: tone reset/restore; on the loudness screen:
+                                         # loudness enable / disable.
+                                         # Long: volume->Loudness,
                                          # tone->tone_select, loudness->volume,
                                          # tone_select->volume.
     'BACK':          'KEY_BACK',         # Cycle within the active group, whatever the TOSLINK mode
@@ -308,18 +326,21 @@ LOUDNESS_STEP = 5           # dB per key press
 #   t = 0 on N/S (bass = -treble)
 #   t = 1 from 45° away from N/S (diagonals, E/W)
 # Frequencies and Q are interpolated logarithmically between anchors.
+#
+# This morphing only applies in TL mode. In BT mode t = 1 always: the filters
+# use the active preset (def / beo) as is, whatever the two gains.
 
 TILT_BASS_FREQ   = 110.0
 TILT_TREBLE_FREQ = 3500.0
 TILT_NS_Q        = 0.35     # Q on both filters at t=0
 
 # Tone anchor presets, selectable at runtime from the tone preset select
-# screen (long ENTER press from the tone screen, then DOWN to toggle def / alt;
+# screen (long ENTER press from the tone screen, then DOWN to toggle def / beo;
 # UP toggles the BT / TL keys mode on the same screen).
 #
 #   Preset 0 ("def"): Baxandall-like shelves (85 Hz / 6500 Hz, Q 0.9 / 0.7).
 #                     Frequencies and Q both morph along the path.
-#   Preset 1 ("alt"): frequencies equal to the tilt anchor (110 Hz / 3500 Hz).
+#   Preset 1 ("beo"): frequencies equal to the tilt anchor (110 Hz / 3500 Hz).
 #                     Only Q morphs along the path (0.35 -> 0.7 on both filters).
 TONE_PRESETS = [
     {   # preset 0
@@ -350,7 +371,10 @@ tone_preset_idx = 0
 #                       UP = B- T+, DOWN = B+ T-, RIGHT = B+ T+, LEFT = B- T-.
 #                       The gain already "past the target" of the key moves by
 #                       0.5 or 0 instead of 1, so the gains are multiples of 0.5.
-# In both modes the stored values are the two gains: only the keys differ.
+# In both modes the stored values are the two gains. The keys differ, and so
+# does the DSP: BT applies the active preset as is (fixed frequencies and Q, no
+# morphing, no compensation); TL morphs between the tilt anchor and the preset
+# and applies the compensation (see above and below).
 TONE_KEY_MODES = ("BT", "TL")
 tone_mode_idx = 0
 
@@ -366,6 +390,8 @@ tone_mode_idx = 0
 #     cut. The perceived level changes by the same amount; full compensation
 #     is applied (comp = -0.25 * 2 * ±6 = ∓3).
 #   - In between: linear interpolation, proportional to (bass + treble).
+#
+# The compensation only applies in TL mode. In BT mode it is always 0 dB.
 #
 # Names of the filters used by the tone / loudness features.
 # They must match the filter names in the YAML pipeline.
@@ -684,6 +710,81 @@ def tone_param(config, filt, name, active=None):
     return params.get(name) if isinstance(params, dict) else None
 
 
+# ---------- Loudness enable / disable ----------
+# The loudness is switched on and off by bypassing the pipeline step(s) that
+# hold the loudness filter (one step per channel in a typical stereo pipeline).
+# Such a step must hold ONLY the loudness filter: bypassing a step that also
+# holds other filters would switch those off too.
+
+def loudness_steps(config):
+    """Pipeline Filter steps (bypassed or not) that contain the loudness filter."""
+    name = LOUDNESS_FILTER[0]
+    return [step for step in (config.get("pipeline") or [])
+            if isinstance(step, dict) and step.get("type") == "Filter"
+            and isinstance(step.get("names"), list) and name in step["names"]]
+
+
+def loudness_state(config):
+    """True: loudness enabled. False: disabled (all its steps bypassed).
+    None: the loudness filter is not defined or not used by the pipeline."""
+    steps = loudness_steps(config)
+    if not steps or LOUDNESS_FILTER[0] not in (config.get("filters") or {}):
+        return None
+    return any(not step.get("bypassed") for step in steps)
+
+
+def loudness_ref(config):
+    """Reference level of the loudness filter, or None if it is not in the
+    pipeline. A bypassed step still counts: the level is kept (and saved)
+    while the loudness is disabled."""
+    if loudness_state(config) is None:
+        return None
+    filt = (config.get("filters") or {}).get(LOUDNESS_FILTER[0])
+    params = filt.get("parameters") if isinstance(filt, dict) else None
+    return params.get(LOUDNESS_FILTER[1]) if isinstance(params, dict) else None
+
+
+def loudness_switchable(config):
+    """True if every step holding the loudness filter holds nothing else."""
+    steps = loudness_steps(config)
+    return bool(steps) and all(step["names"] == [LOUDNESS_FILTER[0]] for step in steps)
+
+
+def set_loudness_enabled(config, on):
+    """Enable / disable the loudness in `config` (in place) by (un)bypassing
+    its steps. True if the pipeline changed. Does nothing (False) if the
+    loudness is absent or shares a step with other filters."""
+    if not loudness_switchable(config):
+        return False
+    changed = False
+    for step in loudness_steps(config):
+        if bool(step.get("bypassed")) == on:    # not in the wanted state yet
+            step["bypassed"] = not on
+            changed = True
+    return changed
+
+
+def toggle_loudness():
+    """Short ENTER on the loudness screen: enable / disable the loudness and
+    push the pipeline to CamillaDSP."""
+    state = loudness_state(config_active)
+    if state is None:
+        return
+    if not loudness_switchable(config_active):
+        log.warning("[LOUDNESS] A pipeline step holds %s together with other "
+                    "filters: it cannot be bypassed alone", LOUDNESS_FILTER[0])
+        return
+    set_loudness_enabled(config_active, not state)
+    try:
+        _push_pipeline()
+    except Exception as e:
+        set_loudness_enabled(config_active, state)     # CamillaDSP refused: roll back
+        log.error("[LOUDNESS] Cannot apply the change: %s", e)
+        return
+    log.info("[LOUDNESS] %s", "OFF" if state else "ON")
+    display_loudness_info()
+
+
 def get_all_tone_params(config):
     """Return the two tone gains and the loudness reference level in one call.
     bass and treble are both None unless ALL THREE tone filters are present
@@ -693,7 +794,8 @@ def get_all_tone_params(config):
     return {
         "bass":     tone_param(config, BASS_FILTER,   "gain", active) if ready else None,
         "treble":   tone_param(config, TREBLE_FILTER, "gain", active) if ready else None,
-        "loudness": tone_param(config, *LOUDNESS_FILTER, active),
+        "loudness":    loudness_ref(config),
+        "loudness_on": loudness_state(config),
     }
 
 
@@ -726,17 +828,21 @@ def interp_log(v0, v1, t):
 
 
 def compute_dsp_params(bass, treble):
-    """Blend between the tilt and tone anchors based on the direction of
-    (bass, treble) relative to the N/S axis.
+    """TL mode: blend between the tilt and tone anchors based on the direction
+    of (bass, treble) relative to the N/S axis.
       t = 0 : on N/S (bass = -treble) -> tilt anchor
       t = 1 : 45° or more from N/S     -> tone anchor
     Logarithmic interpolation for both frequencies and Q.
-    With bass == treble == 0, atan2(0, 0) gives t = 1 (inaudible anyway)."""
-    angle = math.degrees(math.atan2(treble, bass)) % 360
-    d = abs((angle - 135.0) % 180.0)
-    if d > 90.0:
-        d = 180.0 - d
-    t = min(1.0, d / 45.0)
+    With bass == treble == 0, atan2(0, 0) gives t = 1 (inaudible anyway).
+    BT mode: no morphing, t = 1 always (the active preset as is)."""
+    if TONE_KEY_MODES[tone_mode_idx] == "BT":
+        t = 1.0         # BT: the preset anchor as is, no morphing
+    else:
+        angle = math.degrees(math.atan2(treble, bass)) % 360
+        d = abs((angle - 135.0) % 180.0)
+        if d > 90.0:
+            d = 180.0 - d
+        t = min(1.0, d / 45.0)
 
     preset = TONE_PRESETS[tone_preset_idx % len(TONE_PRESETS)]
 
@@ -753,7 +859,10 @@ def compute_comp(bass, treble):
     """comp = -0.25*(bass + treble). Zero on N/S (tilt preserves loudness);
     full at E/W (filters add up). The clamp (= TONE_MAX_DB / 2, i.e. ±3 dB)
     is only a safety net for gains outside the ±TONE_MAX_DB range, for
-    instance coming from a config file."""
+    instance coming from a config file.
+    BT mode: no compensation, always 0."""
+    if TONE_KEY_MODES[tone_mode_idx] == "BT":
+        return 0.0
     limit = TONE_MAX_DB / 2
     return round(clamp(-0.25 * (bass + treble), -limit, limit), 1) + 0.0   # + 0.0: no "-0.0"
 
@@ -794,6 +903,17 @@ def _push_filters(filter_names):
                       config_data_max_polls=TONE_PUBLISH_MAX_POLLS)
 
 
+def _push_pipeline():
+    """Send only the pipeline via PatchConfig (a loudness step was bypassed or
+    restored). A list is replaced as a whole by a patch, so the complete
+    pipeline is sent. Published like _push_filters, so the volume watcher does
+    not take it for an EXTERNAL change."""
+    cdsp.config.patch({"pipeline": config_active.get("pipeline") or []})
+    vol_state.publish(vol_state.db, vol_state.muted,
+                      config_data=config_active,
+                      config_data_max_polls=TONE_PUBLISH_MAX_POLLS)
+
+
 def apply_tone_processing():
     """Push ONLY the affected filters to CamillaDSP (no full reload).
     No-op unless Bass, Treble AND Compensation are all present AND active."""
@@ -804,13 +924,13 @@ def apply_tone_processing():
 
 
 def toggle_tone_preset():
-    """Toggle the tone preset (def <-> alt) and re-display the select screen.
+    """Toggle the tone preset (def <-> beo) and re-display the select screen.
     The DSP is applied only if the three tone filters are present AND active."""
     global tone_preset_idx
     tone_preset_idx = (tone_preset_idx + 1) % len(TONE_PRESETS)
     preset = TONE_PRESETS[tone_preset_idx]
     log.info("[TONE] Preset %s: bass %g Hz Q %g, treble %g Hz Q %g",
-             "DEF" if tone_preset_idx == 0 else "ALT",
+             "DEF" if tone_preset_idx == 0 else "BEO",
              preset["bass_freq"], preset["bass_q"],
              preset["treble_freq"], preset["treble_q"])
     apply_tone_processing()
@@ -820,11 +940,13 @@ def toggle_tone_preset():
 
 
 def toggle_tone_mode():
-    """Toggle the arrow keys mode of the tone screen (BT <-> TL) and
-    re-display the select screen. Only the keys change, not the DSP."""
+    """Toggle the tone mode (BT <-> TL): the arrow keys change, and so does
+    the DSP (BT: fixed preset, no compensation; TL: morphing and compensation),
+    which is re-applied for the current gains. Then re-display the select screen."""
     global tone_mode_idx
     tone_mode_idx = (tone_mode_idx + 1) % len(TONE_KEY_MODES)
-    log.info("[TONE] Keys mode: %s", TONE_KEY_MODES[tone_mode_idx])
+    log.info("[TONE] Mode: %s", TONE_KEY_MODES[tone_mode_idx])
+    apply_tone_processing()
     settings["tone_mode_idx"] = tone_mode_idx
     write_settings()
     display_tone_preset_select()
@@ -873,9 +995,12 @@ def save_audio_settings(config, write=True):
             and is_complete_config(config)):
         entry = get_tone(config)
         entry["prev"] = {key: prev_values[key] for key in TONE_PARAMS}
-        ref = tone_param(config, *LOUDNESS_FILTER)
+        ref = loudness_ref(config)
         if ref is not None:
             entry["loudness_ref"] = ref
+        on = loudness_state(config)
+        if on is not None:
+            entry["loudness_on"] = on
         settings["configs"][current_config_key] = entry
     if write:
         write_settings()
@@ -902,6 +1027,14 @@ def apply_saved_values(filters, saved):
                 f["parameters"][LOUDNESS_FILTER[1]] = saved["loudness_ref"]
 
 
+def apply_saved_loudness_state(config, saved):
+    """Apply the saved enabled / disabled state of the loudness to a config
+    (in place). True if the pipeline changed: the caller must push it."""
+    if saved and isinstance(saved.get("loudness_on"), bool):
+        return set_loudness_enabled(config, saved["loudness_on"])
+    return False
+
+
 def is_complete_config(cfg):
     """A config without a non-empty 'devices' section is rejected by CamillaDSP."""
     return (isinstance(cfg, dict)
@@ -912,8 +1045,9 @@ def is_complete_config(cfg):
 def init_tone():
     """Apply the saved tone/loudness of the config CamillaDSP started with,
     then push the tone filters (apply_tone_processing, which is a no-op
-    unless Bass, Treble AND Compensation are all present and active). Also
-    applies the DSP profile so the filter params match the code."""
+    unless Bass, Treble AND Compensation are all present and active), then the
+    loudness (level and enabled state). Also applies the DSP profile so the
+    filter params match the code."""
     global current_config_key
     path = cdsp.config.file_path()
     if not path:
@@ -924,7 +1058,14 @@ def init_tone():
     if is_complete_config(config_active):
         filters = config_active.get("filters")
         apply_saved_values(filters if isinstance(filters, dict) else {}, saved)
+        loudness_changed = apply_saved_loudness_state(config_active, saved)
         apply_tone_processing()
+        # apply_tone_processing only pushes the tone filters: the saved
+        # loudness level and enabled state must be pushed too.
+        if saved and "loudness_ref" in saved and loudness_state(config_active) is not None:
+            _push_filters((LOUDNESS_FILTER[0],))
+        if loudness_changed:
+            _push_pipeline()
 
 
 # ---------- CamillaDSP connection, polling and task supervision ----------
@@ -974,6 +1115,7 @@ def resync_after_reconnect():
         filters = config_active.get("filters")
         if not current_config_external:
             apply_saved_values(filters if isinstance(filters, dict) else {}, saved)
+            apply_saved_loudness_state(config_active, saved)
             apply_tone_to_config(config_active)
         cdsp.config.set_active(config_active)
 
@@ -1196,12 +1338,15 @@ async def change_config(config_pattern, cycle=True):
                 entry_b = dict(entry_b) if isinstance(entry_b, dict) else {}
                 if "loudness_ref" in old_entry:
                     entry_b["loudness_ref"] = old_entry["loudness_ref"]
+                if "loudness_on" in old_entry:
+                    entry_b["loudness_on"] = old_entry["loudness_on"]
                 settings["configs"][new_key] = entry_b
             elif SAVE_MODE == "same_everywhere":
                 settings["configs"][new_key] = dict(old_entry)
 
     saved = settings["configs"].get(new_key)
     apply_saved_values(filters, saved)
+    apply_saved_loudness_state(new_config_data, saved)
 
     # Re-derive freq/q/comp AFTER apply_saved_values (which may have changed
     # the gains) and BEFORE set_active (so CamillaDSP receives final values).
@@ -1431,24 +1576,16 @@ def send_lms_command(command, quiet=False):
         return None
 
 
-_lms_unreachable = False
-
-
-def lms_is_playing() -> bool:
-    """True if LMS is in 'play' mode. Called in a loop by monitor_tv_toslink:
-    only logs state changes (unreachable / reachable), never every request."""
-    global _lms_unreachable
-    response = send_lms_command("mode ?", quiet=True)
-    if not response:
-        if not _lms_unreachable:
-            log.warning("[LMS] unreachable or empty reply, assuming not playing")
-            _lms_unreachable = True
-        return False
-    if _lms_unreachable:
-        log.info("[LMS] reachable again")
-        _lms_unreachable = False
-    parts = unquote(response).split()
-    return bool(parts) and parts[-1] == "play"
+# ---------- Bluetooth pause (AVRCP) ----------
+def bt_pause():
+    """Send 'pause' to the Bluetooth source (AVRCP, 'menu player' of
+    bluetoothctl). Blocking (~0.2 s): run it in a thread. Harmless if no
+    phone is connected or if it is already paused."""
+    try:
+        subprocess.run(["bluetoothctl"], input="menu player\npause\nquit\n",
+                       capture_output=True, text=True, timeout=BT_CMD_TIMEOUT_S)
+    except Exception as e:
+        log.warning("[BT] pause failed: %s", e)
 
 
 # ---------- LMS <-> CamillaDSP volume bridge ----------
@@ -2118,15 +2255,42 @@ def _tone_gain_text(value):
     return ("-" if neg else "") + str(whole), half
 
 
+def _tone_segments_tl(bass, treble):
+    """TL mode layout, 6 positions: B | |bass| | bass sign | treble sign | |treble| | T.
+    The sign is a bar: low (segment D) if negative, middle (segment G) if zero,
+    top (segment A) if positive. A decimal point on a digit marks an extra half
+    unit, like in the BT layout (gains are multiples of 0.5)."""
+    segs = bytearray(6)
+    segs[0] = tm.encode_char('B')
+    segs[5] = tm.encode_char('T')
+    for digit_pos, sign_pos, value in ((1, 2, bass), (4, 3, treble)):
+        mag = abs(value)
+        whole = int(mag)
+        segs[digit_pos] = tm.encode_char(str(whole))
+        if (mag - whole) >= 0.25:
+            segs[digit_pos] |= 0x80
+        if value < -1e-9:
+            segs[sign_pos] = 0x08       # segment D: low bar
+        elif value > 1e-9:
+            segs[sign_pos] = 0x01       # segment A: top bar
+        else:
+            segs[sign_pos] = 0x40       # segment G: middle bar
+    return segs
+
+
 def display_tone_info():
-    """'B{xx}T{yy}'. 'B----T' if the tone filters are not ready.
+    """BT mode: 'B{xx}T{yy}'. TL mode: 'B{|b|}{sign}{sign}{|t|}T' (see
+    _tone_segments_tl). 'B----T' if the tone filters are not ready.
     A decimal point on the bass or treble digit marks an extra half unit
-    (like the half-dB indicator of the volume): -1.5 shows '-1.', 1.5 shows '1.'."""
+    (like the half-dB indicator of the volume): -1.5 shows '-1.', 1.5 shows '1.'
+    in BT mode."""
     global last_displayed
     p = get_all_tone_params(config_active)
 
     if p['bass'] is None or p['treble'] is None:
         show("B----T")
+    elif TONE_KEY_MODES[tone_mode_idx] == "TL":
+        tm.write(swap(_tone_segments_tl(p['bass'], p['treble'])))
     else:
         b_txt, b_half = _tone_gain_text(p['bass'])
         t_txt, t_half = _tone_gain_text(p['treble'])
@@ -2140,17 +2304,20 @@ def display_tone_info():
 
 
 def display_tone_preset_select():
-    """'BT def', 'BT alt', 'TL def' or 'TL alt': keys mode, then DSP preset.
-    DOWN toggles def / alt, UP toggles BT / TL, LEFT and RIGHT exit."""
+    """'BT def', 'BT beo', 'TL def' or 'TL beo': keys mode, then DSP preset.
+    DOWN toggles def / beo, UP toggles BT / TL, LEFT and RIGHT exit."""
     global last_displayed
-    show(TONE_KEY_MODES[tone_mode_idx] + " " + ("def" if tone_preset_idx == 0 else "alt"))
+    show(TONE_KEY_MODES[tone_mode_idx] + " " + ("def" if tone_preset_idx == 0 else "beo"))
     last_displayed = "tone_select"
 
 
 def display_loudness_info():
     global last_displayed
     p = get_all_tone_params(config_active)
-    show(f"LDN{fmt_loudness(p['loudness'])}")
+    if p['loudness_on'] is False:
+        show("LDNOFF")
+    else:
+        show(f"LDN{fmt_loudness(p['loudness'])}")
     last_displayed = "loudness"
 
 
@@ -2318,14 +2485,18 @@ def toggle_toslink_auto():
 #
 #   _A-XX : CamillaDSP captures the loopback -> TOSLINK is free.
 #           Probed directly through ALSA (0.5 s). A reading counts when
-#           rms >= TOSLINK_ON_DB AND crest (peak - rms) >= CREST_MIN_DB
+#           rms >= SIGNAL_ON_DB AND crest (peak - rms) >= CREST_MIN_DB
 #           (a steady noise floor has peak ~= rms and is ignored).
 #           2 consecutive readings -> switch to _B-XX
 #
-#   _B-XX : CamillaDSP captures TOSLINK -> `silent_now` is the TV level.
-#           Every TV_LOOP_S, LMS is asked whether it is playing:
-#             LMS playing + TOSLINK silent for SILENT_TICKS cycles -> back to _A-XX
-#             LMS playing while the TV plays -> LMS is paused
+#   _B-XX : CamillaDSP captures TOSLINK -> `silent_now` is the TV level,
+#           and the loopback is free: it is probed the same way as the
+#           TOSLINK in group A. LMS and the Bluetooth source both play
+#           through it, so a signal there means one of them is playing.
+#             signal on the loopback + TOSLINK silent for SILENT_TICKS cycles
+#                                                         -> back to _A-XX
+#             signal on the loopback while the TV plays
+#                                    -> LMS is paused, Bluetooth is paused
 #
 # A manual group ("_C-", "_D-", ...) is only meaningful in manual mode. While
 # the automatism is ON and a manual group is active, the loop probes TOSLINK
@@ -2333,74 +2504,39 @@ def toggle_toslink_auto():
 # After a TV -> streamer return the automatism lands on A, not on the manual
 # group.
 #
-# Automatism OFF: no probing, no switching, no LMS pause. BACK cycles within
+# Automatism OFF: no probing, no switching, no pause. BACK cycles within
 # the active group, HOMEPAGE cycles groups.
 
-TOSLINK_FORMATS = {
-    "S16_LE":  (2, 16),
-    "S24_3LE": (3, 24),
-    "S24_LE":  (4, 24),     # 24 bits in a 32-bit word
-    "S32_LE":  (4, 32),
-}
-
-
-def read_toslink_capture_params():
-    """Read device / rate / channels / format from the first '_B-*' YAML config.
-    All '_B-*' configs share the same capture input, so the first is enough."""
-    files = config_files_matching(CONFIG_DIR + "_B-*")
-    if not files:
-        log.error("[TOSLINK] No '_B-*' config file found in %s", CONFIG_DIR)
-        return None
-    try:
-        data = cdsp.config.read_and_parse_file(files[0])
-        if not isinstance(data, dict):
-            return None
-        dev = data.get("devices") or {}
-        cap = dev.get("capture") or {}
-        device = cap.get("device")
-        if not isinstance(device, str) or not device:
-            log.error("[TOSLINK] No capture device in %s", files[0])
-            return None
-        return {
-            "device":   device,
-            "rate":     int(dev.get("samplerate") or 48000),
-            "channels": int(cap.get("channels") or 2),
-            "format":   cap["format"],
-        }
-    except Exception as e:
-        log.error("[TOSLINK] Cannot read %s: %s", files[0], e)
-        return None
-
-
-def _levels(data, fmt, channels):
-    """Peak and RMS in dBFS. The RMS is the one of the LOUDEST channel, not of
-    the channels mixed together (a steady signal with different levels on the
-    two channels would otherwise pass the CREST_MIN_DB test as if it were
-    audio). Stereo only; other channel counts use the mixed RMS."""
+def _levels(data, channels):
+    """Peak and RMS in dBFS of S16_LE samples. The RMS is the one of the
+    LOUDEST channel, not of the channels mixed together (a steady signal with
+    different levels on the two channels would otherwise pass the CREST_MIN_DB
+    test as if it were audio). Stereo only; other channel counts use the
+    mixed RMS."""
     if not data:
         return None, None
-    width, bits = TOSLINK_FORMATS[fmt]
-    full_scale = 2 ** (bits - 1)
-    peak = audioop.max(data, width)
+    peak = audioop.max(data, 2)
     if channels == 2:
-        rms = max(audioop.rms(audioop.tomono(data, width, 1, 0), width),
-                  audioop.rms(audioop.tomono(data, width, 0, 1), width))
+        rms = max(audioop.rms(audioop.tomono(data, 2, 1, 0), 2),
+                  audioop.rms(audioop.tomono(data, 2, 0, 1), 2))
     else:
-        rms = audioop.rms(data, width)
-    peak_db = 20.0 * math.log10(peak / full_scale) if peak > 0 else -1000.0
-    rms_db = 20.0 * math.log10(rms / full_scale) if rms > 0 else -1000.0
+        rms = audioop.rms(data, 2)
+    peak_db = 20.0 * math.log10(peak / 32768) if peak > 0 else -1000.0
+    rms_db = 20.0 * math.log10(rms / 32768) if rms > 0 else -1000.0
     return peak_db, rms_db
 
 
-def _toslink_probe(params):
-    """Runs in a thread (blocks ~0.5 s).
-    Returns (peak_db, rms_db, None) if the TOSLINK is free,
+def _probe_input(device):
+    """Runs in a thread (blocks ~0.5 s). Used for the TOSLINK (group A) and
+    for the loopback (group B). Opens through plughw, so the rate asked below
+    does not need to match what the device actually uses.
+    Returns (peak_db, rms_db, None) if the input is free,
     (None, None, err) if it cannot be opened, (None, None, None) if no samples."""
     try:
         pcm = alsaaudio.PCM(
             type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NONBLOCK,
-            device=params["device"], channels=params["channels"],
-            rate=params["rate"], format=getattr(alsaaudio, "PCM_FORMAT_" + params["format"]),
+            device=device, channels=PROBE_CHANNELS,
+            rate=PROBE_RATE, format=alsaaudio.PCM_FORMAT_S16_LE,
             periodsize=4096,
         )
     except Exception as e:
@@ -2418,44 +2554,59 @@ def _toslink_probe(params):
     finally:
         pcm.close()
 
-    peak_db, rms_db = _levels(b"".join(chunks), params["format"], params["channels"])
+    peak_db, rms_db = _levels(b"".join(chunks), PROBE_CHANNELS)
     return peak_db, rms_db, None
 
 
-def tv_detected(peak, rms):
-    """A probe reading counts as TV audio: samples present, not a steady noise
-    floor (crest), and level above TOSLINK_ON_DB."""
+def signal_present(peak, rms):
+    """A probe reading counts as audio: samples present, not a steady noise
+    floor (crest), and level above SIGNAL_ON_DB."""
     return (peak is not None and (peak - rms) >= CREST_MIN_DB
-            and rms >= TOSLINK_ON_DB)
+            and rms >= SIGNAL_ON_DB)
 
 
 async def monitor_tv_toslink():
     """See the block comment 'Only two groups are recognised...' above
-    TOSLINK_FORMATS."""
+    _levels."""
     global toslink_ready
     loop = asyncio.get_running_loop()
 
-    LOOP_S       = 0.5      # base cycle period; group A mode also spends ~0.5 s probing
-    TV_LOOP_S    = 1.0      # "_B-" mode: exactly one LMS request per cycle
-    SILENT_TICKS = 2        # consecutive silent cycles (LMS playing) -> back to _A-
+    LOOP_S       = 0.5      # base cycle period; both probes also spend ~0.5 s probing
+    SILENT_TICKS = 2        # consecutive silent cycles (source playing) -> back to _A-
     RETRY_BASE_S = 5.0      # first delay after a failed switch; doubled each failure
     RETRY_MAX_S  = 60.0     # backoff ceiling
 
-    toslink_params = read_toslink_capture_params()
-    if toslink_params is None:
-        log.error("[TOSLINK] Cannot determine capture params, detection disabled")
+    # TOSLINK device: read from the _B-* config (the card name depends on the
+    # hardware and cannot be hardcoded). The loopback is always plughw:Loopback,1,0.
+    toslink_files = config_files_matching(CONFIG_DIR + "_B-*")
+    if not toslink_files:
+        log.error("[TOSLINK] No '_B-*' config file found in %s", CONFIG_DIR)
         return
-    log.info("[TOSLINK] Capture: %s @ %d Hz, %d ch, %s",
-             toslink_params["device"], toslink_params["rate"],
-             toslink_params["channels"], toslink_params["format"])
-    if TOSLINK_ON_DB <= SILENCE_RMS_DB:
-        log.warning("[TOSLINK] TOSLINK_ON_DB (%g) is not above SILENCE_RMS_DB (%g): "
-                    "the TV may be detected, then counted as silence", TOSLINK_ON_DB, SILENCE_RMS_DB)
+    try:
+        data = cdsp.config.read_and_parse_file(toslink_files[0])
+        toslink_device = ((data.get("devices") or {}).get("capture") or {}).get("device")
+    except Exception as e:
+        log.error("[TOSLINK] Cannot read %s: %s", toslink_files[0], e)
+        return
+    if not isinstance(toslink_device, str) or not toslink_device:
+        log.error("[TOSLINK] No capture device in %s", toslink_files[0])
+        return
+    # Force plughw on the TOSLINK device too, so the probe does not depend
+    # on the exact format/rate in the config.
+    if toslink_device.startswith("hw:"):
+        toslink_device = "plug" + toslink_device
+    log.info("[TOSLINK] Capture: %s", toslink_device)
+
+    if SIGNAL_ON_DB <= SILENCE_RMS_DB:
+        log.warning("[TOSLINK] SIGNAL_ON_DB (%g) is not above SILENCE_RMS_DB (%g): "
+                    "a signal may be detected, then counted as silence",
+                    SIGNAL_ON_DB, SILENCE_RMS_DB)
 
     if not config_files_matching(CONFIG_DIR + "_A-*"):
         log.error("[LOOPBACK] No '_A-*' config file found in %s", CONFIG_DIR)
         return
-    log.info("[LOOPBACK] Configs '_A-*' found in %s", CONFIG_DIR)
+    log.info("[LOOPBACK] Capture: %s", PROBE_DEVICE_LOOPBACK)
+
     toslink_ready = True
 
     last_config_path = cdsp.config.file_path() or ""
@@ -2463,6 +2614,7 @@ async def monitor_tv_toslink():
     silent_ticks = 0
     switch_failures = 0
     last_err = None
+    last_loop_err = None
 
     async def try_switch(pattern, target_prefix):
         """Switch to the requested group and check that it really happened.
@@ -2505,9 +2657,9 @@ async def monitor_tv_toslink():
             # right away, based on a single TOSLINK probe.
             if current_group not in ('A', 'B'):
                 peak, rms, err = await loop.run_in_executor(
-                    None, _toslink_probe, toslink_params)
+                    None, _probe_input, toslink_device)
 
-                if err is None and tv_detected(peak, rms):
+                if err is None and signal_present(peak, rms):
                     log.info("[TOSLINK] Automatism ON, manual group %s + TV "
                              "playing -> _B-", current_group)
                     await try_switch(CONFIG_DIR + '_B-*', 'B')
@@ -2522,7 +2674,7 @@ async def monitor_tv_toslink():
                 # the streamer group stays active until the TV really plays.
                 silent_ticks = 0
                 peak, rms, err = await loop.run_in_executor(
-                    None, _toslink_probe, toslink_params)
+                    None, _probe_input, toslink_device)
 
                 if err is not None:
                     if repr(err) != last_err:
@@ -2533,13 +2685,13 @@ async def monitor_tv_toslink():
                     continue
                 last_err = None
 
-                if TOSLINK_DEBUG and peak is not None:
+                if PROBE_DEBUG and peak is not None:
                     log.info("[TOSLINK] probe: peak=%.1f rms=%.1f crest=%.1f",
                              peak, rms, peak - rms)
 
                 # Protections 1 and 2: no samples, steady noise floor (peak ~= rms)
                 # or RMS below the level threshold -> no audio
-                if not tv_detected(peak, rms):
+                if not signal_present(peak, rms):
                     toslink_hits = 0
                     continue
 
@@ -2552,29 +2704,49 @@ async def monitor_tv_toslink():
                     await try_switch(CONFIG_DIR + '_B-*', 'B')
 
             else:
-                # _B-XX: TOSLINK captured by CamillaDSP, silent_now is the TV level
+                # _B-XX: TOSLINK captured by CamillaDSP, silent_now is the TV level.
+                # The loopback is free: a signal there means LMS or the
+                # Bluetooth source is playing.
                 toslink_hits = 0
-                lms_playing = await asyncio.to_thread(lms_is_playing)
-                if lms_playing and silent_now:
+                peak, rms, err = await loop.run_in_executor(
+                    None, _probe_input, PROBE_DEVICE_LOOPBACK)
+
+                if err is not None:
+                    if repr(err) != last_loop_err:
+                        log.warning("[LOOPBACK] Probe failed: %r", err)
+                        last_loop_err = repr(err)
+                    silent_ticks = 0
+                    await asyncio.sleep(2.0)
+                    continue
+                last_loop_err = None
+
+                if PROBE_DEBUG and peak is not None:
+                    log.info("[LOOPBACK] probe: peak=%.1f rms=%.1f crest=%.1f",
+                             peak, rms, peak - rms)
+
+                source_playing = signal_present(peak, rms)
+
+                if source_playing and silent_now:
                     # Debounce: a single silent cycle (dialogue pause, stale
                     # reading after a switch) must not send us back to _A-XX
                     silent_ticks += 1
                     if silent_ticks >= SILENT_TICKS:
-                        log.info("[LOOPBACK] LMS playing + TOSLINK silent "
+                        log.info("[LOOPBACK] Source playing + TOSLINK silent "
                                  "-> switch to _A-XX")
                         silent_ticks = 0
                         await try_switch(CONFIG_DIR + '_A-*', 'A')
                         continue
-                elif lms_playing:
+                elif source_playing:
                     silent_ticks = 0
-                    log.info("[TV] LMS started while the TV plays -> pause")
+                    log.info("[TV] Source started while the TV plays -> pause LMS + BT")
                     # "pause 1" forces the pause (a bare "pause" toggles, and
                     # would restart playback if LMS was already paused)
                     await asyncio.to_thread(send_lms_command, "pause 1")
+                    if ENABLE_BT_PAUSE:
+                        await asyncio.to_thread(bt_pause)
                     await asyncio.sleep(2.0)
                 else:
                     silent_ticks = 0
-                await asyncio.sleep(TV_LOOP_S - LOOP_S)
 
         except Exception as e:
             toslink_hits = silent_ticks = 0
@@ -2641,10 +2813,11 @@ def handle_arrow_keys(key):
                      Each gain stops at ±TONE_MAX_DB on its own, the other one
                      keeps moving until it reaches its limit too.
                      (no-op if the three tone filters are not ready)
-      tone_select  : DOWN toggles the DSP preset (def / alt), UP toggles the
+      tone_select  : DOWN toggles the DSP preset (def / beo), UP toggles the
                      keys mode (BT / TL); LEFT / RIGHT exit to tone
-      loudness     : UP/DOWN = loudness ±step (Loudness is optional: no
-                     helper needed, direct access protected by an activity check)
+      loudness     : UP/DOWN = loudness ±step (Loudness is optional; the keys
+                     do nothing while it is disabled; short ENTER enables /
+                     disables it, see toggle_loudness)
       any other    : opens the tone screen
     """
     up, down = KEY_BINDINGS['UP'], KEY_BINDINGS['DOWN']
@@ -2659,7 +2832,7 @@ def handle_arrow_keys(key):
 
     elif last_displayed == "loudness":
         loud_filter, loud_param = LOUDNESS_FILTER
-        if loud_filter in active_filter_names(config_active) and key in (up, down):
+        if loudness_state(config_active) and key in (up, down):
             # LEFT / RIGHT do nothing here
             params = config_active["filters"][loud_filter]["parameters"]
             ref_level = params.get(loud_param, 0) + (
@@ -2708,7 +2881,10 @@ def handle_enter_press(screen):
       previous values if they are already all at 0.
       No-op if the three tone filters are not ready.
     - tone_select screen: nothing (only UP and DOWN act).
-    - loudness screen: nothing."""
+    - loudness screen: enable / disable the loudness (bypass in the pipeline)."""
+    if screen == "loudness":
+        toggle_loudness()
+        return
     if screen != "tone" or not tone_filters_ready(config_active):
         return
 

@@ -14,6 +14,9 @@ import sys
 import time
 import unicodedata
 from urllib.parse import quote, unquote
+import yaml as _yaml # PERF PATCH PyYAML
+if hasattr(_yaml, "CSafeLoader"):
+    _yaml.SafeLoader = _yaml.CSafeLoader
 from camilladsp import CamillaClient
 
 
@@ -2374,7 +2377,7 @@ async def adc_reader_loop():
                 except ValueError:
                     log.warning("Non-numeric input received: %s", line)
 
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.25)
 
 
 # ---------- Display housekeeping ----------
@@ -2571,7 +2574,7 @@ async def monitor_tv_toslink():
     global toslink_ready
     loop = asyncio.get_running_loop()
 
-    LOOP_S       = 0.5      # base cycle period; both probes also spend ~0.5 s probing
+    LOOP_S       = 1      # base cycle period; both probes also spend ~1 s probing
     SILENT_TICKS = 2        # consecutive silent cycles (source playing) -> back to _A-
     RETRY_BASE_S = 5.0      # first delay after a failed switch; doubled each failure
     RETRY_MAX_S  = 60.0     # backoff ceiling

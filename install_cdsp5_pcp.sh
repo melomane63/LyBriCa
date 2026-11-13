@@ -9,67 +9,46 @@
 #                                   installed as the CDSPpiCore.tcz extension
 #
 # Usage (SSH, user tc):
-#   sh install_cdsp5_pcp.sh      -> interactive menu (no parameters)
+#   sh install_cdsp5_pcp.sh      -> asks for confirmation, then installs
 #
-# The step runs in its own process: an error does not stop the menu,
-# and nothing is saved (pcp bu) if that step fails.
+# The install runs in its own process (--run camilla).
 # ---------------------------------------------------------------------------
 
 SELF="$0"
-HOME_DIR=/home/tc
-# NOTE: /opt/bootlocal.sh is NOT read, written or used by this installer.
 
-# Exit code a step returns when the user cancels it (shown as SKIPPED).
-SKIP_RC=10
-
-say()  { echo "==> $*"; }
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
 ###########################################################################
 # CENTRALIZED URLS AND VERSIONS
-# All remote resources fetched by this script are listed here.
-# To upgrade a component, change ONLY the matching variable below.
 ###########################################################################
 
-# --- 1) CamillaDSP + CamillaGUI -----------------------------------------
-CDSP_VER="5.0.0-beta.2"          # CamillaDSP release tag
-GUI_VER="5.0.0-beta.2"           # camillagui-backend release tag
+CDSP_VER="5.0.0-beta.2"
+GUI_VER="5.0.0-beta.2"
 
-# Binary archives (arch suffix is appended at runtime: aarch64|armv7)
 CDSP_URL_BASE="https://github.com/HEnquist/camilladsp/releases/download/v${CDSP_VER}"
-CDSP_URL_ARCH="camilladsp-linux-%s.tar.gz"      # %s = aarch64|armv7
+CDSP_URL_ARCH="camilladsp-linux-%s.tar.gz"
 
 GUI_URL_BASE="https://github.com/HEnquist/camillagui-backend/releases/download/v${GUI_VER}"
-GUI_URL_ARCH="camillagui_linux_%s.tar.gz"       # %s = aarch64|armv7
+GUI_URL_ARCH="camillagui_linux_%s.tar.gz"
 
-# --- pCP extension names (for reference) --------------------------------
 EXT_CDSP="CDSPpiCore.tcz"
 
+# Squeezelite settings written to pcp.cfg (shown in the warning below)
+SQ_RATES="48000-48000"
+SQ_UPSAMPLE="hLE"
+SQ_ALSA_PARAMS="::32:"
+SQ_CLOSEOUT="3"
+
 ###########################################################################
-# 1) CAMILLADSP  (extension version)
-#
-# Layout:
-#   CDSPpiCore.tcz (read-only, rebuilt at each run)
-#     /usr/local/bin/camilladsp
-#     /usr/local/camillagui/camillagui        (+ symlink config -> $BASE/camillagui/config)
-#     /usr/local/tce.installed/CDSPpiCore     (start script, run as root)
-#   /mnt/mmcblk0p2/tce/camilladsp (persistent data, outside the extension)
-#     configs/ coeffs/ default_config.yml camilladsp_statefile.yml
-#     camillagui/config/ (camillagui.yml, gui-config.yml)
+# 1) CAMILLADSP
 ###########################################################################
 install_camilladsp() {
 set -e
 
 ### ======================= CONFIG ==========================================
-# CDSP_VER and GUI_VER are defined globally at the top of this file.
-DAC_FROM_PCP="yes"               # "yes": take the DAC from OUTPUT in pcp.cfg (read BEFORE it is switched to the loopback)
-DAC_DEVICE="null"                # fallback DAC: ALSA "null" output (silence); replace with the real DAC (e.g. hw:CARDNAME,0, see /proc/asound/cards)
-SAMPLERATE=48000                 # fixed pipeline sample rate
-CAPTURE_FORMAT="S32_LE"          # loopback side (what Squeezelite writes)
-PLAYBACK_FORMAT="S16_LE"         # DAC side (see /proc/asound/card0/stream0)
-SQ_RATES="48000-48000"           # Squeezelite -r: fixed rate (same as SAMPLERATE)
-SQ_UPSAMPLE="hLE"                # Squeezelite -R: resampling options
-SQ_ALSA_PARAMS="::::"            # Squeezelite -a: all 5 fields empty (defaults)
+SAMPLERATE=48000
+CAPTURE_FORMAT="S32_LE"
+PLAYBACK_FORMAT="S16_LE"
 ### =========================================================================
 
 normalize_fmt() {
@@ -79,36 +58,48 @@ CAPTURE_FORMAT=$(normalize_fmt "$CAPTURE_FORMAT")
 PLAYBACK_FORMAT=$(normalize_fmt "$PLAYBACK_FORMAT")
 
 PCP_CFG=/usr/local/etc/pcp/pcp.cfg
-if [ "$DAC_FROM_PCP" = "yes" ] && [ -r "$PCP_CFG" ]; then
+
+### ======================= DAC RESOLUTION ===================================
+DAC_DEVICE="null"
+
+PCP_OUT=""
+if [ -r "$PCP_CFG" ]; then
     PCP_OUT=$(sed -n 's/^OUTPUT="\(.*\)"/\1/p' "$PCP_CFG" | head -n 1)
     PCP_OUT=$(echo "$PCP_OUT" | sed -E 's/^plughw:/hw:/; s/^hw:CARD=([^,]*),DEV=([0-9]+)$/hw:\1,\2/; s/^hw:CARD=([^,]*)$/hw:\1,0/')
-    # DAC already set in an existing _A-loopback.yml (script re-run)
-    EXISTING_CFG=/mnt/mmcblk0p2/tce/camilladsp/configs/_A-loopback.yml
-    EXISTING_DAC=""
-    if [ -r "$EXISTING_CFG" ]; then
-        EXISTING_DAC=$(awk '/^  playback:/{f=1;next} f && /^    device:/{gsub(/^    device:[ ]*"?/,""); gsub(/"?[ ]*$/,""); print; exit}' "$EXISTING_CFG")
-        case "$EXISTING_DAC" in *Loopback*) EXISTING_DAC="" ;; esac
-    fi
-    case "$PCP_OUT" in
-        *Loopback*|"")
-            if [ -n "$EXISTING_DAC" ]; then
-                DAC_DEVICE="$EXISTING_DAC"
-                echo ">>> pcp.cfg OUTPUT is empty or already the loopback: DAC taken from _A-loopback.yml: $DAC_DEVICE"
-            else
-                echo ">>> pcp.cfg OUTPUT is empty or already the loopback: keeping DAC_DEVICE=$DAC_DEVICE"
-            fi ;;
-        hw:*)
-            DAC_DEVICE="$PCP_OUT"
-            echo ">>> DAC taken from pcp.cfg: $DAC_DEVICE" ;;
-        *)
-            if [ -n "$EXISTING_DAC" ]; then
-                DAC_DEVICE="$EXISTING_DAC"
-                echo "!!! WARNING: pcp.cfg OUTPUT ('$PCP_OUT') is not a hw: device: DAC taken from _A-loopback.yml: $DAC_DEVICE"
-            else
-                echo "!!! WARNING: pcp.cfg OUTPUT ('$PCP_OUT') is not a hw: device: keeping DAC_DEVICE=$DAC_DEVICE"
-            fi ;;
-    esac
 fi
+
+# First existing config named _A-*.yml (alphabetical order)
+EXISTING_CFG=$(ls /mnt/mmcblk0p2/tce/camilladsp/configs/_A-*.yml 2>/dev/null | head -n 1)
+EXISTING_DAC=""
+if [ -r "$EXISTING_CFG" ]; then
+    EXISTING_DAC=$(awk '/^  playback:/{f=1;next} f && /^    device:/{gsub(/^    device:[ ]*"?/,""); gsub(/"?[ ]*$/,""); print; exit}' "$EXISTING_CFG")
+    case "$EXISTING_DAC" in *Loopback*) EXISTING_DAC="" ;; esac
+fi
+
+# Case 1: OUTPUT in pcp.cfg is a real physical DAC
+case "$PCP_OUT" in
+    hw:*)
+        case "$PCP_OUT" in
+            *Loopback*) ;;   # virtual -> look in the first _A-*.yml
+            *)
+                DAC_DEVICE="$PCP_OUT"
+                echo ">>> DAC from pcp.cfg: $DAC_DEVICE"
+                ;;
+        esac
+        ;;
+esac
+
+# Case 2: OUTPUT is virtual (loopback, dmix, empty) -> read the first _A-*.yml
+if [ "$DAC_DEVICE" = "null" ]; then
+    if [ -n "$EXISTING_DAC" ]; then
+        DAC_DEVICE="$EXISTING_DAC"
+        echo ">>> DAC from $EXISTING_CFG: $DAC_DEVICE"
+    else
+        echo "!!! WARNING: no physical DAC found (neither in pcp.cfg nor in an _A-*.yml config)."
+        echo "!!! DAC_DEVICE reste null."
+    fi
+fi
+### =========================================================================
 
 BASE=/mnt/mmcblk0p2/tce/camilladsp
 TMPDIR_CDSP=/tmp/install_camilladsp
@@ -122,8 +113,6 @@ AVAILABLE_MB=$(/bin/df -m /dev/mmcblk0p2 | awk 'NR==2 { print $4 }')
 if [ "$AVAILABLE_MB" -le "$REQUIRED_MB" ]; then
     die "Not enough space (${AVAILABLE_MB} MB). Enlarge the partition: Main Page > Additional functions > Resize FS"
 fi
-
-# (No more refusal if CDSPpiCore.tcz exists: it is simply replaced.)
 
 if [ -d "$TMPDIR_CDSP" ]; then
     die "Reboot before re-running ($TMPDIR_CDSP already exists)."
@@ -144,7 +133,6 @@ install_if_missing() {
     fi
 }
 
-# Same, but temporary: downloaded to /tmp, gone after the next reboot.
 install_temporarily_if_missing() {
     if ! tce-status -i | grep -q "$1" ; then
         pcp-load -wil -t /tmp "$1"
@@ -158,7 +146,6 @@ EXT="$TMPDIR_CDSP/ext"
 mkdir -p "$EXT/usr/local/bin" "$EXT/usr/local/camillagui" "$EXT/usr/local/tce.installed"
 CDSP_BIN="$EXT/usr/local/bin/camilladsp"
 
-# Persistent data (outside the extension)
 mkdir -p "$BASE/configs" "$BASE/coeffs" "$BASE/camillagui/config"
 
 cd "$TMPDIR_CDSP"
@@ -179,8 +166,6 @@ fi
 aplay -l | grep -qi loopback || die "Loopback card missing after modprobe."
 
 ### --- 3. CamillaDSP config and statefile ----------------------------------
-# Minimal pass-through config: Loopback,1 (capture) -> 0 dB gain -> DAC.
-# Capture on Loopback,1 because Squeezelite plays on Loopback,0.
 cat > "$BASE/configs/_A-loopback.yml" <<EOF
 ---
 devices:
@@ -253,7 +238,6 @@ pipeline:
   type: Filter
 title: Setup
 EOF
-cp "$BASE/configs/_A-loopback.yml" "$BASE/default_config.yml"
 
 if "$CDSP_BIN" -c "$BASE/configs/_A-loopback.yml"; then
     echo ">>> Config _A-loopback.yml: valid."
@@ -287,7 +271,6 @@ else
     echo ">>> No stream0 for '$DAC_CARD' (non-USB card or null device?): DAC formats not checked."
 fi
 
-# Complete statefile: without mute/volume, CamillaDSP 4.x/5.x rejects the file
 cat > "$BASE/camilladsp_statefile.yml" <<EOF
 config_path: $BASE/configs/_A-loopback.yml
 mute:
@@ -325,7 +308,6 @@ GUI_FOUND=$(find "$GUI_TMP" -type f -name camillagui | head -n 1)
 cp "$GUI_FOUND" "$GUI_BIN"
 chmod +x "$GUI_BIN"
 
-# If the archive ships a default gui-config.yml, use it only when none exists yet
 GUI_CFG_FOUND=$(find "$GUI_TMP" -type f -name gui-config.yml | head -n 1)
 if [ -n "$GUI_CFG_FOUND" ] && [ ! -f "$BASE/camillagui/config/gui-config.yml" ]; then
     cp "$GUI_CFG_FOUND" "$BASE/camillagui/config/gui-config.yml"
@@ -334,14 +316,12 @@ fi
 ( cd "$BASE/camillagui" && "$GUI_BIN" --help > /dev/null ) \
     || die "The GUI executable does not run on this system."
 
-# camillagui.yml is rewritten each time (fixed paths).
-# gui-config.yml is NOT touched: the GUI settings survive an update.
 cat > "$BASE/camillagui/config/camillagui.yml" <<EOF
 ---
 camilla_host: "127.0.0.1"
 camilla_port: 1234
 bind_address: "0.0.0.0"
-port: 5000
+port: 5005
 ssl_certificate: null
 ssl_private_key: null
 gui_config_file: null
@@ -356,30 +336,18 @@ supported_capture_types: ["Alsa", "Stdin"]
 supported_playback_types: ["Alsa"]
 EOF
 
-# Symlink inside the extension: works whether the GUI looks for config/
-# next to its executable or in the current directory.
 ln -s "$BASE/camillagui/config" "$EXT/usr/local/camillagui/config"
 
 ### --- 5. Startup script (run as root when the extension is loaded) --------
 cat > "$EXT/usr/local/tce.installed/CDSPpiCore" <<'EOF'
 #!/bin/sh
-# Starts CamillaDSP then CamillaGUI (run as root by the extension loader)
-
 BASE=/mnt/mmcblk0p2/tce/camilladsp
-
-# Load the ALSA loopback module before Squeezelite starts
 modprobe snd-aloop
-
-# CamillaDSP: runs as root so that its audio threads can get real-time
-# priority (SCHED_FIFO).
 /usr/local/bin/camilladsp \
     -w -p 1234 -a 0.0.0.0 \
     -o /tmp/camilladsp.log \
     -s "$BASE/camilladsp_statefile.yml" &
-
-# CamillaGUI: no real-time priority needed, runs as tc from the persistent folder
 sudo -u tc sh -c "cd '$BASE/camillagui' && /usr/local/camillagui/camillagui" &
-
 exit 0
 EOF
 chmod 775 "$EXT/usr/local/tce.installed/CDSPpiCore"
@@ -390,7 +358,6 @@ TCZ="$TMPDIR_CDSP/$EXT_CDSP"
 mksquashfs "$EXT" "$TCZ" -noappend -all-root
 mv -f "$TCZ" "$OPT/$EXT_CDSP"
 
-# Make sure the kernel modules (snd-aloop) are loaded before our script runs
 ALSA_EXT="alsa-modules-$(uname -r).tcz"
 if [ -f "$OPT/$ALSA_EXT" ]; then
     echo "$ALSA_EXT" > "$OPT/$EXT_CDSP.dep"
@@ -401,45 +368,153 @@ fi
 grep -qx "$EXT_CDSP" /etc/sysconfig/tcedir/onboot.lst \
     || echo "$EXT_CDSP" >> /etc/sysconfig/tcedir/onboot.lst
 
-# Migration: remove the old loose files (bootlocal.sh is NOT touched:
-# CamillaDSP is now started by the extension's tce.installed script).
 rm -f "$BASE/start_camilladsp.sh" "$BASE/camilladsp" "$BASE/camillagui/camillagui"
 
 ### --- 7. Squeezelite -> loopback ------------------------------------------
-# Replace VAR="value" if the key exists in pcp.cfg; otherwise warn
-# (so that a wrong variable name never silently creates a useless line).
 set_pcp_cfg() {
     if grep -q "^$1=" "$PCP_CFG"; then
         sed "s|^$1=.*|$1=\"$2\"|" -i "$PCP_CFG"
         echo ">>> pcp.cfg: $1=\"$2\""
     else
-        echo "!!! WARNING: key $1 not found in pcp.cfg, not set. Set it in the pCP web interface."
+        echo "!!! WARNING: key $1 not found in pcp.cfg, not set."
     fi
 }
 
-set_pcp_cfg OUTPUT      "hw:Loopback,0"
-set_pcp_cfg ALSA_PARAMS "$SQ_ALSA_PARAMS"   # -a  all fields empty
-set_pcp_cfg MAX_RATE    "$SQ_RATES"         # -r  min-max sample rate
-set_pcp_cfg UPSAMPLE    "$SQ_UPSAMPLE"      # -R  resampling options
+# Only switch OUTPUT to the loopback if it is not already a virtual device
+case "$PCP_OUT" in
+    *Loopback*|dmix*|"")
+        echo ">>> OUTPUT is already virtual ('$PCP_OUT'), leaving it unchanged."
+        ;;
+    hw:*)
+        set_pcp_cfg OUTPUT "hw:Loopback,0"
+        ;;
+esac
 
-### --- 8. Cleanup and backup -----------------------------------------------
+set_pcp_cfg ALSA_PARAMS "$SQ_ALSA_PARAMS"
+set_pcp_cfg MAX_RATE    "$SQ_RATES"
+set_pcp_cfg UPSAMPLE    "$SQ_UPSAMPLE"
+set_pcp_cfg CLOSEOUT    "$SQ_CLOSEOUT"
+
+### --- 8. Cleanup (pcp backup runs only once, at the end of step 10) ------
+set +e
 rm -rf "$TMPDIR_CDSP"
-grep -q '^defaults\.pcm\.rate_converter[[:space:]]' /etc/asound.conf \
-    || sudo sed -i '1i defaults.pcm.rate_converter "speexrate_medium"' /etc/asound.conf
-pcp backup
+
+### --- 9. pcp_patch.sh (dmix.cgi patches + DAC mixer restore) --------------
+# Extract the card name from DAC_DEVICE
+# (hw:CARD=Aureon51MkII,DEV=0 / plughw:Aureon51MkII,0 -> Aureon51MkII)
+DAC_NAME=$(echo "$DAC_DEVICE" | sed -E 's/^(plug)?hw:(CARD=)?([^,]+).*/\3/')
+[ "$DAC_DEVICE" = "null" ] && DAC_NAME=""
+
+cat > /mnt/mmcblk0p2/tce/pcp_patch.sh <<'EOF'
+#!/bin/sh
+# pcp_patch.sh - piCorePlayer post-boot patches (run from Tweaks > User commands)
+
+# Patch dmix.cgi: stop commenting out the format line (idempotent)
+sudo sed -i '/Comment out format for now/{n;/^[[:blank:]]*busybox/s/^/#/}' /var/www/cgi-bin/dmix.cgi
+
+# Patch dmix.cgi: the "rate" sed must not overwrite the rate_converter line (idempotent)
+sudo sed -i 's|s/rate\.\*/rate |s/rate [0-9].*/rate |' /var/www/cgi-bin/dmix.cgi
+
+# Restore the DAC mixer
+sudo alsactl restore DAC_NAME_PLACEHOLDER
+EOF
+
+# If there is no DAC, remove the alsactl line (otherwise it would keep an empty name)
+if [ -z "$DAC_NAME" ]; then
+    sed -i '/sudo alsactl restore DAC_NAME_PLACEHOLDER/d' /mnt/mmcblk0p2/tce/pcp_patch.sh
+else
+    sed -i "s|DAC_NAME_PLACEHOLDER|${DAC_NAME}|g" /mnt/mmcblk0p2/tce/pcp_patch.sh
+fi
+
+chmod +x /mnt/mmcblk0p2/tce/pcp_patch.sh
+
+set_pcp_cfg USER_COMMAND_1 "/mnt/mmcblk0p2/tce/pcp_patch.sh"
+
+### --- 10. /etc/asound.conf: rate_converter (mixer only) + dmixer subdevice -
+ASOUND=/etc/asound.conf
+
+sudo touch "$ASOUND"
+
+# 1) pcm.pCP_Mixer: add rate_converter "speexrate_medium" (idempotent)
+if sudo grep -q '^pcm\.pCP_Mixer' "$ASOUND"; then
+    if ! sudo awk '/^pcm\.pCP_Mixer[[:space:]]*\{/,/^\}/' "$ASOUND" | grep -q 'rate_converter'; then
+        sudo awk '
+            /^pcm\.pCP_Mixer[[:space:]]*\{/ { inblock=1 }
+            inblock && /^\}/ && !done {
+                print "   rate_converter \"speexrate_medium\""
+                done=1
+            }
+            { print }
+        ' "$ASOUND" > /tmp/asound.new && sudo cp /tmp/asound.new "$ASOUND" && rm -f /tmp/asound.new
+    fi
+else
+    sudo sh -c "cat >> $ASOUND" <<'EOC'
+
+pcm.pCP_Mixer {
+   type plug
+   slave.pcm "pcm.dmixer"
+   rate_converter "speexrate_medium"
+}
+EOC
+fi
+
+# 2) pcm.dmixer: subdevice 0 always ACTIVE (uncommented if needed, added otherwise)
+if sudo grep -q '^pcm\.dmixer' "$ASOUND"; then
+    # uncomment any form of "# subdevice 0" / "##  subdevice 0" (inside the dmixer block only)
+    sudo sed -i '/^pcm\.dmixer[[:space:]]*{/,/^}/ s/^[[:space:]]*#*[[:space:]]*subdevice 0[[:space:]]*$/      subdevice 0/' "$ASOUND"
+    # if the line is missing, add it after "device 0"
+    if ! sudo awk '/^pcm\.dmixer[[:space:]]*\{/,/^\}/' "$ASOUND" | grep -q '^[[:space:]]*subdevice 0'; then
+        sudo awk '
+            /^pcm\.dmixer[[:space:]]*\{/ { indmixer=1 }
+            indmixer && /^      device 0/ && !done {
+                print
+                print "      subdevice 0"
+                done=1
+                next
+            }
+            { print }
+        ' "$ASOUND" > /tmp/asound.new && sudo cp /tmp/asound.new "$ASOUND" && rm -f /tmp/asound.new
+    fi
+else
+    sudo sh -c "cat >> $ASOUND" <<'EOC'
+
+pcm.dmixer {
+   type dmix
+   ipc_key 1024
+   ipc_perm 0666
+   slave.pcm {
+      type hw
+      card Loopback
+      device 0
+      subdevice 0
+   }
+}
+EOC
+fi
+
+# 3) Verification
+echo ">>> /etc/asound.conf after patch:"
+sudo cat "$ASOUND"
+sudo grep -q 'rate_converter "speexrate_medium"' "$ASOUND" \
+    && echo ">>> OK: speexrate_medium present." \
+    || echo "!!! WARNING: speexrate_medium missing."
+sudo grep -q '^[[:space:]]*subdevice 0' "$ASOUND" \
+    && echo ">>> OK: subdevice 0 active." \
+    || echo "!!! WARNING: subdevice 0 missing or commented out."
+
+# 4) Final backup: USER_COMMAND_1 (pcp.cfg) and asound.conf
+pcp backup || echo "!!! pcp backup failed (non-blocking)."
+
+set -e
 
 set +v
 echo ""
 echo "CamillaDSP extension installed ($EXT_CDSP). Reboot to start it."
-echo "Web interface: http://pcp.local:5000/gui/index.html"
-echo "After reboot, check:"
-echo "  tce-status -i | grep CDSPpiCore"
-echo "  pidof camilladsp camillagui"
-echo "  for t in /proc/\$(pidof camilladsp)/task/*; do echo \"\$(cat \$t/comm): \$(chrt -p \$(basename \$t) | head -1)\"; done"
+echo "Web interface: http://pcp.local:5005/gui/index.html"
 }
 
 ###########################################################################
-# DISPATCH: one step = one process (sh "$SELF" --run <step>)
+# DISPATCH
 ###########################################################################
 if [ "$1" = "--run" ]; then
     case "$2" in
@@ -451,70 +526,31 @@ fi
 
 [ "$(id -u)" -eq 0 ] && fail "Run this script as user tc, not root."
 
-DONE=""
+echo "This script installs CamillaDSP + CamillaGUI and WRITES:"
+echo "  - CamillaDSP: _A-loopback.yml, camilladsp_statefile.yml"
+echo "    (volume reset to -40 dB) and camillagui.yml (web port 5005)"
+echo "  - the $EXT_CDSP extension (+ .dep) and its line in onboot.lst"
+echo "  - pcp.cfg: squeezelite settings ALSA_PARAMS=\"$SQ_ALSA_PARAMS\", MAX_RATE=\"$SQ_RATES\","
+echo "    UPSAMPLE=\"$SQ_UPSAMPLE\", CLOSEOUT=\"$SQ_CLOSEOUT\" (your current values are overwritten),"
+echo "    USER_COMMAND_1 (overwritten), and OUTPUT only if it is a physical hw: device"
+echo "  - /mnt/mmcblk0p2/tce/pcp_patch.sh and /etc/asound.conf"
+echo "    (rate_converter in pCP_Mixer, subdevice 0 in dmixer)"
+printf "Continue? [y/N]: "
+read -r A
+case "$A" in
+    y|Y) ;;
+    *)   echo "Cancelled."; exit 0 ;;
+esac
 
-run_step() {  # $1 = camilla
-    echo
-    echo "############################################################"
-    echo "# Step: $1"
-    echo "############################################################"
-    sh "$SELF" --run "$1"
-    rc=$?
-    case "$rc" in
-        0)        DONE="$DONE $1:OK" ;;
-        "$SKIP_RC") DONE="$DONE $1:SKIPPED" ;;
-        *)        DONE="$DONE $1:FAILED"
-                  echo "!!! Step '$1' failed (see messages above)." >&2 ;;
-    esac
-}
+if sh "$SELF" --run camilla; then
+    echo "Installation finished."
+else
+    echo "!!! Installation failed (see messages above)." >&2
+fi
 
-do_reboot() {
-    case "$DONE" in
-        *FAILED*) echo "!!! Some steps failed:$DONE" ;;
-    esac
-    printf "Reboot now? [y/N]: "
-    read -r R
-    case "$R" in
-        y|Y) echo "Rebooting..."; pcp reboot; exit 0 ;;
-        *)   echo "Reboot cancelled." ;;
-    esac
-}
-
-run_choice() {
-    for c in "$@"; do
-        case "$c" in
-            1|camilla) run_step camilla ;;
-            r|R)       do_reboot ;;
-            q|Q)       return 1 ;;
-            *) echo "Unknown choice: $c" ;;
-        esac
-    done
-    return 0
-}
-
-summary() {
-    echo
-    if [ -n "$DONE" ]; then
-        echo "Result:$DONE"
-        echo "Reboot to activate everything:  pcp reboot"
-    fi
-}
-
-# Interactive menu
-while true; do
-    echo
-    echo "=============================================="
-    echo "  CamillaDSP installer for piCorePlayer "
-    echo "=============================================="
-    echo "  1) CamillaDSP + CamillaGUI"
-    echo "  R) Reboot now"
-    echo "  Q) Quit"
-    echo "----------------------------------------------"
-    printf "Choice (several allowed, e.g. 1): "
-    read -r CHOICES || break
-    [ -z "$CHOICES" ] && continue
-    # shellcheck disable=SC2086
-    run_choice $CHOICES || break
-done
-
-summary
+printf "Reboot now? [y/N]: "
+read -r R
+case "$R" in
+    y|Y) echo "Rebooting..."; pcp reboot ;;
+    *)   echo "Reboot cancelled." ;;
+esac

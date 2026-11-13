@@ -56,7 +56,6 @@ ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input.
 ENABLE_TV_RELAY       = True   # Relay on TV_RELAY_GPIO: active (input pulled to ground) as long
                                # as a "_B-*" config is active, inactive (high impedance)
                                # otherwise. Independent of the POWER relay.
-ENABLE_BT_PAUSE       = True   # In "_B-", pause the Bluetooth source too (AVRCP, bluetoothctl)
 
 
 # At least one feature must be enabled, otherwise the script has nothing to do
@@ -2745,8 +2744,7 @@ async def monitor_tv_toslink():
                     # "pause 1" forces the pause (a bare "pause" toggles, and
                     # would restart playback if LMS was already paused)
                     await asyncio.to_thread(send_lms_command, "pause 1")
-                    if ENABLE_BT_PAUSE:
-                        await asyncio.to_thread(bt_pause)
+                    await asyncio.to_thread(bt_pause)
                     await asyncio.sleep(2.0)
                 else:
                     silent_ticks = 0

@@ -19,7 +19,7 @@
 SELF="$0"
 HOME_DIR=/home/tc
 # NOTE: /opt/bootlocal.sh is NOT read, written or used by this installer.
-# LyBriCa is started via USER_COMMAND_1 in pcp.cfg (pCP user command).
+# LyBriCa is started via USER_COMMAND_2 in pcp.cfg (pCP user command).
 
 # Exit code a step returns when the user cancels it (shown as SKIPPED).
 # Chosen so it cannot be confused with the exit codes of wget, tar, etc.
@@ -442,19 +442,19 @@ EOF
     patch_pcp_bt || echo "!!! WARNING: pcp-bt.tcz was not patched (see messages above)."
 
     # 9. Register the launcher as a pCP user command.
-    #    On a fresh pCP install, USER_COMMAND_1 exists and is empty:
+    #    On a fresh pCP install, USER_COMMAND_2 exists and is empty:
     #    write the launcher there. bootlocal.sh is NOT touched.
     #    Spaces are encoded as '+' (same format as the pCP web UI).
     PCP_CFG=/usr/local/etc/pcp/pcp.cfg
     CMD_RAW="/usr/local/bin/start_lybrica.sh"
     CMD_ENC=$(echo "$CMD_RAW" | tr ' ' '+')
 
-    say "Registering $CMD_RAW in USER_COMMAND_1..."
+    say "Registering $CMD_RAW in USER_COMMAND_2..."
     awk -v v="$CMD_ENC" '
-        /^USER_COMMAND_1=/ { print "USER_COMMAND_1=\"" v "\""; next }
+        /^USER_COMMAND_2=/ { print "USER_COMMAND_2=\"" v "\""; next }
         { print }
     ' "$PCP_CFG" > "$PCP_CFG.new" && mv "$PCP_CFG.new" "$PCP_CFG"
-    say "pcp.cfg: USER_COMMAND_1=\"$CMD_RAW\""
+    say "pcp.cfg: USER_COMMAND_2=\"$CMD_RAW\""
 
     # 10. Check imports from the build dir (proves both tc and root see them)
     say "Checking imports from the build dir (tc)..."
@@ -481,7 +481,7 @@ EOF
     echo "  pcp-bt.tcz                        (rebuilt with the patched hid_ble_bridge.py + hidbridge)"
     echo "  /home/tc/lybrica-mod.py           (optional, create with 'lybrica reset')"
     echo
-    echo "NOTE: the launcher is registered as USER_COMMAND_1 in pcp.cfg:"
+    echo "NOTE: the launcher is registered as USER_COMMAND_2 in pcp.cfg:"
     echo "        $CMD_RAW"
     echo "      Check Tweaks > User commands in the pCP web interface."
     echo

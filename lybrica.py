@@ -1,4 +1,4 @@
-# Lybrica V2.2
+# Lybrica V2.3 (CPU-optimised)
 import asyncio
 import functools
 import glob
@@ -14,10 +14,18 @@ import sys
 import time
 import unicodedata
 from urllib.parse import quote, unquote
+
 import yaml as _yaml # PERF PATCH PyYAML
 if hasattr(_yaml, "CSafeLoader"):
     _yaml.SafeLoader = _yaml.CSafeLoader
+
 from camilladsp import CamillaClient
+
+# PERF: lower priority than CamillaDSP
+try:
+    os.nice(10)
+except Exception:
+    pass
 
 
 # =====================================================================
@@ -107,9 +115,14 @@ CAMILLA_ADDR = ("127.0.0.1", 1234)  # CamillaDSP on this Pi (must stay local: lo
 # One shared reader (cdsp_poller) publishes into `vol_state`. The volume watcher
 # (display / resync) and the LMS bridge subscribe to it; the TOSLINK monitor
 # reads vol_state.config_path by polling.
-POLL_INTERVAL_S = 0.25      # One read cycle of CamillaDSP (volume + mute)
-PATH_EVERY = 2              # The config file path is read every N cycles (2 -> every 0.5 s)
+#
+# Adaptive polling: fast while the user interacts, slow otherwise.
+POLL_INTERVAL_S = 0.25      # One read cycle of CamillaDSP (volume + mute), interaction in progress
+POLL_IDLE_S = 1.0           # One read cycle when nobody touched the remote recently
+POLL_FAST_WINDOW_S = 10     # Seconds of fast polling after a key press
+PATH_EVERY = 2              # The config file path is read every N cycles
 CDSP_RECONNECT_DELAY_S = 2.0    # Seconds to wait before trying to reconnect to CamillaDSP after an error
+RAW_DEBUG = False           # Log every time the active config text changed (should be silent at rest)
 
 
 # ---------------------- Logitech Media Server ----------------------
@@ -196,6 +209,9 @@ PROBE_DEBUG = False     # Log every input probe measurement, to calibrate SIGNAL
 PROBE_DEVICE_LOOPBACK = "plughw:Loopback,1,0"
 PROBE_RATE     = 48000
 PROBE_CHANNELS = 2
+PROBE_WINDOW_S = 0.5    # Length of one probe measurement
+PROBE_POLL_S   = 0.04   # Sleep between two ALSA reads inside a probe (period is ~85 ms)
+TOSLINK_LOOP_S = 2      # Base cycle period of the TOSLINK monitor
 
 
 # ---------------------- Display ----------------------
@@ -215,6 +231,7 @@ BAUD_RATE = 115200
 ADC_LEVELS = [80, 1000, 2500, 3500]
 BRIGHTNESS_LEVELS = [0, 1, 2, 3, 7]
 HYSTERESIS_RATIO = 0.03     # 3 % hysteresis between two brightness levels
+ADC_READ_INTERVAL_S = 1.0   # Ambient light sensor read period
 
 
 # ---------------------- Remote control ----------------------
@@ -414,7 +431,8 @@ TONE_MAX_DB = 6.0
 
 TASK_RESTART_DELAY_S = 2.0  # Seconds before a background task that crashed is restarted
 TONE_PUBLISH_MAX_POLLS = 4  # A tone / loudness publish is dropped if the config read from
-                            # CamillaDSP did not change within this many reads (about 2 s)
+                            # CamillaDSP did not change within this many reads (about 2 s
+                            # while polling fast, longer at rest)
 
 # CamillaDSP configs: PiCorePlayer's persistent partition (PCP_DIR), or ~ elsewhere.
 BASE_DIR   = PCP_DIR if os.path.isdir(PCP_DIR) else os.path.expanduser("~")
@@ -628,11 +646,17 @@ def quiet_age():
     return min(silence_age(), idle_age())
 
 
+def _read_capture_levels():
+    """(rms, peak) of the capture side, in a single CamillaDSP request
+    (pycamilladsp >= 5)."""
+    lv = cdsp.levels.levels()
+    return lv["capture_rms"], lv["capture_peak"]
+
+
 def is_silent():
     """RMS threshold, then crest factor (peak vs RMS). A steady noise floor
     has peak ≈ RMS; real audio does not."""
-    rms = cdsp.levels.capture_rms()
-    peak = cdsp.levels.capture_peak()
+    rms, peak = _read_capture_levels()
     rms_vals = list(rms.values()) if isinstance(rms, dict) else list(rms)
     peak_vals = list(peak.values()) if isinstance(peak, dict) else list(peak)
     if not rms_vals or not peak_vals:
@@ -1135,14 +1159,28 @@ async def supervised(name, factory):
             await asyncio.sleep(TASK_RESTART_DELAY_S)
 
 
+def poll_delay():
+    """Fast polling while the user interacts, slow otherwise."""
+    if is_volume_key_held or idle_age() < POLL_FAST_WINDOW_S:
+        return POLL_INTERVAL_S
+    return POLL_IDLE_S
+
+
 async def cdsp_poller():
     """Periodic reader of volume / mute / config path. Also publishes the full
-    content of cdsp.config.active(): it is the change-detection source that
+    content of the active config: it is the change-detection source that
     works even when the GUI changed the config without updating file_path()
     (CamillaDSP stores the path but does not touch it on SetConfig: only
-    change_config calls set_file_path). On error: reconnection, keep running."""
+    change_config calls set_file_path).
+
+    PERF: the active config is read as raw YAML text (active_raw, pycamilladsp
+    >= 5) and only parsed when the text changed; otherwise the already
+    published dict is reused.
+    On error: reconnection, keep running."""
     n = 0
     failures = 0
+    last_raw = None
+
     while True:
         try:
             t0 = time.monotonic()
@@ -1152,14 +1190,22 @@ async def cdsp_poller():
             path = active = None
             if n % PATH_EVERY == 0:
                 path = cdsp.config.file_path()
-                # active() serializes the whole config: skip it while a volume
-                # key is held, otherwise the volume display stutters on every
-                # repeat (the remote handler already refreshes it directly).
+                # Skip the config read while a volume key is held, otherwise
+                # the volume display stutters on every repeat (the remote
+                # handler already refreshes it directly).
                 if not is_volume_key_held:
                     try:
-                        active = cdsp.config.active() or {}
+                        raw = cdsp.config.active_raw()
+                        if raw != last_raw or vol_state.config_active is None:
+                            if RAW_DEBUG:
+                                log.info("[RAW] changed")
+                            active = _yaml.safe_load(raw) or {}
+                            last_raw = raw
+                        else:
+                            active = vol_state.config_active    # unchanged
                     except Exception:
                         active = None
+                        last_raw = None
 
             n += 1
             vol_state.publish(db, muted, config_path=path,
@@ -1169,6 +1215,7 @@ async def cdsp_poller():
                 failures = 0
         except Exception as e:
             failures += 1
+            last_raw = None            # force a re-parse after the reconnection
             if failures == 1 or failures % 20 == 0:
                 log.warning("CamillaDSP unreachable (%s), reconnecting...", e)
             await asyncio.sleep(CDSP_RECONNECT_DELAY_S)
@@ -1179,7 +1226,7 @@ async def cdsp_poller():
             except Exception as e2:
                 log.warning("Reconnection failed (%s)", e2)
             continue
-        await asyncio.sleep(POLL_INTERVAL_S)
+        await asyncio.sleep(poll_delay())
 
 
 # ---------- Config switching ----------
@@ -1428,6 +1475,7 @@ async def volume_watcher_loop():
         current_active = vol_state.config_active
 
         config_changed = (current_active is not None
+                          and current_active is not last_active
                           and current_active != last_active)
 
         if config_changed:
@@ -2016,7 +2064,7 @@ _last_clock_str = None          # Last string drawn by draw_clock(), used to avo
 
 def draw_clock():
     """Draw HHh MM. Writes only when the displayed text changes (once a minute),
-    so a per-second redraw does not hit the TM1637 bus for nothing."""
+    so a redraw does not hit the TM1637 bus for nothing."""
     global _last_clock_str
     if not ENABLE_DISPLAY:
         return
@@ -2376,7 +2424,7 @@ async def adc_reader_loop():
                 except ValueError:
                     log.warning("Non-numeric input received: %s", line)
 
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(ADC_READ_INTERVAL_S)
 
 
 # ---------- Display housekeeping ----------
@@ -2434,28 +2482,19 @@ async def blink_loop():
 async def clock_loop():
     """Refresh the clock while the display is in clock mode.
 
-    Two independent things happen here:
-
-    1) The wall-clock alignment. The sleep is computed from time.time() (not
-       time.monotonic()): the wake-up happens exactly when the system clock
-       changes second, so the minute flip is not delayed by the monotonic
-       drift. A "HHh MM" display only changes once a minute, but alignment
-       still matters: without it, the flip could happen up to 1 s late.
-
-    2) The de-duplication. draw_clock() itself compares the formatted string
-       with the last one drawn and skips the TM1637 write when the text has
-       not changed. So even if the loop wakes every second, only one bus
-       write happens per minute.
+    PERF: the display only shows HHh MM, so the loop wakes once a minute,
+    aligned on the wall clock (time.time(), not time.monotonic()), exactly
+    when the minute changes. sleep_display() already draws the clock
+    immediately when entering clock mode, so nothing waits for the next
+    minute. draw_clock() still compares the formatted string with the last
+    one drawn and skips the TM1637 write if it has not changed.
 
     The `not shutting_down` guard prevents the clock from overwriting the
-    HALT message that shutdown_system() has just displayed: shutdown_system
-    sets shutting_down = True before writing " HALT ", and the loop checks
-    it before every redraw. Without this, the next tick (~1 s later, during
-    the poweroff sequence) would clear the HALT message."""
+    HALT message that shutdown_system() has just displayed."""
     if not ENABLE_DISPLAY or not ENABLE_CLOCK:
         return
     while True:
-        await asyncio.sleep(1.0 - time.time() % 1.0)
+        await asyncio.sleep(60.0 - time.time() % 60.0 + 0.05)
         if (display_is_off and last_displayed == "clock"
                 and not scroll_active() and not shutting_down):
             draw_clock()
@@ -2529,9 +2568,9 @@ def _levels(data, channels):
 
 
 def _probe_input(device):
-    """Runs in a thread (blocks ~0.5 s). Used for the TOSLINK (group A) and
-    for the loopback (group B). Opens through plughw, so the rate asked below
-    does not need to match what the device actually uses.
+    """Runs in a thread (blocks ~PROBE_WINDOW_S). Used for the TOSLINK (group A)
+    and for the loopback (group B). Opens through plughw, so the rate asked
+    below does not need to match what the device actually uses.
     Returns (peak_db, rms_db, None) if the input is free,
     (None, None, err) if it cannot be opened, (None, None, None) if no samples."""
     try:
@@ -2546,13 +2585,13 @@ def _probe_input(device):
 
     chunks = []
     try:
-        deadline = time.monotonic() + 0.5
+        deadline = time.monotonic() + PROBE_WINDOW_S
         while time.monotonic() < deadline:
             length, data = pcm.read()
             if length > 0:
                 chunks.append(data)
             else:
-                time.sleep(0.01)
+                time.sleep(PROBE_POLL_S)    # PERF: 25 wake-ups / s instead of 100
     finally:
         pcm.close()
 
@@ -2573,7 +2612,7 @@ async def monitor_tv_toslink():
     global toslink_ready
     loop = asyncio.get_running_loop()
 
-    LOOP_S       = 1      # base cycle period; both probes also spend ~1 s probing
+    LOOP_S       = TOSLINK_LOOP_S   # base cycle period; both probes also spend ~PROBE_WINDOW_S probing
     SILENT_TICKS = 2        # consecutive silent cycles (source playing) -> back to _A-
     RETRY_BASE_S = 5.0      # first delay after a failed switch; doubled each failure
     RETRY_MAX_S  = 60.0     # backoff ceiling

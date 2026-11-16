@@ -368,8 +368,6 @@ fi
 grep -qx "$EXT_CDSP" /etc/sysconfig/tcedir/onboot.lst \
     || echo "$EXT_CDSP" >> /etc/sysconfig/tcedir/onboot.lst
 
-rm -f "$BASE/start_camilladsp.sh" "$BASE/camilladsp" "$BASE/camillagui/camillagui"
-
 ### --- 7. Squeezelite -> loopback ------------------------------------------
 set_pcp_cfg() {
     if grep -q "^$1=" "$PCP_CFG"; then

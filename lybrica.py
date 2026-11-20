@@ -346,8 +346,8 @@ LOUDNESS_STEP = 5           # dB per key press
 #   t = 1 from 45° away from N/S (diagonals, E/W)
 # Frequencies and Q are interpolated logarithmically between anchors.
 #
-# This morphing only applies in TL mode. In BT mode t = 1 always: the filters
-# use the active preset (def / beo) as is, whatever the two gains.
+# This morphing applies in both key modes (BT and TL): the DSP only depends
+# on the two gains, never on the keys mode.
 
 TILT_BASS_FREQ   = 110.0
 TILT_TREBLE_FREQ = 3500.0
@@ -390,10 +390,9 @@ tone_preset_idx = 0
 #                       UP = B- T+, DOWN = B+ T-, RIGHT = B+ T+, LEFT = B- T-.
 #                       The gain already "past the target" of the key moves by
 #                       0.5 or 0 instead of 1, so the gains are multiples of 0.5.
-# In both modes the stored values are the two gains. The keys differ, and so
-# does the DSP: BT applies the active preset as is (fixed frequencies and Q, no
-# morphing, no compensation); TL morphs between the tilt anchor and the preset
-# and applies the compensation (see above and below).
+# In both modes the stored values are the two gains and the DSP is the same
+# (tilt / preset morphing + compensation, see above and below). Only the keys
+# differ.
 TONE_KEY_MODES = ("BT", "TL")
 tone_mode_idx = 0
 
@@ -410,7 +409,7 @@ tone_mode_idx = 0
 #     is applied (comp = -0.25 * 2 * ±6 = ∓3).
 #   - In between: linear interpolation, proportional to (bass + treble).
 #
-# The compensation only applies in TL mode. In BT mode it is always 0 dB.
+# The compensation applies in both key modes (BT and TL).
 #
 # Names of the filters used by the tone / loudness features.
 # They must match the filter names in the YAML pipeline.
@@ -854,21 +853,18 @@ def interp_log(v0, v1, t):
 
 
 def compute_dsp_params(bass, treble):
-    """TL mode: blend between the tilt and tone anchors based on the direction
-    of (bass, treble) relative to the N/S axis.
+    """Blend between the tilt and tone anchors based on the direction of
+    (bass, treble) relative to the N/S axis.
       t = 0 : on N/S (bass = -treble) -> tilt anchor
       t = 1 : 45° or more from N/S     -> tone anchor
     Logarithmic interpolation for both frequencies and Q.
     With bass == treble == 0, atan2(0, 0) gives t = 1 (inaudible anyway).
-    BT mode: no morphing, t = 1 always (the active preset as is)."""
-    if TONE_KEY_MODES[tone_mode_idx] == "BT":
-        t = 1.0         # BT: the preset anchor as is, no morphing
-    else:
-        angle = math.degrees(math.atan2(treble, bass)) % 360
-        d = abs((angle - 135.0) % 180.0)
-        if d > 90.0:
-            d = 180.0 - d
-        t = min(1.0, d / 45.0)
+    Same in BT and TL modes: only the arrow keys differ."""
+    angle = math.degrees(math.atan2(treble, bass)) % 360
+    d = abs((angle - 135.0) % 180.0)
+    if d > 90.0:
+        d = 180.0 - d
+    t = min(1.0, d / 45.0)
 
     preset = TONE_PRESETS[tone_preset_idx % len(TONE_PRESETS)]
 
@@ -886,9 +882,7 @@ def compute_comp(bass, treble):
     full at E/W (filters add up). The clamp (= TONE_MAX_DB / 2, i.e. ±3 dB)
     is only a safety net for gains outside the ±TONE_MAX_DB range, for
     instance coming from a config file.
-    BT mode: no compensation, always 0."""
-    if TONE_KEY_MODES[tone_mode_idx] == "BT":
-        return 0.0
+    Same in BT and TL modes."""
     limit = TONE_MAX_DB / 2
     return round(clamp(-0.25 * (bass + treble), -limit, limit), 1) + 0.0   # + 0.0: no "-0.0"
 
@@ -966,13 +960,12 @@ def toggle_tone_preset():
 
 
 def toggle_tone_mode():
-    """Toggle the tone mode (BT <-> TL): the arrow keys change, and so does
-    the DSP (BT: fixed preset, no compensation; TL: morphing and compensation),
-    which is re-applied for the current gains. Then re-display the select screen."""
+    """Toggle the tone keys mode (BT <-> TL): only the arrow keys change, the
+    DSP is the same in both modes (no re-apply needed). Then re-display the
+    select screen."""
     global tone_mode_idx
     tone_mode_idx = (tone_mode_idx + 1) % len(TONE_KEY_MODES)
     log.info("[TONE] Mode: %s", TONE_KEY_MODES[tone_mode_idx])
-    apply_tone_processing()
     settings["tone_mode_idx"] = tone_mode_idx
     write_settings()
     display_tone_preset_select()

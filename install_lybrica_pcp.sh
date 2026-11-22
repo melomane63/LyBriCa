@@ -5,7 +5,7 @@
 # Installs LyBriCa (CamillaDSP remote / display / TOSLINK / LMS volume sync
 # daemon) as a pCP extension, together with:
 #   - the patched BLE HID bridge (pcp-bt.tcz),
-#   - the Material Skin web files (custom.js button + Beosonic tone page),
+#   - the Material Skin web files (custom.js button + tone circle page),
 #   - a TEMPORARY patch of Material Skin's material.min.js,
 #   - the optional ESP32C3 power-button support (config.txt, pcp.cfg).
 #
@@ -52,9 +52,9 @@ PYCAMILLA_URL="git+https://github.com/HEnquist/pycamilladsp.git@${PYCAMILLA_REF}
 TM1637_URL="https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py"
 LYBRICA_URL="https://github.com/melomane63/LyBriCa/raw/refs/heads/main/lybrica.py"
 
-# Material Skin button and Beosonic tone page (raw URLs, no HTML)
+# Material Skin button and tone circle page (raw URLs, no HTML)
 CUSTOM_JS_URL="https://raw.githubusercontent.com/melomane63/LyBriCa/refs/heads/main/custom.js"
-BEOSONIC_HTML_URL="https://raw.githubusercontent.com/melomane63/LyBriCa/refs/heads/main/beosonic_lybrica.html"
+TONE_CIRCLE_HTML_URL="https://raw.githubusercontent.com/melomane63/LyBriCa/refs/heads/main/tone_circle.html"
 
 # Patched BLE HID bridge files (raw URLs, no HTML)
 PCP_BT_RAW_BASE="https://raw.githubusercontent.com/melomane63/pcp-ble-gatt/refs/heads/main"
@@ -89,7 +89,7 @@ EXT_SHUTDOWN_MONITOR="shutdown-monitor.tcz"
 #     lybrica.log  pcp_startup.log  lybrica.pid
 #   /mnt/mmcblk0p2/tce (persistent, written directly, no pcp bu needed)
 #     slimserver/prefs/material-skin/custom.js
-#     camilladsp/beosonic_lybrica.html
+#     camilladsp/tone_circle.html
 #
 # Modules in /usr/local are visible to both tc and root without PYTHONPATH,
 # unlike the old pip --user install in /home/tc/.local.
@@ -455,10 +455,10 @@ EOF
     say "Patching pcp-bt.tcz (BLE HID bridge)..."
     patch_pcp_bt || echo "!!! WARNING: pcp-bt.tcz was not patched (see messages above)."
 
-    # 8c. Web files: Material Skin custom.js, Beosonic tone page, and the
+    # 8c. Web files: Material Skin custom.js, tone circle page, and the
     #     TEMPORARY material.min.js patch (see install_web_ui). A failure
     #     here only warns, for the same reason as above.
-    say "Installing web files (custom.js, Beosonic page, Material Skin patch)..."
+    say "Installing web files (custom.js, tone circle page, Material Skin patch)..."
     install_web_ui || echo "!!! WARNING: web files step incomplete (see messages above)."
 
     # 9. Register the launcher as a pCP user command.
@@ -500,7 +500,7 @@ EOF
     echo "  /usr/local/bin/lybrica.py         (from the extension, read-only)"
     echo "  pcp-bt.tcz                        (rebuilt with the patched hid_ble_bridge.py + hidbridge)"
     echo "  /mnt/mmcblk0p2/tce/slimserver/prefs/material-skin/custom.js"
-    echo "  /mnt/mmcblk0p2/tce/camilladsp/beosonic_lybrica.html"
+    echo "  /mnt/mmcblk0p2/tce/camilladsp/tone_circle.html"
     echo "  /home/tc/lybrica-mod.py           (optional, create with 'lybrica reset')"
     echo
     echo "NOTE: the launcher is registered as USER_COMMAND_2 in pcp.cfg:"
@@ -595,11 +595,11 @@ patch_pcp_bt() {
 }
 
 ###########################################################################
-# Web files: Material Skin custom.js, Beosonic page, TEMPORARY JS patch
+# Web files: Material Skin custom.js, tone circle page, TEMPORARY JS patch
 #
 # Everything lives on the persistent partition (no pcp bu needed).
 # - custom.js     -> slimserver/prefs/material-skin/
-# - beosonic page -> camilladsp/ (next to settings.json, see WEB_PAGE_PATH
+# - tone circle page -> camilladsp/ (next to settings.json, see WEB_PAGE_PATH
 #                    in lybrica.py)
 # - an existing different file is kept once as <file>.bak
 # - Not fatal: returns non-zero with a message, the caller only warns.
@@ -610,7 +610,7 @@ install_web_ui() {
     WU_TMP="$TMPDIR_LY/web"
     WU_BASE=/mnt/mmcblk0p2/tce
     WU_CUSTOM="$WU_BASE/slimserver/prefs/material-skin/custom.js"
-    WU_HTML="$WU_BASE/camilladsp/beosonic_lybrica.html"
+    WU_HTML="$WU_BASE/camilladsp/tone_circle.html"
     mkdir -p "$WU_TMP" || return 1
 
     fetch_checked() {  # $1=url  $2=dest  $3=text that must be inside
@@ -627,10 +627,17 @@ install_web_ui() {
 
     # Download and check both files before touching anything
     fetch_checked "$CUSTOM_JS_URL" "$WU_TMP/custom.js" "LyBriCa" || return 1
-    fetch_checked "$BEOSONIC_HTML_URL" "$WU_TMP/beosonic_lybrica.html" "api/tone" || return 1
+    fetch_checked "$TONE_CIRCLE_HTML_URL" "$WU_TMP/tone_circle.html" "api/tone" || return 1
 
     put_file "$WU_TMP/custom.js" "$WU_CUSTOM" || return 1
-    put_file "$WU_TMP/beosonic_lybrica.html" "$WU_HTML" || return 1
+    put_file "$WU_TMP/tone_circle.html" "$WU_HTML" || return 1
+
+    # Old name of the page (before the rename): the new lybrica.py no longer
+    # serves it, so it is removed to avoid leaving a dead copy behind.
+    if [ -f "$WU_BASE/camilladsp/beosonic_lybrica.html" ]; then
+        rm -f "$WU_BASE/camilladsp/beosonic_lybrica.html" \
+            && echo ">>> Removed the old page: $WU_BASE/camilladsp/beosonic_lybrica.html"
+    fi
 
     # ---- TEMPORARY: Material Skin patch ---------------------------------
     # Remove this block once a Material Skin release contains the fix.

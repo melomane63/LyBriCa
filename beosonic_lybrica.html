@@ -1,0 +1,356 @@
+<!--
+  Copyright (c) 2026 Domenico GUERRA
+
+  Portions of this file (circular Tone control logic) are adapted from Beocreate 2:
+  https://github.com
+
+  Copyright (c) 2018 Bang & Olufsen a/s
+  Licensed under the MIT License (https://opensource.org):
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+-->
+
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Listening mode</title>
+<style>
+  :root { --bg:#fafafa; --bar:color-mix(in srgb, var(--bg) 92%, black); --area:#f1f1f1; --line:#dcdcdc; --fg:#1d1d1f; --mut:#8a8a8f; --dot:#1d1d1f; --accent:#5b83d7; color-scheme:light; }
+  @media (prefers-color-scheme:dark) { :root:not([data-theme="light"]) { --bg:#161616; --bar:color-mix(in srgb, var(--bg) 72%, black); --area:#2a2a2a; --line:#3a3a3a; --fg:#f2f2f2; --mut:#8e8e93; --dot:#f2f2f2; color-scheme:dark; } }
+- { box-sizing:border-box; }
+  html,body { min-height:100%; margin:0; }
+  body { min-height:100vh; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,"Segoe UI",sans-serif; display:flex; flex-direction:column; }
+  #topbar { height:44px; flex-shrink:0; display:flex; align-items:center; justify-content:center; background:var(--bar); border-bottom:1px solid var(--line); padding:0 24px; }
+  h1 { font-size:.92rem; font-weight:500; margin:0; letter-spacing:.01em; }
+  #main { flex:1; display:flex; align-items:center; justify-content:center; padding:max(16px,env(safe-area-inset-top)) 72px max(16px,env(safe-area-inset-bottom)); }
+  #layout { width:min(100%,960px); display:grid; grid-template-columns:minmax(220px,550px) minmax(180px,1fr); align-items:center; gap:clamp(24px,4.5vw,56px); }
+  #control { position:relative; width:min(100%,70vh,550px); aspect-ratio:1; justify-self:center; }
+  #area { position:absolute; inset:0; border-radius:50%; background:var(--area); box-shadow:0 3px 15px rgba(0,0,0,.1); touch-action:none; transition:box-shadow 1s cubic-bezier(.18,0,0,1); }
+  #area::after { content:""; position:absolute; inset:-1px; border-radius:50%; border:1px solid var(--line); pointer-events:none; }
+  #control.drag #area,#control.drag .lbl { transition:none; }
+  .lbl { position:absolute; display:flex; align-items:center; pointer-events:none; transition:opacity .3s ease; }
+  .p { font-size:.8rem; font-weight:500; width:100px; height:20px; }
+  .p.top,.p.bottom { left:50%; margin-left:-50px; justify-content:center; }
+  .p.top { top:10px; } .p.bottom { bottom:10px; }
+  .p.left,.p.right { top:50%; margin-top:-10px; }
+  .p.left { left:10px; } .p.right { right:10px; justify-content:flex-end; }
+  .s { font-size:.72rem; color:var(--mut); width:56px; height:40px; margin:-20px 0 0 -28px; justify-content:center; text-align:center; opacity:0; }
+  .s.nw,.s.ne { top:22%; } .s.sw,.s.se { top:78%; }
+  .s.nw,.s.sw { left:22%; } .s.ne,.s.se { left:78%; }
+  #dot { position:absolute; left:50%; top:50%; width:60px; height:60px; margin:-30px 0 0 -30px; border-radius:50%; background:var(--dot); opacity:.8; cursor:grab; touch-action:none; box-shadow:0 3px 10px rgba(0,0,0,.18); transition:box-shadow .2s ease; }
+  #dot:active { cursor:grabbing; box-shadow:0 8px 20px rgba(0,0,0,.4); }
+  #dot:focus-visible,button:focus-visible,input:focus-visible { outline:3px solid var(--accent); outline-offset:3px; }
+  #panel { min-width:0; display:flex; flex-direction:column; gap:10px; }
+  #presets { display:flex; flex-direction:column; gap:2px; }
+  .preset { border:0; border-radius:10px; background:transparent; color:var(--fg); text-align:left; padding:8px 12px; font:500 .95rem system-ui,sans-serif; cursor:pointer; }
+  .preset.active { background:var(--area); box-shadow:inset 0 0 0 1px var(--line); }
+  .actions { display:flex; flex-wrap:nowrap; gap:8px; margin-top:5px; }
+  button.action { border:0; border-radius:999px; padding:8px 14px; font-size:.8rem; white-space:nowrap; background:var(--area); color:var(--fg); cursor:pointer; box-shadow:inset 0 0 0 1px var(--line); }
+  #loudness { display:flex; align-items:center; gap:10px; margin-top:10px; padding-top:18px; border-top:1px solid var(--line); }
+  .loud-toggle { display:inline-flex; align-items:center; gap:6px; font-size:.82rem; font-weight:500; cursor:pointer; white-space:nowrap; user-select:none; }
+  .loud-toggle input { width:16px; height:16px; margin:0; accent-color:var(--accent); cursor:pointer; }
+  #loud-slider { flex:1; min-width:72px; accent-color:var(--accent); cursor:pointer; }
+  #loud-val { min-width:54px; text-align:right; font-size:.8rem; color:var(--mut); font-variant-numeric:tabular-nums; }
+  @media(max-width:560px) { #main { align-items:flex-start; padding:16px 44px max(16px,env(safe-area-inset-bottom)); } #layout { grid-template-columns:1fr; gap:22px; width:min(100%,450px); } #control { width:min(97.5vw,52.5vh,450px); } #panel { gap:8px; } #presets { display:grid; grid-template-columns:1fr 1fr; gap:2px; } .actions { justify-content:center; } }
+  @media(prefers-reduced-motion:reduce) { #area,.lbl,#dot { transition:none; } }
+</style>
+</head>
+<body>
+<header id="topbar">
+  <h1>CamillaDSP</h1>
+</header>
+<div id="main">
+<div id="layout">
+  <div id="control">
+    <div id="area"></div>
+    <div class="lbl p top" data-a="180">Bright</div>
+    <div class="lbl p bottom" data-a="0">Warm</div>
+    <div class="lbl p left" data-a="270">Relaxed</div>
+    <div class="lbl p right" data-a="90">Energetic</div>
+    <div class="lbl s nw" data-a="225">Low bass</div>
+    <div class="lbl s ne" data-a="135">High treble</div>
+    <div class="lbl s sw" data-a="315">Low treble</div>
+    <div class="lbl s se" data-a="45">High bass</div>
+    <div id="dot" tabindex="0" role="slider" aria-label="Tonal balance: drag to adjust bass and treble"></div>
+  </div>
+  <section id="panel">
+    <div id="presets" aria-label="Listening presets"></div>
+    <div class="actions">
+      <button class="action" id="edit" type="button">Edit list...</button>
+      <button class="action" id="save" type="button">Save new...</button>
+    </div>
+    <div id="loudness" aria-label="Loudness control">
+      <label class="loud-toggle" for="loud-enabled">
+        <input id="loud-enabled" type="checkbox">
+        <span>Loudness</span>
+      </label>
+      <input id="loud-slider" type="range" min="-50" max="-10" step="5" value="-25" aria-label="Loudness reference level">
+      <span id="loud-val">−25 dB</span>
+    </div>
+  </section>
+</div>
+</div>
+<script>
+// Material Skin theme synchronisation
+window.addEventListener("message", event => {
+  if (event.source !== window.parent) return;
+  const theme = event.data;
+  if (!theme || theme.type !== "lybrica-theme") return;
+  const root = document.documentElement;
+  if (theme.bg) {
+    root.style.setProperty("--bg", theme.bg);
+    root.style.setProperty("--bar", `color-mix(in srgb, ${theme.bg} 78%, black)`);
+  }
+  if (theme.area) root.style.setProperty("--area", theme.area);
+  if (theme.line) root.style.setProperty("--line", theme.line);
+  if (theme.fg) {
+    root.style.setProperty("--fg", theme.fg);
+    root.style.setProperty("--dot", theme.fg);
+    root.style.setProperty("--mut", `color-mix(in srgb, ${theme.fg} 60%, transparent)`);
+  }
+  if (theme.accent) root.style.setProperty("--accent", theme.accent);
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && window.parent !== window) window.parent.postMessage({type:"lybrica-close"}, "*");
+});
+
+const TONE_URL="/api/tone", PRESETS_URL="/api/beosonic-presets", LOUDNESS_URL="/api/loudness";
+const MAX_DB=6, STEP_DB=.25, SEND_EVERY_MS=100;
+const DEFAULT_GAINS={Neutral:{bass:0,treble:0},Voice:{bass:-2.0,treble:0},Clear:{bass:-2.0,treble:2.0},Dark:{bass:0,treble:-2.0}};
+const CORNERS=[[1,-1],[1,1],[-1,1],[-1,-1]];
+function gains(angle,dist) {
+  const a=((angle%360)+360)%360, i=Math.floor(a/90)%4, f=(a%90)/90;
+  const c0=CORNERS[i],c1=CORNERS[(i+1)%4],k=(dist/50)*MAX_DB;
+  const q=v=>Math.round(v/STEP_DB)*STEP_DB+0;
+  return {bass:q((c0[0]+(c1[0]-c0[0])*f)*k),treble:q((c0[1]+(c1[1]-c0[1])*f)*k)};
+}
+const control=document.getElementById("control"),area=document.getElementById("area"),dot=document.getElementById("dot");
+const labels=[...document.querySelectorAll(".lbl")];
+let angle=0,dist=0,lastSent=0,timer=null,warned=false,presets={},activePreset="Neutral";
+const fmt = v => (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(2);
+const angDiff=(a,b)=>{const d=Math.abs(a-b)%360;return d>180?360-d:d;};
+function render() {
+  const x=dist*Math.cos((angle-90)*Math.PI/180),y=dist*Math.sin((angle-90)*Math.PI/180);
+  dot.style.left=50+x+"%"; dot.style.top=50-y+"%";
+  const effect=dist/50;
+  area.style.boxShadow=dist===0?"0 3px 15px rgba(0,0,0,.1)":`0 3px 15px rgba(0,0,0,.1), ${x}px ${-y}px ${10+effect*40}px hsl(${Math.round(angle-105)},65%,50%)`;
+  for(const el of labels){
+    const d=angDiff(angle,+el.dataset.a);
+    if(el.classList.contains("p")){
+      el.style.opacity=1-.75*effect*(1-Math.max(0,1-d/90));
+    }else{
+      const prox=Math.max(0,1-d/90);
+      const radial=Math.pow(effect,0.75);
+      el.style.opacity=radial*prox*(0.5+0.5*prox);
+    }
+  }
+  const g=gains(angle,dist);
+  dot.setAttribute("aria-valuetext", `Bass ${fmt(g.bass)} dB, treble ${fmt(g.treble)} dB`);
+}
+function send() {
+  const now=Date.now();
+  const go=()=>{lastSent=Date.now();fetch(TONE_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(gains(angle,dist))}).catch(()=>{});};
+  clearTimeout(timer); if(now-lastSent>=SEND_EVERY_MS)go();else timer=setTimeout(go,SEND_EVERY_MS-(now-lastSent));
+}
+function moveTo(clientX,clientY) {
+  const r=area.getBoundingClientRect(),dx=((clientX-r.left)/r.width)*100-50,dy=50-((clientY-r.top)/r.height)*100;
+  dist=Math.min(50,Math.hypot(dx,dy));angle=Math.round((Math.atan2(dy,dx)*180/Math.PI+90+360)%360);
+  activePreset=null;render();renderPresets();send();
+}
+dot.addEventListener("pointerdown",e=>{dot.setPointerCapture(e.pointerId);control.classList.add("drag");moveTo(e.clientX,e.clientY);});
+dot.addEventListener("pointermove",e=>{if(dot.hasPointerCapture(e.pointerId))moveTo(e.clientX,e.clientY);});
+const release=()=>{control.classList.remove("drag");if(dist<2){dist=0;render();}send();};
+dot.addEventListener("pointerup",release);dot.addEventListener("pointercancel",release);
+dot.addEventListener("keydown",e=>{
+  const d={ArrowLeft:[-2,0],ArrowRight:[2,0],ArrowUp:[0,2],ArrowDown:[0,-2]}[e.key];if(!d)return;e.preventDefault();
+  const x=dist*Math.cos((angle-90)*Math.PI/180)+d[0],y=dist*Math.sin((angle-90)*Math.PI/180)+d[1];
+  dist=Math.min(50,Math.hypot(x,y));angle=dist<.5?0:Math.round((Math.atan2(y,x)*180/Math.PI+90+360)%360);
+  activePreset=null;render();renderPresets();send();
+});
+function fromGains(b,t) {
+  const bu=b/MAX_DB,tu=t/MAX_DB,s=Math.max(Math.abs(bu),Math.abs(tu));if(s<.01)return[0,0];
+  const u=bu/s,v=tu/s;
+  const a=Math.abs(u)>=Math.abs(v)?(u>0?(v+1)*45:180+(1-v)*45):(v>0?90+(1-u)*45:270+(u+1)*45);
+  return[Math.round(a)%360,Math.min(50,s*50)];
+}
+function renderPresets(){
+  const host=document.getElementById("presets");host.replaceChildren();
+  Object.keys(presets).forEach(name=>{const b=document.createElement("button");b.type="button";b.className="preset"+(name===activePreset?" active":"");b.textContent=name;b.addEventListener("click",()=>selectPreset(name));host.appendChild(b);});
+}
+async function apiPost(data){const r=await fetch(PRESETS_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});const result=await r.json();if(!r.ok)throw new Error(result.error||"Request failed");return result;}
+async function refreshPresets(){try{const r=await fetch(PRESETS_URL);if(!r.ok)throw new Error(r.status);const data=await r.json();presets=data.presets||{};activePreset=data.active||null;renderPresets();}catch(e){}}
+async function selectPreset(name){try{const data=await apiPost({action:"select",name});presets=data.presets;activePreset=data.active;const g=presets[name];[angle,dist]=fromGains(g.bass,g.treble);render();renderPresets();}catch(e){}}
+document.getElementById("save").addEventListener("click",async()=>{
+  const name=prompt("Name for the new preset:");if(name===null)return;
+  try{const data=await apiPost({action:"save",name});presets=data.presets;activePreset=data.active;renderPresets();}catch(e){}
+});
+document.getElementById("edit").addEventListener("click",async()=>{
+  const names=Object.keys(presets).filter(n=>n!=="Neutral");if(!names.length)return;
+  const choice=prompt("Choose a preset:\n\n"+names.join(" · "));
+  if(choice===null)return;
+  if(!Object.prototype.hasOwnProperty.call(presets,choice)||choice==="Neutral"){return;}
+  const isDefault=["Voice","Clear","Dark"].includes(choice);
+  if(isDefault){
+    const action=prompt(`“${choice}” is a built-in preset.\n\nEnter save or reset`);
+    if(action===null)return;
+    const cmd=action.trim().toLowerCase();
+    if(cmd==="save"){
+      const g=gains(angle,dist);
+      try{
+        const data=await apiPost({action:"update",name:choice,bass:g.bass,treble:g.treble});
+        presets=data.presets;activePreset=data.active;renderPresets();
+      }catch(e){}return;
+    }
+    if(cmd==="reset"){
+      const def=DEFAULT_GAINS[choice]||{bass:0,treble:0};
+      try{
+        const data=await apiPost({action:"update",name:choice,bass:def.bass,treble:def.treble});
+        presets=data.presets;activePreset=data.active;
+        if(activePreset===choice){[angle,dist]=fromGains(def.bass,def.treble);render();send();}
+        renderPresets();
+      }catch(e){}return;
+    }
+    return;
+  }
+  const action=prompt(`Manage “${choice}”:\nEnter save, rename or delete`);
+  if(action===null)return;
+  const cmd=action.trim().toLowerCase();
+  if(cmd==="save"){
+    const g=gains(angle,dist);
+    try{
+      const data=await apiPost({action:"update",name:choice,bass:g.bass,treble:g.treble});
+      presets=data.presets;activePreset=data.active;renderPresets();
+    }catch(e){}return;
+  }
+  if(cmd==="delete"){
+    if(!confirm(`Delete preset “${choice}”?`))return;
+    try{
+      const data=await apiPost({action:"delete",name:choice});presets=data.presets;activePreset=data.active;
+      renderPresets();
+      if(activePreset==="Neutral")await loadTone();
+    }catch(e){}return;
+  }
+  if(cmd==="rename"){
+    const newName=prompt("New name:",choice);if(newName===null||!newName.trim())return;
+    try{
+      const data=await apiPost({action:"rename",old_name:choice,name:newName});presets=data.presets;activePreset=data.active;
+      renderPresets();
+    }catch(e){}return;
+  }
+});
+
+const loudBoxEl     = document.getElementById("loudness");
+const loudEnabledEl = document.getElementById("loud-enabled");
+const loudSliderEl  = document.getElementById("loud-slider");
+const loudValEl     = document.getElementById("loud-val");
+let loudMin = -50, loudMax = -10, loudStep = 5;
+let loudReady = true, loudEnabled = false, loudLevel = -25;
+let loudLastSent = 0, loudTimer = null;
+
+const fmtDb = v => Math.round(v) + " dB";
+
+function renderLoudness() {
+  loudEnabledEl.checked = loudEnabled;
+  loudSliderEl.min = String(loudMin);
+  loudSliderEl.max = String(loudMax);
+  loudSliderEl.step = String(loudStep);
+  loudSliderEl.value = String(loudLevel);
+  loudEnabledEl.disabled = !loudReady;
+  loudSliderEl.disabled = !loudReady || !loudEnabled;
+  loudBoxEl.style.opacity = loudReady ? "1" : ".45";
+  loudValEl.style.opacity = loudEnabled ? "1" : ".5";
+  loudValEl.textContent = fmtDb(loudLevel);
+}
+
+function sendLoudness() {
+  const now = Date.now();
+  const payload = JSON.stringify({ enabled: loudEnabled, level: Number(loudLevel) });
+  const go = () => {
+    loudLastSent = Date.now();
+    fetch(LOUDNESS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload
+    }).catch(() => {});
+  };
+  clearTimeout(loudTimer);
+  if (now - loudLastSent >= SEND_EVERY_MS) go();
+  else loudTimer = setTimeout(go, SEND_EVERY_MS - (now - loudLastSent));
+}
+
+loudEnabledEl.addEventListener("change", () => {
+  loudEnabled = loudEnabledEl.checked;
+  renderLoudness();
+  sendLoudness();
+});
+
+loudSliderEl.addEventListener("input", () => {
+  loudLevel = Math.max(loudMin, Math.min(loudMax, Number(loudSliderEl.value)));
+  renderLoudness();
+  sendLoudness();
+});
+
+async function loadLoudness() {
+  try {
+    const r = await fetch(LOUDNESS_URL);
+    if (!r.ok) return;
+    const s = await r.json();
+    if (typeof s.min === "number") loudMin = s.min;
+    if (typeof s.max === "number") loudMax = s.max;
+    if (typeof s.step === "number" && s.step > 0) loudStep = s.step;
+    if (typeof s.ready === "boolean") loudReady = s.ready;
+    if (typeof s.enabled === "boolean") loudEnabled = s.enabled;
+    if (typeof s.level === "number") {
+      loudLevel = Math.max(loudMin, Math.min(loudMax, s.level));
+    }
+    renderLoudness();
+  } catch (e) {}
+}
+
+async function loadTone() {
+    try {
+        const r = await fetch(TONE_URL);
+        const s = await r.json();
+
+        if (s.ready) {
+            [angle, dist] = fromGains(s.bass, s.treble);
+            render();
+        }
+    } catch(e) {}
+}
+
+render();
+renderLoudness();
+
+refreshPresets()
+    .then(loadTone)
+    .then(loadLoudness)
+    .finally(() => {
+        if (window.parent !== window) {
+            window.parent.postMessage({
+                type: "lybrica-ready"
+            }, "*");
+        }
+    });
+</script>
+</body>
+</html>

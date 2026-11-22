@@ -1,15 +1,22 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# install_pcp.sh - All-in-one installer for piCorePlayer (menu)
+# install_lybrica_pcp.sh - Installer for LyBriCa on piCorePlayer
 #
-#   1) LyBriCa + BLE HID bridge + ESP32C3   (chains the two steps below
-#      in a single user flow)
+# Installs LyBriCa (CamillaDSP remote / display / TOSLINK / LMS volume sync
+# daemon) as a pCP extension, together with:
+#   - the patched BLE HID bridge (pcp-bt.tcz),
+#   - the Material Skin web files (custom.js button + Beosonic tone page),
+#   - a TEMPORARY patch of Material Skin's material.min.js,
+#   - the optional ESP32C3 power-button support (config.txt, pcp.cfg).
+#
+#   1) LyBriCa + BLE HID bridge + web files + ESP32C3   (chains the two
+#      steps below in a single user flow)
 #
 # The two steps remain separate in the script (install_lybrica and
 # install_esp32): they can be launched independently via --run.
 #
 # Usage (SSH, user tc):
-#   sh install_pcp.sh      -> interactive menu (no parameters)
+#   sh install_lybrica_pcp.sh      -> interactive menu (no parameters)
 #
 # Each step runs in its own process: an error in one step does not stop
 # the menu, and nothing is saved (pcp bu) if that step fails.
@@ -45,6 +52,10 @@ PYCAMILLA_URL="git+https://github.com/HEnquist/pycamilladsp.git@${PYCAMILLA_REF}
 TM1637_URL="https://raw.githubusercontent.com/melomane63/tm1637_lgpio/main/tm1637_lgpio.py"
 LYBRICA_URL="https://github.com/melomane63/LyBriCa/raw/refs/heads/main/lybrica.py"
 
+# Material Skin button and Beosonic tone page (raw URLs, no HTML)
+CUSTOM_JS_URL="https://raw.githubusercontent.com/melomane63/LyBriCa/refs/heads/main/custom.js"
+BEOSONIC_HTML_URL="https://raw.githubusercontent.com/melomane63/LyBriCa/refs/heads/main/beosonic_lybrica.html"
+
 # Patched BLE HID bridge files (raw URLs, no HTML)
 PCP_BT_RAW_BASE="https://raw.githubusercontent.com/melomane63/pcp-ble-gatt/refs/heads/main"
 PCP_BT_HID_BLE_BRIDGE_URL="${PCP_BT_RAW_BASE}/hid_ble_bridge.py"
@@ -60,7 +71,7 @@ EXT_PCP_BT="pcp-bt.tcz"
 EXT_SHUTDOWN_MONITOR="shutdown-monitor.tcz"
 
 ###########################################################################
-# 1) LYBRICA + BLE HID BRIDGE (patched pcp-bt.tcz)
+# 1) LYBRICA + BLE HID BRIDGE (patched pcp-bt.tcz) + WEB FILES
 #
 # Layout:
 #   lybrica.tcz (read-only, rebuilt at each run)
@@ -76,6 +87,9 @@ EXT_SHUTDOWN_MONITOR="shutdown-monitor.tcz"
 #                                        not created by this installer, run
 #                                        "lybrica reset" to create it)
 #     lybrica.log  pcp_startup.log  lybrica.pid
+#   /mnt/mmcblk0p2/tce (persistent, written directly, no pcp bu needed)
+#     slimserver/prefs/material-skin/custom.js
+#     camilladsp/beosonic_lybrica.html
 #
 # Modules in /usr/local are visible to both tc and root without PYTHONPATH,
 # unlike the old pip --user install in /home/tc/.local.
@@ -441,6 +455,12 @@ EOF
     say "Patching pcp-bt.tcz (BLE HID bridge)..."
     patch_pcp_bt || echo "!!! WARNING: pcp-bt.tcz was not patched (see messages above)."
 
+    # 8c. Web files: Material Skin custom.js, Beosonic tone page, and the
+    #     TEMPORARY material.min.js patch (see install_web_ui). A failure
+    #     here only warns, for the same reason as above.
+    say "Installing web files (custom.js, Beosonic page, Material Skin patch)..."
+    install_web_ui || echo "!!! WARNING: web files step incomplete (see messages above)."
+
     # 9. Register the launcher as a pCP user command.
     #    On a fresh pCP install, USER_COMMAND_2 exists and is empty:
     #    write the launcher there. bootlocal.sh is NOT touched.
@@ -479,6 +499,8 @@ EOF
     echo "  /usr/local/bin/lybrica            (symlink, e.g. 'lybrica help')"
     echo "  /usr/local/bin/lybrica.py         (from the extension, read-only)"
     echo "  pcp-bt.tcz                        (rebuilt with the patched hid_ble_bridge.py + hidbridge)"
+    echo "  /mnt/mmcblk0p2/tce/slimserver/prefs/material-skin/custom.js"
+    echo "  /mnt/mmcblk0p2/tce/camilladsp/beosonic_lybrica.html"
     echo "  /home/tc/lybrica-mod.py           (optional, create with 'lybrica reset')"
     echo
     echo "NOTE: the launcher is registered as USER_COMMAND_2 in pcp.cfg:"
@@ -569,6 +591,69 @@ patch_pcp_bt() {
     fi
     mv -f "$PB_TMP/pcp-bt.tcz" "$PB_TCZ"
     echo ">>> pcp-bt.tcz rebuilt with the patched hid_ble_bridge.py and hidbridge (active after reboot)."
+    return 0
+}
+
+###########################################################################
+# Web files: Material Skin custom.js, Beosonic page, TEMPORARY JS patch
+#
+# Everything lives on the persistent partition (no pcp bu needed).
+# - custom.js     -> slimserver/prefs/material-skin/
+# - beosonic page -> camilladsp/ (next to settings.json, see WEB_PAGE_PATH
+#                    in lybrica.py)
+# - an existing different file is kept once as <file>.bak
+# - Not fatal: returns non-zero with a message, the caller only warns.
+#
+# Uses TMPDIR_LY from install_lybrica.
+###########################################################################
+install_web_ui() {
+    WU_TMP="$TMPDIR_LY/web"
+    WU_BASE=/mnt/mmcblk0p2/tce
+    WU_CUSTOM="$WU_BASE/slimserver/prefs/material-skin/custom.js"
+    WU_HTML="$WU_BASE/camilladsp/beosonic_lybrica.html"
+    mkdir -p "$WU_TMP" || return 1
+
+    fetch_checked() {  # $1=url  $2=dest  $3=text that must be inside
+        wget -q -O "$2" "$1" || { echo "!!! Download failed: $1"; return 1; }
+        grep -qF "$3" "$2" || { echo "!!! $1 does not look right (missing '$3')"; return 1; }
+    }
+    put_file() {  # $1=source  $2=destination
+        mkdir -p "$(dirname "$2")" || return 1
+        if [ -f "$2" ] && ! cmp -s "$1" "$2" && [ ! -f "$2.bak" ]; then
+            cp -p "$2" "$2.bak" && echo ">>> Existing $2 kept as $2.bak"
+        fi
+        cp "$1" "$2" && echo ">>> Installed: $2"
+    }
+
+    # Download and check both files before touching anything
+    fetch_checked "$CUSTOM_JS_URL" "$WU_TMP/custom.js" "LyBriCa" || return 1
+    fetch_checked "$BEOSONIC_HTML_URL" "$WU_TMP/beosonic_lybrica.html" "api/tone" || return 1
+
+    put_file "$WU_TMP/custom.js" "$WU_CUSTOM" || return 1
+    put_file "$WU_TMP/beosonic_lybrica.html" "$WU_HTML" || return 1
+
+    # ---- TEMPORARY: Material Skin patch ---------------------------------
+    # Remove this block once a Material Skin release contains the fix.
+    # Idempotent. A Material Skin update replaces the file and removes the
+    # patch (the next run of the installer applies it again).
+    JS="$WU_BASE/slimserver/Cache/InstalledPlugins/Plugins/MaterialSkin/HTML/material/html/js/material.min.js"
+    PATCH_FROM='if(void 0!=a){var e=[]'
+    if [ ! -f "$JS" ]; then
+        echo "!!! material.min.js not found: Material Skin not installed yet?"
+        echo "    custom.js is installed; re-run this step after installing Material Skin."
+        return 0
+    fi
+    if ! grep -qF "$PATCH_FROM" "$JS"; then
+        echo ">>> material.min.js: pattern not found (already patched, or another version): unchanged."
+        return 0
+    fi
+    [ -f "$JS.bak" ] || cp -p "$JS" "$JS.bak" || { echo "!!! Cannot back up $JS"; return 1; }
+    sed -i 's/if(void 0!=a){var e=\[\]/{var e=[]/' "$JS" || { echo "!!! sed failed on $JS"; return 1; }
+    if grep -qF "$PATCH_FROM" "$JS"; then
+        echo "!!! Patch not applied (pattern still present)."
+        return 1
+    fi
+    echo ">>> material.min.js patched (backup: $JS.bak)"
     return 0
 }
 
@@ -709,7 +794,7 @@ else
 fi
 
 # Tell the caller whether anything was actually added.
-# 20 matches UNCHANGED_RC in install_pcp.sh: "already up to date".
+# 20 matches UNCHANGED_RC in install_lybrica_pcp.sh: "already up to date".
 if [ "$ADDED" -eq 0 ]; then
     exit 20
 fi

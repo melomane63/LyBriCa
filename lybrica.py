@@ -205,7 +205,7 @@ TV_RELAY_GPIO = 12          # Optocoupler board input of the "_B-" group relay
 # CREST_MIN_DB is also used by the input probes (TOSLINK and loopback), which
 # have their own level threshold (SIGNAL_ON_DB).
 
-SILENCE_RMS_DB = -80.0   # RMS below this -> silence
+SILENCE_RMS_DB = -72.0   # RMS below this -> silence
 CREST_MIN_DB   = 2.0     # peak - rms below this -> steady noise, not audio
 
 

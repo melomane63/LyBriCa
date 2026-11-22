@@ -2,10 +2,10 @@
 # Copyright (c) 2026 Domenico GUERRA
 #
 # Portions of this file (circular Tone control logic) are adapted from Beocreate 2:
-# https://github.com
+# https://github.com/bang-olufsen/create
 #
 # Copyright (c) 2018 Bang & Olufsen a/s
-# Licensed under the MIT License (https://opensource.org):
+# Licensed under the MIT License (https://opensource.org/licenses/MIT):
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -411,11 +411,11 @@ TONE_PRESETS = [
 
 # Runtime: which preset is active. Changed from the tone preset select
 # screen (DOWN key), persisted in settings.json so that a restart resumes on
-# the last preset used. Default 0 at first launch.
+# the last preset used. Default 1 ("Beo")  at first launch.
 tone_preset_idx = 1
 
 # How the arrow keys act on the tone screen, selectable at runtime from the
-# same screen (UP key), persisted in settings.json. Default 0 at first launch.
+# same screen (UP key), persisted in settings.json. Default 1 ("TL") at first launch.
 #
 #   0 "BT" (Baxandall): UP / DOWN = Bass +1 / -1, RIGHT / LEFT = Treble +1 / -1.
 #   1 "TL" (Tilt)     : fixed direction per key, amplitude depending on the
@@ -492,6 +492,7 @@ TONE_PARAMS = {
 }
 
 # The loudness filter (handled separately from the tone gains)
+# Rebound here as a (filter name, parameter) tuple
 LOUDNESS_FILTER = (LOUDNESS_FILTER, "reference_level")
 
 # Arrow keys on the tone screen, BT mode only (see TONE_KEY_MODES):
@@ -1013,12 +1014,12 @@ def load_settings():
         data = {}
     configs = data.get("configs")
     last_config = data.get("last_config")
-    preset_idx = data.get("tone_preset_idx", 0)
+    preset_idx = data.get("tone_preset_idx", 1)
     if not isinstance(preset_idx, int) or not (0 <= preset_idx < len(TONE_PRESETS)):
-        preset_idx = 0
-    mode_idx = data.get("tone_mode_idx", 0)
+        preset_idx = 1
+    mode_idx = data.get("tone_mode_idx", 1)
     if not isinstance(mode_idx, int) or not (0 <= mode_idx < len(TONE_KEY_MODES)):
-        mode_idx = 0
+        mode_idx = 1
     beosonic = data.get("beosonic_presets")
     if not isinstance(beosonic, dict):
         beosonic = {}
@@ -2714,7 +2715,7 @@ async def monitor_tv_toslink():
                     SIGNAL_ON_DB, SILENCE_RMS_DB)
 
     if not config_files_matching(CONFIG_DIR + "_A-*"):
-        log.error("[LOOPBACK] No '_A-*' config file found in %s", CONFIG_DIR)
+        log.error("[TOSLINK] No '_A-*' config file found in %s", CONFIG_DIR)
         return
     log.info("[LOOPBACK] Capture: %s", PROBE_DEVICE_LOOPBACK)
 
@@ -3361,8 +3362,7 @@ def set_loudness_api(enabled=None, level=None):
     if ENABLE_DISPLAY and not scroll_active():
         if display_is_off:
             display_volume_info()
-        if "display_loudness_info" in globals():
-            display_loudness_info()
+        display_loudness_info()
     return True, None
 
 def active_beosonic_preset():
@@ -3626,7 +3626,7 @@ if USE_GPIO:
         lgpio.gpio_claim_input(h, TV_RELAY_GPIO)    # inactive from the start (tv_relay_on = False)
     if ENABLE_AUTO_POWEROFF:
         lgpio.gpio_claim_output(h, POWER_GPIO, 0)   # LOW first: no LOW -> HIGH glitch
-        time.sleep(1)                   # Keep the relay off so the A70 can re-arm
+        time.sleep(1)                   # Keep the relay off so ampli can re-arm
         lgpio.gpio_write(h, POWER_GPIO, 1)
 
 tm = TM1637(clk=CLK, dio=DIO) if ENABLE_DISPLAY else NullDisplay()

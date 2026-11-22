@@ -7,6 +7,8 @@
 # Copyright (c) 2018 Bang & Olufsen a/s
 # Licensed under the MIT License (https://opensource.org/licenses/MIT):
 #
+# LyBriCa is not affiliated with, endorsed by or sponsored by Bang & Olufsen.
+#
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
@@ -90,7 +92,7 @@ ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input.
 ENABLE_TV_RELAY       = True   # Relay on TV_RELAY_GPIO: active (input pulled to ground) as long
                                # as a "_B-*" config is active, inactive (high impedance)
                                # otherwise. Independent of the POWER relay.
-ENABLE_WEB            = True   # Web interface (Beosonic circle): HTTP server running inside
+ENABLE_WEB            = True   # Web interface (tone circle): HTTP server running inside
                                # Lybrica's asyncio loop, port WEB_PORT.
                                # Tone changes go through the same path as the arrow keys.
 
@@ -1020,10 +1022,12 @@ def load_settings():
     mode_idx = data.get("tone_mode_idx", 1)
     if not isinstance(mode_idx, int) or not (0 <= mode_idx < len(TONE_KEY_MODES)):
         mode_idx = 1
-    beosonic = data.get("beosonic_presets")
-    if not isinstance(beosonic, dict):
-        beosonic = {}
-    # Built-in presets. Keep these values in sync with DEFAULT_GAINS in beosonic_lybrica.html
+    saved_presets = data.get("tone_presets")
+    if not isinstance(saved_presets, dict):
+        saved_presets = data.get("beosonic_presets")   # settings.json written before the rename
+    if not isinstance(saved_presets, dict):
+        saved_presets = {}
+    # Built-in presets. Keep these values in sync with DEFAULT_GAINS in tone_circle.html
     # (the page uses them for its "reset" action).
     defaults = {
         "Neutral": {"bass": 0.0,  "treble": 0.0},
@@ -1033,7 +1037,7 @@ def load_settings():
     }
     clean_presets = {}
     for name, values in defaults.items():
-        item = beosonic.get(name, values)
+        item = saved_presets.get(name, values)
         if isinstance(item, dict):
             try:
                 b, t = float(item.get("bass", 0)), float(item.get("treble", 0))
@@ -1044,7 +1048,7 @@ def load_settings():
             except (TypeError, ValueError):
                 pass
         clean_presets[name] = dict(values)
-    for name, item in beosonic.items():
+    for name, item in saved_presets.items():
         if name in clean_presets or not isinstance(name, str) or not name.strip() or not isinstance(item, dict):
             continue
         try:
@@ -1054,7 +1058,7 @@ def load_settings():
                                                     "treble": clamp(t, -TONE_MAX_DB, TONE_MAX_DB)}
         except (TypeError, ValueError):
             pass
-    active = data.get("beosonic_active", "Neutral")
+    active = data.get("tone_active", data.get("beosonic_active", "Neutral"))
     if active not in clean_presets:
         active = "Neutral"
     return {
@@ -1062,8 +1066,8 @@ def load_settings():
         "last_config": last_config if isinstance(last_config, dict) else {},
         "tone_preset_idx": preset_idx,
         "tone_mode_idx": mode_idx,
-        "beosonic_presets": clean_presets,
-        "beosonic_active": active,
+        "tone_presets": clean_presets,
+        "tone_active": active,
     }
 
 
@@ -3238,12 +3242,12 @@ async def remote_events(device):
 
 
 # =====================================================================
-#  WEB - Beosonic circle (HTTP server running inside the asyncio loop)
+#  WEB - tone circle (HTTP server running inside the asyncio loop)
 #  Everything runs in the same event loop as the keys, so the tone state
 #  (config_active, prev_values, display) is shared without any lock.
 # =====================================================================
 
-WEB_PAGE_PATH = os.path.join(os.path.dirname(SETTINGS_PATH), "beosonic_lybrica.html")
+WEB_PAGE_PATH = os.path.join(os.path.dirname(SETTINGS_PATH), "tone_circle.html")
 WEB_MAX_BODY = 4096         # bytes accepted in a request body
 WEB_TIMEOUT_S = 5           # seconds allowed to receive a request
 
@@ -3365,17 +3369,17 @@ def set_loudness_api(enabled=None, level=None):
         display_loudness_info()
     return True, None
 
-def active_beosonic_preset():
+def active_tone_preset():
     """Name of the preset that matches the tone gains in use right now, or None.
-    The stored name (settings["beosonic_active"]) only breaks ties between presets
+    The stored name (settings["tone_active"]) only breaks ties between presets
     that share the same values: the answer always follows the real gains, so a
     change made with the remote or with the circle never leaves a stale preset
     highlighted in the page."""
-    stored = settings.get("beosonic_active")
+    stored = settings.get("tone_active")
     gains = get_tone_gains()
     if gains is None:
         return stored               # tone filters not ready: nothing to compare
-    presets = settings.get("beosonic_presets", {})
+    presets = settings.get("tone_presets", {})
 
     def same(name):
         item = presets.get(name)
@@ -3413,15 +3417,15 @@ async def _web_route(method, path, body):
     if method == "GET" and path == "/api/player":
         return _json_reply(200, {"mac": player_id()})
 
-    if path == "/api/beosonic-presets":
+    if path == "/api/tone-presets":
         if method == "GET":
-            return _json_reply(200, {"presets": settings.get("beosonic_presets", {}),
-                                     "active": active_beosonic_preset()})
+            return _json_reply(200, {"presets": settings.get("tone_presets", {}),
+                                     "active": active_tone_preset()})
         if method == "POST":
             try:
                 data = json.loads(body.decode("utf-8"))
                 action = data.get("action")
-                presets = settings.setdefault("beosonic_presets", {})
+                presets = settings.setdefault("tone_presets", {})
                 if action == "select":
                     name = data.get("name")
                     if name not in presets:
@@ -3429,7 +3433,7 @@ async def _web_route(method, path, body):
                     item = presets[name]
                     if not set_tone_gains(item["bass"], item["treble"]):
                         return _json_reply(409, {"ok": False, "error": "tone filters are not available in the active config"})
-                    settings["beosonic_active"] = name
+                    settings["tone_active"] = name
                 elif action == "save":
                     name = str(data.get("name", "")).strip()[:32]
                     if not name:
@@ -3440,7 +3444,7 @@ async def _web_route(method, path, body):
                     if gains is None:
                         return _json_reply(409, {"ok": False, "error": "tone filters are not available"})
                     presets[name] = {"bass": round(float(gains[0]), 2), "treble": round(float(gains[1]), 2)}
-                    settings["beosonic_active"] = name
+                    settings["tone_active"] = name
                 elif action == "update":
                     # Save the current circle position into an existing preset.
                     name = data.get("name")
@@ -3453,7 +3457,7 @@ async def _web_route(method, path, body):
                         "bass": round(clamp(bass, -TONE_MAX_DB, TONE_MAX_DB), 2),
                         "treble": round(clamp(treble, -TONE_MAX_DB, TONE_MAX_DB), 2),
                     }
-                    settings["beosonic_active"] = name
+                    settings["tone_active"] = name
                 elif action == "rename":
                     old_name = data.get("old_name")
                     name = str(data.get("name", "")).strip()[:32]
@@ -3464,8 +3468,8 @@ async def _web_route(method, path, body):
                     if name != old_name and name in presets:
                         return _json_reply(409, {"ok": False, "error": "that preset already exists"})
                     presets[name] = presets.pop(old_name)
-                    if settings.get("beosonic_active") == old_name:
-                        settings["beosonic_active"] = name
+                    if settings.get("tone_active") == old_name:
+                        settings["tone_active"] = name
                 elif action == "delete":
                     name = data.get("name")
                     if name in ("Neutral", "Voice", "Clear", "Dark"):
@@ -3473,14 +3477,14 @@ async def _web_route(method, path, body):
                     if name not in presets:
                         return _json_reply(404, {"ok": False, "error": "preset not found"})
                     del presets[name]
-                    if settings.get("beosonic_active") == name:
-                        settings["beosonic_active"] = "Neutral"
+                    if settings.get("tone_active") == name:
+                        settings["tone_active"] = "Neutral"
                         set_tone_gains(0, 0)
                 else:
                     return _json_reply(400, {"ok": False, "error": "unknown action"})
                 write_settings()
                 return _json_reply(200, {"ok": True, "presets": presets,
-                                         "active": active_beosonic_preset()})
+                                         "active": active_tone_preset()})
             except (ValueError, TypeError, AttributeError):
                 return _json_reply(400, {"ok": False, "error": "invalid request"})
 

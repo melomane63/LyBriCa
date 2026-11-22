@@ -7,6 +7,8 @@
   Copyright (c) 2018 Bang & Olufsen a/s
   Licensed under the MIT License (https://opensource.org/licenses/MIT):
 
+  LyBriCa is not affiliated with, endorsed by or sponsored by Bang & Olufsen.
+
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
   in the Software without restriction, including without limitation the rights
@@ -133,7 +135,7 @@ document.addEventListener("keydown", e => {
   if (e.key === "Escape" && window.parent !== window) window.parent.postMessage({type:"lybrica-close"}, "*");
 });
 
-const TONE_URL="/api/tone", PRESETS_URL="/api/beosonic-presets", LOUDNESS_URL="/api/loudness";
+const TONE_URL="/api/tone", PRESETS_URL="/api/tone-presets", LOUDNESS_URL="/api/loudness";
 const MAX_DB=6, STEP_DB=.25, SEND_EVERY_MS=100;
 const SYNC_EVERY_MS=1500;   // how often the page re-reads the server (remote control changes)
 const BUSY_HOLD_MS=1500;    // no re-read for this long after the user touched a control

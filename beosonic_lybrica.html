@@ -2,10 +2,10 @@
   Copyright (c) 2026 Domenico GUERRA
 
   Portions of this file (circular Tone control logic) are adapted from Beocreate 2:
-  https://github.com
+  https://github.com/bang-olufsen/create
 
   Copyright (c) 2018 Bang & Olufsen a/s
-  Licensed under the MIT License (https://opensource.org):
+  Licensed under the MIT License (https://opensource.org/licenses/MIT):
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -36,7 +36,7 @@
 <style>
   :root { --bg:#fafafa; --bar:color-mix(in srgb, var(--bg) 92%, black); --area:#f1f1f1; --line:#dcdcdc; --fg:#1d1d1f; --mut:#8a8a8f; --dot:#1d1d1f; --accent:#5b83d7; color-scheme:light; }
   @media (prefers-color-scheme:dark) { :root:not([data-theme="light"]) { --bg:#161616; --bar:color-mix(in srgb, var(--bg) 72%, black); --area:#2a2a2a; --line:#3a3a3a; --fg:#f2f2f2; --mut:#8e8e93; --dot:#f2f2f2; color-scheme:dark; } }
-- { box-sizing:border-box; }
+  * { box-sizing:border-box; }
   html,body { min-height:100%; margin:0; }
   body { min-height:100vh; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,"Segoe UI",sans-serif; display:flex; flex-direction:column; }
   #topbar { height:44px; flex-shrink:0; display:flex; align-items:center; justify-content:center; background:var(--bar); border-bottom:1px solid var(--line); padding:0 24px; }
@@ -135,6 +135,8 @@ document.addEventListener("keydown", e => {
 
 const TONE_URL="/api/tone", PRESETS_URL="/api/beosonic-presets", LOUDNESS_URL="/api/loudness";
 const MAX_DB=6, STEP_DB=.25, SEND_EVERY_MS=100;
+const SYNC_EVERY_MS=1500;   // how often the page re-reads the server (remote control changes)
+const BUSY_HOLD_MS=1500;    // no re-read for this long after the user touched a control
 const DEFAULT_GAINS={Neutral:{bass:0,treble:0},Voice:{bass:-2.0,treble:0},Clear:{bass:-2.0,treble:2.0},Dark:{bass:0,treble:-2.0}};
 const CORNERS=[[1,-1],[1,1],[-1,1],[-1,-1]];
 function gains(angle,dist) {
@@ -146,6 +148,9 @@ function gains(angle,dist) {
 const control=document.getElementById("control"),area=document.getElementById("area"),dot=document.getElementById("dot");
 const labels=[...document.querySelectorAll(".lbl")];
 let angle=0,dist=0,lastSent=0,timer=null,warned=false,presets={},activePreset="Neutral";
+let busyUntil=0;            // the user is acting: do not overwrite the controls from the server
+let presetsSig="";          // signature of the last rendered presets list (avoids useless redraws)
+const markBusy=()=>{busyUntil=Date.now()+BUSY_HOLD_MS;};
 const fmt = v => (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(2);
 const angDiff=(a,b)=>{const d=Math.abs(a-b)%360;return d>180?360-d:d;};
 function render() {
@@ -172,16 +177,18 @@ function send() {
   clearTimeout(timer); if(now-lastSent>=SEND_EVERY_MS)go();else timer=setTimeout(go,SEND_EVERY_MS-(now-lastSent));
 }
 function moveTo(clientX,clientY) {
+  markBusy();
   const r=area.getBoundingClientRect(),dx=((clientX-r.left)/r.width)*100-50,dy=50-((clientY-r.top)/r.height)*100;
   dist=Math.min(50,Math.hypot(dx,dy));angle=Math.round((Math.atan2(dy,dx)*180/Math.PI+90+360)%360);
   activePreset=null;render();renderPresets();send();
 }
 dot.addEventListener("pointerdown",e=>{dot.setPointerCapture(e.pointerId);control.classList.add("drag");moveTo(e.clientX,e.clientY);});
 dot.addEventListener("pointermove",e=>{if(dot.hasPointerCapture(e.pointerId))moveTo(e.clientX,e.clientY);});
-const release=()=>{control.classList.remove("drag");if(dist<2){dist=0;render();}send();};
+const release=()=>{markBusy();control.classList.remove("drag");if(dist<2){dist=0;render();}send();};
 dot.addEventListener("pointerup",release);dot.addEventListener("pointercancel",release);
 dot.addEventListener("keydown",e=>{
   const d={ArrowLeft:[-2,0],ArrowRight:[2,0],ArrowUp:[0,2],ArrowDown:[0,-2]}[e.key];if(!d)return;e.preventDefault();
+  markBusy();
   const x=dist*Math.cos((angle-90)*Math.PI/180)+d[0],y=dist*Math.sin((angle-90)*Math.PI/180)+d[1];
   dist=Math.min(50,Math.hypot(x,y));angle=dist<.5?0:Math.round((Math.atan2(y,x)*180/Math.PI+90+360)%360);
   activePreset=null;render();renderPresets();send();
@@ -192,13 +199,18 @@ function fromGains(b,t) {
   const a=Math.abs(u)>=Math.abs(v)?(u>0?(v+1)*45:180+(1-v)*45):(v>0?90+(1-u)*45:270+(u+1)*45);
   return[Math.round(a)%360,Math.min(50,s*50)];
 }
-function renderPresets(){
+function renderPresets(force){
+  // Redraw only when the list or the highlighted preset changed: replacing the
+  // buttons while the user is clicking one could swallow the click.
+  const sig=JSON.stringify([Object.keys(presets),activePreset]);
+  if(!force&&sig===presetsSig)return;
+  presetsSig=sig;
   const host=document.getElementById("presets");host.replaceChildren();
   Object.keys(presets).forEach(name=>{const b=document.createElement("button");b.type="button";b.className="preset"+(name===activePreset?" active":"");b.textContent=name;b.addEventListener("click",()=>selectPreset(name));host.appendChild(b);});
 }
 async function apiPost(data){const r=await fetch(PRESETS_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});const result=await r.json();if(!r.ok)throw new Error(result.error||"Request failed");return result;}
 async function refreshPresets(){try{const r=await fetch(PRESETS_URL);if(!r.ok)throw new Error(r.status);const data=await r.json();presets=data.presets||{};activePreset=data.active||null;renderPresets();}catch(e){}}
-async function selectPreset(name){try{const data=await apiPost({action:"select",name});presets=data.presets;activePreset=data.active;const g=presets[name];[angle,dist]=fromGains(g.bass,g.treble);render();renderPresets();}catch(e){}}
+async function selectPreset(name){markBusy();try{const data=await apiPost({action:"select",name});presets=data.presets;activePreset=data.active;const g=presets[name];[angle,dist]=fromGains(g.bass,g.treble);render();renderPresets();}catch(e){}}
 document.getElementById("save").addEventListener("click",async()=>{
   const name=prompt("Name for the new preset:");if(name===null)return;
   try{const data=await apiPost({action:"save",name});presets=data.presets;activePreset=data.active;renderPresets();}catch(e){}
@@ -298,12 +310,14 @@ function sendLoudness() {
 }
 
 loudEnabledEl.addEventListener("change", () => {
+  markBusy();
   loudEnabled = loudEnabledEl.checked;
   renderLoudness();
   sendLoudness();
 });
 
 loudSliderEl.addEventListener("input", () => {
+  markBusy();
   loudLevel = Math.max(loudMin, Math.min(loudMax, Number(loudSliderEl.value)));
   renderLoudness();
   sendLoudness();
@@ -338,13 +352,36 @@ async function loadTone() {
     } catch(e) {}
 }
 
+// Periodic re-read: keeps the page in step with changes made elsewhere
+// (remote control, another browser). Skipped while the tab is hidden or while
+// the user is acting, so the controls never jump under the finger.
+let syncing = false;
+async function syncFromServer() {
+  if (syncing || document.hidden) return;
+  if (control.classList.contains("drag") || Date.now() < busyUntil) return;
+  syncing = true;
+  try {
+    await refreshPresets();
+    if (Date.now() < busyUntil) return;     // the user started acting meanwhile
+    await loadTone();
+    await loadLoudness();
+  } finally {
+    syncing = false;
+  }
+}
+setInterval(syncFromServer, SYNC_EVERY_MS);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) syncFromServer(); });
+
 render();
 renderLoudness();
 
-refreshPresets()
-    .then(loadTone)
-    .then(loadLoudness)
+// First display: no halo animation, the three reads run in parallel
+area.style.transition = "none";
+syncing = true;                     // the periodic re-read waits for the end of the loading
+Promise.all([refreshPresets(), loadTone(), loadLoudness()])
     .finally(() => {
+        requestAnimationFrame(() => { area.style.transition = ""; });
+        syncing = false;
         if (window.parent !== window) {
             window.parent.postMessage({
                 type: "lybrica-ready"

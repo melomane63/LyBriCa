@@ -1,4 +1,30 @@
-# Lybrica V2.3 (CPU-optimised)
+# Lybrica V2.4 (Web-ui)
+# Copyright (c) 2026 Domenico GUERRA
+#
+# Portions of this file (circular Tone control logic) are adapted from Beocreate 2:
+# https://github.com
+#
+# Copyright (c) 2018 Bang & Olufsen a/s
+# Licensed under the MIT License (https://opensource.org):
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 import asyncio
 import functools
 import glob
@@ -64,14 +90,17 @@ ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input.
 ENABLE_TV_RELAY       = True   # Relay on TV_RELAY_GPIO: active (input pulled to ground) as long
                                # as a "_B-*" config is active, inactive (high impedance)
                                # otherwise. Independent of the POWER relay.
+ENABLE_WEB            = True   # Web interface (Beosonic circle): HTTP server running inside
+                               # Lybrica's asyncio loop, port WEB_PORT.
+                               # Tone changes go through the same path as the arrow keys.
 
 
 # At least one feature must be enabled, otherwise the script has nothing to do
 if not (ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_AUTO_POWEROFF
-        or ENABLE_TOSLINK_SWITCH or ENABLE_LMS_SYNC or ENABLE_TV_RELAY):
+        or ENABLE_TOSLINK_SWITCH or ENABLE_LMS_SYNC or ENABLE_TV_RELAY or ENABLE_WEB):
     raise ValueError("No feature enabled: turn on at least one option in the FEATURES block")
 
-TONE_ACTIVE = ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH   # tone is saved / restored per config
+TONE_ACTIVE = ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH or ENABLE_WEB   # tone is saved / restored per config
 USE_GPIO    = ENABLE_AUTO_POWEROFF or ENABLE_TV_RELAY  # TOSLINK detection needs no GPIO
 
 
@@ -148,6 +177,10 @@ LMS_RETRY_S = 5              # delay before the bridge restarts after an error
 
 # ---------------------- Bluetooth pause ----------------------
 BT_CMD_TIMEOUT_S = 4.0      # bluetoothctl can be slow the first time (D-Bus startup)
+
+
+# ---------------------- Web interface ----------------------
+WEB_PORT = 5010             # HTTP port of the page (port 5005 is the CamillaDSP web interface)
 
 
 # ---------------------- Power ----------------------
@@ -318,7 +351,7 @@ ARROW_KEYS = (KEY_BINDINGS['UP'], KEY_BINDINGS['DOWN'],
 # applied, so apply_saved_values uses the copied values (if CamillaDSP rejects the
 # new config, the previous entry is restored). The values survive restarts:
 # they are saved per config in settings.json at every config switch and at script exit.
-SAVE_MODE = "half"
+SAVE_MODE = "all_group"
 
 if SAVE_MODE not in ("all_config", "all_group", "half", "same_everywhere"):
     raise ValueError(f"Unknown SAVE_MODE {SAVE_MODE!r}")
@@ -379,7 +412,7 @@ TONE_PRESETS = [
 # Runtime: which preset is active. Changed from the tone preset select
 # screen (DOWN key), persisted in settings.json so that a restart resumes on
 # the last preset used. Default 0 at first launch.
-tone_preset_idx = 0
+tone_preset_idx = 1
 
 # How the arrow keys act on the tone screen, selectable at runtime from the
 # same screen (UP key), persisted in settings.json. Default 0 at first launch.
@@ -394,7 +427,7 @@ tone_preset_idx = 0
 # (tilt / preset morphing + compensation, see above and below). Only the keys
 # differ.
 TONE_KEY_MODES = ("BT", "TL")
-tone_mode_idx = 0
+tone_mode_idx = 1
 
 
 # ---------------------- Tone gain compensation ----------------------
@@ -514,7 +547,6 @@ def tl_steps(key, bass, treble):
     else:
         case = ("pos" if x > 0 else "neg") + ("_low" if abs(x) <= 1.0 + 1e-9 else "_high")
     return TL_STEPS[key][case]
-
 
 # =====================================================================
 #  CORE - shared by every feature
@@ -987,11 +1019,50 @@ def load_settings():
     mode_idx = data.get("tone_mode_idx", 0)
     if not isinstance(mode_idx, int) or not (0 <= mode_idx < len(TONE_KEY_MODES)):
         mode_idx = 0
+    beosonic = data.get("beosonic_presets")
+    if not isinstance(beosonic, dict):
+        beosonic = {}
+    # Built-in presets. Keep these values in sync with DEFAULT_GAINS in beosonic_lybrica.html
+    # (the page uses them for its "reset" action).
+    defaults = {
+        "Neutral": {"bass": 0.0,  "treble": 0.0},
+        "Voice":   {"bass": -2.0, "treble": 0.0},
+        "Clear":   {"bass": -2.0, "treble": 2.0},
+        "Dark":    {"bass": 0.0,  "treble": -2.0},
+    }
+    clean_presets = {}
+    for name, values in defaults.items():
+        item = beosonic.get(name, values)
+        if isinstance(item, dict):
+            try:
+                b, t = float(item.get("bass", 0)), float(item.get("treble", 0))
+                if math.isfinite(b) and math.isfinite(t):
+                    clean_presets[name] = {"bass": clamp(b, -TONE_MAX_DB, TONE_MAX_DB),
+                                           "treble": clamp(t, -TONE_MAX_DB, TONE_MAX_DB)}
+                    continue
+            except (TypeError, ValueError):
+                pass
+        clean_presets[name] = dict(values)
+    for name, item in beosonic.items():
+        if name in clean_presets or not isinstance(name, str) or not name.strip() or not isinstance(item, dict):
+            continue
+        try:
+            b, t = float(item.get("bass", 0)), float(item.get("treble", 0))
+            if math.isfinite(b) and math.isfinite(t):
+                clean_presets[name.strip()[:32]] = {"bass": clamp(b, -TONE_MAX_DB, TONE_MAX_DB),
+                                                    "treble": clamp(t, -TONE_MAX_DB, TONE_MAX_DB)}
+        except (TypeError, ValueError):
+            pass
+    active = data.get("beosonic_active", "Neutral")
+    if active not in clean_presets:
+        active = "Neutral"
     return {
         "configs": configs if isinstance(configs, dict) else {},
         "last_config": last_config if isinstance(last_config, dict) else {},
         "tone_preset_idx": preset_idx,
         "tone_mode_idx": mode_idx,
+        "beosonic_presets": clean_presets,
+        "beosonic_active": active,
     }
 
 
@@ -1568,9 +1639,16 @@ async def volume_watcher_loop():
             vol_state.config_data = None
 
         if current_volume != last_volume or current_mute != last_mute or config_changed:
+            volume_changed = (current_volume != last_volume)
+
             last_volume = current_volume
             last_mute = current_mute
-            if (last_displayed == "volume" and not is_volume_key_held
+
+            if (volume_changed and not is_volume_key_held
+                    and not scroll_active() and not display_is_off):
+                display_volume_info(current_volume, current_mute)
+
+            elif (last_displayed == "volume" and not is_volume_key_held
                     and not scroll_active() and not display_is_off):
                 display_volume_info(current_volume, current_mute)
 
@@ -2492,7 +2570,6 @@ async def clock_loop():
                 and not scroll_active() and not shutting_down):
             draw_clock()
 
-
 # =====================================================================
 #  TOSLINK - automatic _A- / _B- config switching
 # =====================================================================
@@ -3160,6 +3237,350 @@ async def remote_events(device):
 
 
 # =====================================================================
+#  WEB - Beosonic circle (HTTP server running inside the asyncio loop)
+#  Everything runs in the same event loop as the keys, so the tone state
+#  (config_active, prev_values, display) is shared without any lock.
+# =====================================================================
+
+WEB_PAGE_PATH = os.path.join(os.path.dirname(SETTINGS_PATH), "beosonic_lybrica.html")
+WEB_MAX_BODY = 4096         # bytes accepted in a request body
+WEB_TIMEOUT_S = 5           # seconds allowed to receive a request
+
+_HTTP_REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found", 409: "Conflict",
+                 413: "Payload Too Large", 500: "Internal Server Error"}
+
+
+def get_tone_gains():
+    """(bass, treble) currently applied, or None if the tone filters are not
+    ready (same guard as the arrow keys)."""
+    if not tone_filters_ready(config_active):
+        return None
+    filters = config_active["filters"]
+    return (filters[BASS_FILTER]["parameters"].get("gain", 0) or 0,
+            filters[TREBLE_FILTER]["parameters"].get("gain", 0) or 0)
+
+
+def set_tone_gains(bass, treble):
+    """Set both tone gains directly. Same path as the arrow keys on the tone
+    screen: limit to ±TONE_MAX_DB, apply_tone_processing() (derives freq / Q /
+    compensation and pushes only the tone filters), then refresh the display.
+    Returns False if the tone filters are not available in the active config."""
+    touch_activity()        # a command from the page counts like a key press
+    if not tone_filters_ready(config_active):
+        return False
+
+    bass = clamp(float(bass), -TONE_MAX_DB, TONE_MAX_DB)
+    treble = clamp(float(treble), -TONE_MAX_DB, TONE_MAX_DB)
+    bass_p = config_active["filters"][BASS_FILTER]["parameters"]
+    treble_p = config_active["filters"][TREBLE_FILTER]["parameters"]
+
+    if (bass_p.get("gain", 0) or 0) != bass or (treble_p.get("gain", 0) or 0) != treble:
+        bass_p["gain"] = bass
+        treble_p["gain"] = treble
+        apply_tone_processing()
+
+    # Show the tone screen, like the arrow keys. A scrolling message is left alone.
+    if ENABLE_DISPLAY and not scroll_active():
+        if display_is_off:
+            display_volume_info()       # wake the display first
+        display_tone_info()
+    return True
+
+
+def get_loudness_status():
+    """Return current loudness state for GET /api/loudness."""
+    cfg = config_active if isinstance(config_active, dict) else {}
+    state = loudness_state(cfg)
+    ref = loudness_ref(cfg)
+    default_level = clamp(
+        round(((LOUDNESS_MIN + LOUDNESS_MAX) / 2) / LOUDNESS_STEP) * LOUDNESS_STEP,
+        LOUDNESS_MIN,
+        LOUDNESS_MAX,
+    )
+    return {
+        "ready": state is not None,
+        "switchable": loudness_switchable(cfg) if state is not None else False,
+        "enabled": bool(state) if state is not None else False,
+        "level": ref if ref is not None else default_level,
+        "min": LOUDNESS_MIN,
+        "max": LOUDNESS_MAX,
+        "step": LOUDNESS_STEP,
+    }
+
+
+def set_loudness_api(enabled=None, level=None):
+    """Apply loudness enabled state and/or reference level from the web API."""
+    touch_activity()
+    if not isinstance(config_active, dict) or loudness_state(config_active) is None:
+        return False, "loudness filter is not available in the active config"
+
+    filt_cfg = (config_active.get("filters") or {}).get(LOUDNESS_FILTER[0])
+    old_level = loudness_ref(config_active)
+    old_state = loudness_state(config_active)
+    level_changed = False
+    state_changed = False
+
+    if level is not None:
+        try:
+            lvl = float(level)
+        except (TypeError, ValueError):
+            return False, "invalid level"
+        if not math.isfinite(lvl):
+            return False, "invalid level"
+        lvl = clamp(round(lvl / LOUDNESS_STEP) * LOUDNESS_STEP, LOUDNESS_MIN, LOUDNESS_MAX)
+        if isinstance(filt_cfg, dict) and isinstance(filt_cfg.get("parameters"), dict):
+            if filt_cfg["parameters"].get(LOUDNESS_FILTER[1]) != lvl:
+                filt_cfg["parameters"][LOUDNESS_FILTER[1]] = lvl
+                level_changed = True
+
+    if enabled is not None:
+        if not isinstance(enabled, bool):
+            return False, "expected boolean for enabled"
+        if enabled != old_state:
+            if not loudness_switchable(config_active):
+                return False, "loudness step cannot be bypassed alone"
+            state_changed = set_loudness_enabled(config_active, enabled)
+
+    if not level_changed and not state_changed:
+        return True, None
+
+    try:
+        if level_changed:
+            _push_filters((LOUDNESS_FILTER[0],))
+        if state_changed:
+            _push_pipeline()
+    except Exception as e:
+        if level_changed and isinstance(filt_cfg, dict) and isinstance(filt_cfg.get("parameters"), dict):
+            filt_cfg["parameters"][LOUDNESS_FILTER[1]] = old_level
+        if state_changed and old_state is not None:
+            set_loudness_enabled(config_active, old_state)
+        return False, str(e)
+
+    save_audio_settings(config_active)
+
+    if ENABLE_DISPLAY and not scroll_active():
+        if display_is_off:
+            display_volume_info()
+        if "display_loudness_info" in globals():
+            display_loudness_info()
+    return True, None
+
+def active_beosonic_preset():
+    """Name of the preset that matches the tone gains in use right now, or None.
+    The stored name (settings["beosonic_active"]) only breaks ties between presets
+    that share the same values: the answer always follows the real gains, so a
+    change made with the remote or with the circle never leaves a stale preset
+    highlighted in the page."""
+    stored = settings.get("beosonic_active")
+    gains = get_tone_gains()
+    if gains is None:
+        return stored               # tone filters not ready: nothing to compare
+    presets = settings.get("beosonic_presets", {})
+
+    def same(name):
+        item = presets.get(name)
+        return (isinstance(item, dict)
+                and abs(item["bass"] - gains[0]) < 0.01
+                and abs(item["treble"] - gains[1]) < 0.01)
+
+    if stored in presets and same(stored):
+        return stored
+    return next((name for name in presets if same(name)), None)
+
+
+def _json_reply(status, obj):
+    return status, "application/json", json.dumps(obj).encode("utf-8")
+
+
+def _parse_tone_body(body):
+    data = json.loads(body.decode("utf-8"))
+    bass, treble = float(data["bass"]), float(data["treble"])
+    if not (math.isfinite(bass) and math.isfinite(treble)):
+        raise ValueError("not finite")
+    return bass, treble
+
+
+async def _web_route(method, path, body):
+    """Returns (status, content type, payload)."""
+    if method == "GET" and path in ("/", "/index.html"):
+        try:
+            with open(WEB_PAGE_PATH, "rb") as f:
+                return 200, "text/html; charset=utf-8", f.read()
+        except OSError:
+            return 404, "text/plain; charset=utf-8", \
+                ("Page not found: " + WEB_PAGE_PATH).encode("utf-8")
+
+    if method == "GET" and path == "/api/player":
+        return _json_reply(200, {"mac": player_id()})
+
+    if path == "/api/beosonic-presets":
+        if method == "GET":
+            return _json_reply(200, {"presets": settings.get("beosonic_presets", {}),
+                                     "active": active_beosonic_preset()})
+        if method == "POST":
+            try:
+                data = json.loads(body.decode("utf-8"))
+                action = data.get("action")
+                presets = settings.setdefault("beosonic_presets", {})
+                if action == "select":
+                    name = data.get("name")
+                    if name not in presets:
+                        return _json_reply(404, {"ok": False, "error": "preset not found"})
+                    item = presets[name]
+                    if not set_tone_gains(item["bass"], item["treble"]):
+                        return _json_reply(409, {"ok": False, "error": "tone filters are not available in the active config"})
+                    settings["beosonic_active"] = name
+                elif action == "save":
+                    name = str(data.get("name", "")).strip()[:32]
+                    if not name:
+                        return _json_reply(400, {"ok": False, "error": "a preset name is required"})
+                    if name in presets:
+                        return _json_reply(409, {"ok": False, "error": "that preset already exists"})
+                    gains = get_tone_gains()
+                    if gains is None:
+                        return _json_reply(409, {"ok": False, "error": "tone filters are not available"})
+                    presets[name] = {"bass": round(float(gains[0]), 2), "treble": round(float(gains[1]), 2)}
+                    settings["beosonic_active"] = name
+                elif action == "update":
+                    # Save the current circle position into an existing preset.
+                    name = data.get("name")
+                    if name not in presets:
+                        return _json_reply(404, {"ok": False, "error": "preset not found"})
+                    bass, treble = float(data["bass"]), float(data["treble"])
+                    if not (math.isfinite(bass) and math.isfinite(treble)):
+                        return _json_reply(400, {"ok": False, "error": "invalid tone values"})
+                    presets[name] = {
+                        "bass": round(clamp(bass, -TONE_MAX_DB, TONE_MAX_DB), 2),
+                        "treble": round(clamp(treble, -TONE_MAX_DB, TONE_MAX_DB), 2),
+                    }
+                    settings["beosonic_active"] = name
+                elif action == "rename":
+                    old_name = data.get("old_name")
+                    name = str(data.get("name", "")).strip()[:32]
+                    if old_name in ("Neutral", "Voice", "Clear", "Dark"):
+                        return _json_reply(400, {"ok": False, "error": "built-in preset names cannot be changed"})
+                    if old_name not in presets or not name:
+                        return _json_reply(400, {"ok": False, "error": "invalid preset name"})
+                    if name != old_name and name in presets:
+                        return _json_reply(409, {"ok": False, "error": "that preset already exists"})
+                    presets[name] = presets.pop(old_name)
+                    if settings.get("beosonic_active") == old_name:
+                        settings["beosonic_active"] = name
+                elif action == "delete":
+                    name = data.get("name")
+                    if name in ("Neutral", "Voice", "Clear", "Dark"):
+                        return _json_reply(400, {"ok": False, "error": "built-in presets cannot be deleted"})
+                    if name not in presets:
+                        return _json_reply(404, {"ok": False, "error": "preset not found"})
+                    del presets[name]
+                    if settings.get("beosonic_active") == name:
+                        settings["beosonic_active"] = "Neutral"
+                        set_tone_gains(0, 0)
+                else:
+                    return _json_reply(400, {"ok": False, "error": "unknown action"})
+                write_settings()
+                return _json_reply(200, {"ok": True, "presets": presets,
+                                         "active": active_beosonic_preset()})
+            except (ValueError, TypeError, AttributeError):
+                return _json_reply(400, {"ok": False, "error": "invalid request"})
+
+    if path == "/api/tone":
+        if method == "GET":
+            gains = get_tone_gains()
+            return _json_reply(200, {"ready": gains is not None,
+                                     "bass": gains[0] if gains else 0,
+                                     "treble": gains[1] if gains else 0})
+        if method == "POST":
+            try:
+                bass, treble = _parse_tone_body(body)
+            except (ValueError, KeyError, TypeError):
+                return _json_reply(400, {"ok": False, "error": "expected {\"bass\": dB, \"treble\": dB}"})
+            if not set_tone_gains(bass, treble):
+                return _json_reply(409, {"ok": False,
+                                         "error": "tone filters are not available in the active config"})
+            gains = get_tone_gains()
+            return _json_reply(200, {"ok": True, "bass": gains[0], "treble": gains[1]})
+
+    if path == "/api/loudness":
+        if method == "GET":
+            return _json_reply(200, get_loudness_status())
+        if method == "POST":
+            try:
+                data = json.loads(body.decode("utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("not an object")
+            except (ValueError, TypeError, UnicodeDecodeError):
+                return _json_reply(400, {"ok": False, "error": "invalid JSON body"})
+            ok, err = set_loudness_api(
+                enabled=data.get("enabled") if "enabled" in data else None,
+                level=data.get("level") if "level" in data else None,
+            )
+            if not ok:
+                status = 409 if "not available" in (err or "") or "cannot be bypassed" in (err or "") else 400
+                return _json_reply(status, {"ok": False, "error": err})
+            return _json_reply(200, {"ok": True, **get_loudness_status()})
+
+    return _json_reply(404, {"ok": False, "error": "not found"})
+
+
+async def _web_client(reader, writer):
+    status, ctype, payload = _json_reply(400, {"ok": False, "error": "bad request"})
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), WEB_TIMEOUT_S)
+        parts = request_line.decode("latin-1").split()
+        if len(parts) >= 2:
+            method, target = parts[0].upper(), parts[1]
+            length = 0
+            while True:
+                header = await asyncio.wait_for(reader.readline(), WEB_TIMEOUT_S)
+                if header in (b"\r\n", b"\n", b""):
+                    break
+                name, _, value = header.decode("latin-1").partition(":")
+                if name.strip().lower() == "content-length":
+                    length = int(value.strip() or 0)
+            if length < 0 or length > WEB_MAX_BODY:
+                status, ctype, payload = _json_reply(413, {"ok": False, "error": "body too large"})
+            else:
+                body = (await asyncio.wait_for(reader.readexactly(length), WEB_TIMEOUT_S)
+                        if length else b"")
+                status, ctype, payload = await _web_route(method, target.split("?", 1)[0], body)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, ValueError):
+        pass                    # incomplete or invalid request: the 400 above is sent
+    except Exception:
+        log.exception("[WEB] Request failed")
+        status, ctype, payload = _json_reply(500, {"ok": False, "error": "internal error"})
+
+    try:
+        head = (f"HTTP/1.1 {status} {_HTTP_REASONS.get(status, 'Error')}\r\n"
+                f"Content-Type: {ctype}\r\n"
+                f"Content-Length: {len(payload)}\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Cache-Control: no-store\r\n"
+                "Connection: close\r\n\r\n")
+        writer.write(head.encode("latin-1") + payload)
+        await writer.drain()
+    except ConnectionError:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def web_server_task():
+    """Started by main(). If the port is taken, log it once and stop (no restart loop)."""
+    try:
+        server = await asyncio.start_server(_web_client, "0.0.0.0", WEB_PORT)
+    except OSError as e:
+        log.error("[WEB] Cannot listen on port %s: %s", WEB_PORT, e)
+        return
+    log.info("[WEB] Listening on port %s", WEB_PORT)
+    async with server:
+        await server.serve_forever()
+
+
+# =====================================================================
 #  STARTUP - serial, CamillaDSP, GPIO, display, settings (do not reorder)
 # =====================================================================
 
@@ -3270,7 +3691,7 @@ async def main():
         spawn("blink", blink_loop)
         if ENABLE_CLOCK:
             spawn("clock", clock_loop)
-    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH or ENABLE_TV_RELAY:
+    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH or ENABLE_TV_RELAY or ENABLE_WEB:
         # Redraws and resyncs config_active after an external change (also
         # keeps the TV relay in step with an external config change)
         spawn("volume-watcher", volume_watcher_loop)
@@ -3278,6 +3699,8 @@ async def main():
         spawn("lms-bridge", lms_bridge_task)
     if ENABLE_TOSLINK_SWITCH:
         spawn("tv-toslink", monitor_tv_toslink)
+    if ENABLE_WEB:
+        spawn("web", web_server_task)
     if ENABLE_REMOTE:
         spawn("remote", remote_watcher)
 

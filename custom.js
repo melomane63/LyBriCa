@@ -18,7 +18,7 @@
     let button = null;
     let lybricaFrame = null;
 
-    // ----- Visibilité du bouton selon le lecteur sélectionné -----
+    // ----- Button visibility according to the selected player -----
 
     function updateButtonVisibility() {
         if (!button || !store || !lybricaMac) return;
@@ -29,7 +29,7 @@
             selectedMac === lybricaMac ? "" : "none";
     }
 
-    // ----- Synchronisation du thème Material Skin -----
+    // ----- Material Skin theme synchronisation -----
 
     function syncLybricaTheme() {
         if (!lybricaFrame?.contentWindow) return;
@@ -60,7 +60,7 @@
         lybricaFrame.contentWindow.postMessage(theme, "*");
     }
 
-    // ----- Récupération du store Vuex -----
+    // ----- Retrieving the Vuex store -----
 
     function findStore() {
         if (store) return;
@@ -80,7 +80,7 @@
             () => {
                 updateButtonVisibility();
 
-                // Laisser Material Skin actualiser son thème
+                // Let Material Skin update its theme first
                 requestAnimationFrame(() => {
                     requestAnimationFrame(syncLybricaTheme);
                 });
@@ -90,7 +90,7 @@
         updateButtonVisibility();
     }
 
-    // ----- Détection du lecteur LyBriCa -----
+    // ----- LyBriCa player detection -----
 
     async function loadLybricaPlayer() {
         try {
@@ -124,14 +124,14 @@
         }
     }
 
-    // ----- Fermeture de LyBriCa : Échap, clic à l'extérieur, ou message de la page -----
+    // ----- Closing LyBriCa: Escape, click outside, or message from the page -----
 
     function onKeyDown(event) {
         if (event.key === "Escape") closeLybrica();
     }
 
-    // Échap pressé DANS l'iframe : la page LyBriCa nous le signale par postMessage
-    // (le clavier de l'iframe n'arrive pas jusqu'ici, les deux pages ont des ports différents)
+    // Escape pressed INSIDE the iframe: the LyBriCa page tells us through postMessage
+    // (keyboard events from the iframe do not reach this page, the two pages are on different ports)
     function onMessage(event) {
         if (!lybricaFrame ||
             event.source !== lybricaFrame.contentWindow) {
@@ -156,7 +156,7 @@
         lybricaFrame = null;
     }
 
-    // ----- Ouverture / fermeture de LyBriCa -----
+    // ----- Opening / closing LyBriCa -----
 
     function toggleLybrica() {
         if (document.getElementById(PANEL_ID)) {
@@ -164,7 +164,7 @@
             return;
         }
 
-        // Voile transparent derrière la fenêtre : un clic dessus ferme LyBriCa
+        // Transparent overlay behind the window: a click on it closes LyBriCa
         const overlay = document.createElement("div");
         overlay.id = OVERLAY_ID;
 
@@ -188,7 +188,6 @@
             height: "520px",
             maxWidth: "calc(100vw - 30px)",
             maxHeight: "calc(100vh - 95px)",
-            background: "#lalala",
             border: "1px solid #888",
             borderRadius: "8px",
             boxShadow: "0 5px 25px rgba(0,0,0,.4)",
@@ -206,12 +205,10 @@
         frame.style.flex = "1";
         frame.style.border = "0";
 
-        // Permet à LyBriCa d'utiliser le thème sombre
+        // Lets LyBriCa use the dark theme
         frame.style.colorScheme = "dark";
 
         lybricaFrame = frame;
-
-        frame.style.opacity = "0";
 
         frame.style.opacity = "0";
 
@@ -227,7 +224,7 @@
         window.addEventListener("message", onMessage);
     }
 
-    // ----- Ajout du bouton dans la barre d'outils -----
+    // ----- Adding the button to the toolbar -----
 
     function addLybricaButton() {
         const existing = document.getElementById(BUTTON_ID);

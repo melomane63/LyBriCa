@@ -1024,8 +1024,6 @@ def load_settings():
         mode_idx = 1
     saved_presets = data.get("tone_presets")
     if not isinstance(saved_presets, dict):
-        saved_presets = data.get("beosonic_presets")   # settings.json written before the rename
-    if not isinstance(saved_presets, dict):
         saved_presets = {}
     # Built-in presets. Keep these values in sync with DEFAULT_GAINS in tone_circle.html
     # (the page uses them for its "reset" action).
@@ -1058,7 +1056,7 @@ def load_settings():
                                                     "treble": clamp(t, -TONE_MAX_DB, TONE_MAX_DB)}
         except (TypeError, ValueError):
             pass
-    active = data.get("tone_active", data.get("beosonic_active", "Neutral"))
+    active = data.get("tone_active", "Neutral")
     if active not in clean_presets:
         active = "Neutral"
     return {

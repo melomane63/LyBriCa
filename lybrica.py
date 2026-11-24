@@ -1645,11 +1645,22 @@ async def volume_watcher_loop():
 
         if current_volume != last_volume or current_mute != last_mute or config_changed:
             volume_changed = (current_volume != last_volume)
+            mute_changed = (current_mute != last_mute)
 
             last_volume = current_volume
             last_mute = current_mute
 
-            if (volume_changed and not is_volume_key_held
+            if ((volume_changed or mute_changed) and display_is_off
+                    and not is_volume_key_held and not scroll_active()
+                    and not shutting_down):
+                # Volume or mute changed from OUTSIDE the remote (LMS, a web
+                # player...) while the clock is shown: wake the display on the
+                # volume screen. It counts as activity, otherwise
+                # display_manager_loop would put the clock back at once.
+                touch_activity()
+                display_volume_info(current_volume, current_mute)
+
+            elif (volume_changed and not is_volume_key_held
                     and not scroll_active() and not display_is_off):
                 display_volume_info(current_volume, current_mute)
 

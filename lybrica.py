@@ -64,7 +64,7 @@ except Exception:
 
 ENABLE_LMS_SYNC       = True   # LMS <-> CamillaDSP volume bridge (asyncio task).
                                # Only the bridge: the LMS CLI is used anyway by the LMS keys
-                               # (play / pause / seek) and by the TOSLINK monitor.
+                               # (play / pause / seek) and by the auto switch monitor.
 ENABLE_AUTO_POWEROFF  = True   # Power relay: off after silence, on with sound,
                                # halt after HALT_DELAY, relay toggle on POWER long press
 ENABLE_REMOTE         = True   # Remote control (all keys: volume, mute, LMS, BACK,
@@ -76,7 +76,8 @@ ENABLE_CLOCK          = True   # When the display would normally go blank (silen
                                # instead. Any key press returns to the volume screen.
                                # Needs ENABLE_DISPLAY. The system time zone must be
                                # set (on piCorePlayer: pCP web interface).
-ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input.
+ENABLE_AUTO_SWITCH    = True   # Automatic switching between the streamer (group A) and an
+                               # external input (group B): any ALSA capture input, not only TOSLINK.
                                # True : automatism ON  -> BACK cycles within the active
                                #                          group (any "_X-");
                                #                          HOMEPAGE short press = nothing.
@@ -89,9 +90,10 @@ ENABLE_TOSLINK_SWITCH = True   # Auto config switching on the TOSLINK input.
                                # The automatism itself only knows groups A and B.
                                # If either has no config file, the automatism cannot run:
                                # the keys then behave as with False.
-ENABLE_TV_RELAY       = True   # Relay on TV_RELAY_GPIO: active (input pulled to ground) as long
+ENABLE_EXT_RELAY      = True   # Relay on EXT_RELAY_GPIO: active (input pulled to ground) as long
                                # as a "_B-*" config is active, inactive (high impedance)
                                # otherwise. Independent of the POWER relay.
+                               # Typical use: a relay that follows the external input (group B).
 ENABLE_WEB            = True   # Web interface (tone circle): HTTP server running inside
                                # Lybrica's asyncio loop, port WEB_PORT.
                                # Tone changes go through the same path as the arrow keys.
@@ -99,11 +101,11 @@ ENABLE_WEB            = True   # Web interface (tone circle): HTTP server runnin
 
 # At least one feature must be enabled, otherwise the script has nothing to do
 if not (ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_AUTO_POWEROFF
-        or ENABLE_TOSLINK_SWITCH or ENABLE_LMS_SYNC or ENABLE_TV_RELAY or ENABLE_WEB):
+        or ENABLE_AUTO_SWITCH or ENABLE_LMS_SYNC or ENABLE_EXT_RELAY or ENABLE_WEB):
     raise ValueError("No feature enabled: turn on at least one option in the FEATURES block")
 
-TONE_ACTIVE = ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH or ENABLE_WEB   # tone is saved / restored per config
-USE_GPIO    = ENABLE_AUTO_POWEROFF or ENABLE_TV_RELAY  # TOSLINK detection needs no GPIO
+TONE_ACTIVE = ENABLE_REMOTE or ENABLE_AUTO_SWITCH or ENABLE_WEB   # tone is saved / restored per config
+USE_GPIO    = ENABLE_AUTO_POWEROFF or ENABLE_EXT_RELAY  # external input detection needs no GPIO
 
 
 # ---------------------------------------------------------------------
@@ -117,7 +119,7 @@ if ENABLE_DISPLAY:
     from tm1637_lgpio import TM1637
 if USE_GPIO:
     import lgpio
-if ENABLE_TOSLINK_SWITCH:
+if ENABLE_AUTO_SWITCH:
     import alsaaudio
     import warnings
     with warnings.catch_warnings():
@@ -144,7 +146,7 @@ PCP_DIR = "/mnt/mmcblk0p2/tce"
 CAMILLA_ADDR = ("127.0.0.1", 1234)  # CamillaDSP on this Pi (must stay local: loopback audio)
 
 # One shared reader (cdsp_poller) publishes into `vol_state`. The volume watcher
-# (display / resync) and the LMS bridge subscribe to it; the TOSLINK monitor
+# (display / resync) and the LMS bridge subscribe to it; the auto switch monitor
 # reads vol_state.config_path by polling.
 #
 # Adaptive polling: fast while the user interacts, slow otherwise.
@@ -193,48 +195,48 @@ POWER_OFF_DELAY = 2         # Minutes without sound AND without key press before
                             # (needs ENABLE_DISPLAY). A key press restarts the countdown.
 HALT_DELAY = 48             # Hours of continuous silence before the Raspberry Pi shuts down
 
-TV_RELAY_GPIO = 12          # Optocoupler board input of the "_B-" group relay
+EXT_RELAY_GPIO = 12         # Optocoupler board input of the "_B-" group relay
                             # LOW (ground) = relay active, high impedance = inactive.
-                            # To avoid a pulse while the Pi boots, add "gpio=<TV_RELAY_GPIO>=ip,np"
+                            # To avoid a pulse while the Pi boots, add "gpio=<EXT_RELAY_GPIO>=ip,np"
                             # to config.txt.
 
 
 # ---------------------- Audio analysis ----------------------
 # is_silent() feeds `silent_now`, used by the power relay (auto power-off and
-# HALT_DELAY), by the display blanking and by the TOSLINK -> loopback return.
+# HALT_DELAY), by the display blanking and by the external input -> loopback return.
 # It declares silence when the RMS level is below SILENCE_RMS_DB, or when the
 # signal is a steady noise floor (crest below CREST_MIN_DB).
-# CREST_MIN_DB is also used by the input probes (TOSLINK and loopback), which
+# CREST_MIN_DB is also used by the input probes (external input and loopback), which
 # have their own level threshold (SIGNAL_ON_DB).
 
 SILENCE_RMS_DB = -72.0   # RMS below this -> silence
 CREST_MIN_DB   = 2.0     # peak - rms below this -> steady noise, not audio
 
 
-# ---------------------- TOSLINK auto switching ----------------------
+# ---------------------- Automatic source switching ----------------------
 # Automatic switch between group A (streamer, files matching "_A-*") and
-# group B (TV, files matching "_B-*"), based on what is actually playing.
+# group B (external input, files matching "_B-*"), based on what is actually playing.
 # While the automatism is ON, only these two groups can be active: a manual
 # group ("_C-*", "_D-*", ...) is immediately replaced by A or B (see the
-# block comment 'Only two groups are recognised...' in the TOSLINK section).
+# block comment 'Only two groups are recognised...' in the AUTO SWITCH section).
 #
 #   group A active:
-#       TOSLINK audio detected -> switch to B
+#       external input audio detected -> switch to B
 #   group B active:
-#       TOSLINK silent + loopback signal (LMS or Bluetooth) -> switch back to A
-#       loopback signal while the TV plays                  -> pause LMS + BT
+#       external input silent + loopback signal (LMS or Bluetooth) -> switch back to A
+#       loopback signal while the external input plays                  -> pause LMS + BT
 #
 # The automatism can be disabled / enabled at run time with a long press
 # on HOMEPAGE. Enabled at every start.
 #
-# The TOSLINK device is read from the first "_B-*" file (its name depends on
+# The external input device is read from the first "_B-*" file (its name depends on
 # the hardware and cannot be hardcoded). The loopback is always
 # plughw:Loopback,1,0. Both probes ask for S16_LE / 48000 / 2 channels; plughw
 # adapts if the device is in something else, so the exact format/rate in the
 # config files does not matter for the probes.
 
 SIGNAL_ON_DB = -60.0    # above which audio is considered present on a probed input
-                        # (TOSLINK in group A, loopback in group B), dBFS RMS.
+                        # (external input in group A, loopback in group B), dBFS RMS.
                         # Keep it ABOVE SILENCE_RMS_DB, otherwise a signal could be detected
                         # and then count as silence.
 PROBE_DEBUG = False     # Log every input probe measurement, to calibrate SIGNAL_ON_DB
@@ -246,7 +248,7 @@ PROBE_RATE     = 48000
 PROBE_CHANNELS = 2
 PROBE_WINDOW_S = 0.5    # Length of one probe measurement
 PROBE_POLL_S   = 0.04   # Sleep between two ALSA reads inside a probe (period is ~85 ms)
-TOSLINK_LOOP_S = 2      # Base cycle period of the TOSLINK monitor
+AUTO_SWITCH_LOOP_S = 2  # Base cycle period of the auto switch monitor
 
 
 # ---------------------- Display ----------------------
@@ -300,11 +302,11 @@ KEY_BINDINGS = {
                                          # Long: volume->Loudness,
                                          # tone->tone_select, loudness->volume,
                                          # tone_select->volume.
-    'BACK':          'KEY_BACK',         # Cycle within the active group, whatever the TOSLINK mode
-    'HOMEPAGE':      'KEY_HOMEPAGE',     # TOSLINK ON : long = automatism on/off
-                                         #              short, auto ON : nothing
-                                         #              short, auto OFF: cycle groups
-                                         # TOSLINK OFF: cycle groups
+    'BACK':          'KEY_BACK',         # Cycle within the active group, whatever the auto switch mode
+    'HOMEPAGE':      'KEY_HOMEPAGE',     # AUTO SWITCH ON : long = automatism on/off
+                                         #                  short, auto ON : nothing
+                                         #                  short, auto OFF: cycle groups
+                                         # AUTO SWITCH OFF: cycle groups
 }
 
 # Hold durations, in key-repeat events. The remote repeats every 40 ms, but
@@ -320,7 +322,7 @@ SEEK_STEP_BACKWARD_S = 10   # Seconds jumped at each seek (PREVIOUSSONG)
 SEEK_INTERVAL_S = 0.8       # Seconds between two seeks while the key is held
 ARROW_REPEAT_EVERY = 5      # Arrow keys: one action every: value * 40 ms
 
-HOLD_TOGGLE_AUTO_S = 1.0    # HOMEPAGE long press to enable/disable the TOSLINK automatism
+HOLD_TOGGLE_AUTO_S = 1.0    # HOMEPAGE long press to enable/disable the automatic source switching
 
 # VOLUME+ / VOLUME- held: apply a volume step only on every Nth repeat.
 # 1 = every repeat (fastest), 2 = every other repeat, etc. The remote
@@ -481,7 +483,7 @@ else:
     SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
 # Config group prefix: "_X-", where X is a single uppercase letter.
-# "_A-" and "_B-" are used by the TOSLINK automatism; a user can define
+# "_A-" and "_B-" are used by the automatic source switching; a user can define
 # "_C-", "_D-", etc. and reach them in manual mode. A file whose name does
 # not match falls back to group A.
 _GROUP_RE = re.compile(r"^_([A-Z])-")
@@ -1201,7 +1203,7 @@ def resync_after_reconnect():
     if isinstance(new_active, dict) and new_active:
         config_active = new_active
     current_config_key = new_key
-    update_tv_relay()
+    update_ext_relay()
     saved = settings["configs"].get(current_config_key) if current_config_key else None
     load_prev_values(saved)
     if TONE_ACTIVE and is_complete_config(config_active):
@@ -1491,7 +1493,7 @@ async def change_config(config_pattern, cycle=True):
     config_active = new_config_data
     current_config_key = new_key
     current_config_external = False
-    update_tv_relay()
+    update_ext_relay()
 
     load_prev_values(saved)
 
@@ -1612,7 +1614,7 @@ async def volume_watcher_loop():
                 config_active = new_active
                 current_config_key = new_key
                 current_config_external = True
-                update_tv_relay()
+                update_ext_relay()
 
                 load_prev_values(None)
 
@@ -1966,7 +1968,7 @@ def shutdown_system():
         log.warning("Shutdown: could not save the settings (%s)", e)
     if ENABLE_AUTO_POWEROFF:
         lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
-    release_tv_relay()
+    release_ext_relay()
     cancel_scroll()                 # nothing may overwrite the HALT message
     show(" HALT ")
     os.system("sudo poweroff")
@@ -2020,43 +2022,43 @@ async def auto_poweroff():
 
 
 # =====================================================================
-#  TV RELAY - shared helpers
+#  EXT RELAY - shared helpers
 # =====================================================================
 
-tv_relay_on = False             # Known state: the GPIO is only written on a change.
+ext_relay_on = False             # Known state: the GPIO is only written on a change.
                                 # The input is claimed (inactive) at startup.
 
 
-def release_tv_relay():
-    if not ENABLE_TV_RELAY:
+def release_ext_relay():
+    if not ENABLE_EXT_RELAY:
         return
     try:
-        lgpio.gpio_free(h, TV_RELAY_GPIO)
+        lgpio.gpio_free(h, EXT_RELAY_GPIO)
     except Exception:
         pass
-    lgpio.gpio_claim_input(h, TV_RELAY_GPIO)
+    lgpio.gpio_claim_input(h, EXT_RELAY_GPIO)
 
 
-def update_tv_relay():
+def update_ext_relay():
     """Active (GPIO to ground) if the active config belongs to group B,
     inactive (high impedance) otherwise. Called after every change of
     current_config_key."""
-    global tv_relay_on
-    if not ENABLE_TV_RELAY or not current_config_key:
+    global ext_relay_on
+    if not ENABLE_EXT_RELAY or not current_config_key:
         return
     want = _prefix_of(current_config_key) == 'B'
-    if want == tv_relay_on:
+    if want == ext_relay_on:
         return
     try:
-        lgpio.gpio_free(h, TV_RELAY_GPIO)
+        lgpio.gpio_free(h, EXT_RELAY_GPIO)
     except Exception:
         pass
     if want:
-        lgpio.gpio_claim_output(h, TV_RELAY_GPIO, 0)
+        lgpio.gpio_claim_output(h, EXT_RELAY_GPIO, 0)
     else:
-        lgpio.gpio_claim_input(h, TV_RELAY_GPIO)
-    tv_relay_on = want
-    log.info("[TV RELAY] %s (config %s)", "ON" if want else "OFF", current_config_key)
+        lgpio.gpio_claim_input(h, EXT_RELAY_GPIO)
+    ext_relay_on = want
+    log.info("[EXT RELAY] %s (config %s)", "ON" if want else "OFF", current_config_key)
 
 
 # =====================================================================
@@ -2301,7 +2303,7 @@ def display_volume_info(current_volume=None, is_muted=None):
     """Show the config label and the volume.
 
     Indicators (blink phase shared by all):
-      segs[0..2] DP : CONF MANUAL (TOSLINK auto OFF)
+      segs[0..2] DP : CONF MANUAL (auto switch OFF)
       segs[3] DP    : TONE active (bass or treble non-zero), fixed
       segs[3] Seg G : separator; blinks when POWER auto is OFF
       segs[5] DP    : half-dB indicator
@@ -2358,7 +2360,7 @@ def display_volume_info(current_volume=None, is_muted=None):
         segs[3] |= 0x40
 
     # DP on the three label characters: CONF MANUAL, blinking.
-    if ENABLE_TOSLINK_SWITCH and not toslink_auto_enabled and blink_on():
+    if ENABLE_AUTO_SWITCH and not auto_switch_enabled and blink_on():
         segs[0] |= 0x80
         segs[1] |= 0x80
         segs[2] |= 0x80
@@ -2542,7 +2544,7 @@ async def blink_loop():
         await asyncio.sleep(1.0 - time.monotonic() % 1.0)
 
         blinking = (current_config_external
-                    or (ENABLE_TOSLINK_SWITCH and not toslink_auto_enabled)
+                    or (ENABLE_AUTO_SWITCH and not auto_switch_enabled)
                     or (ENABLE_AUTO_POWEROFF and not auto_power_enabled))
 
         if (blinking
@@ -2574,48 +2576,48 @@ async def clock_loop():
             draw_clock()
 
 # =====================================================================
-#  TOSLINK - automatic _A- / _B- config switching
+#  AUTO SWITCH - automatic _A- / _B- config switching
 # =====================================================================
 
-toslink_auto_enabled = True
-toslink_ready = False
+auto_switch_enabled = True
+auto_switch_ready = False
 
 
-def toslink_active():
-    """True when the automatism can run: feature enabled AND monitor_tv_toslink
+def auto_switch_active():
+    """True when the automatism can run: feature enabled AND monitor_auto_switch
     found its config files. Otherwise BACK/HOMEPAGE behave as if the feature
     were off."""
-    return ENABLE_TOSLINK_SWITCH and toslink_ready
+    return ENABLE_AUTO_SWITCH and auto_switch_ready
 
 
-def toggle_toslink_auto():
-    global toslink_auto_enabled
-    toslink_auto_enabled = not toslink_auto_enabled
-    log.info("[TOSLINK] Automatism %s", "ON" if toslink_auto_enabled else "OFF")
-    scroll_message("CONF AUTO" if toslink_auto_enabled else "CONF MANUAL")
+def toggle_auto_switch():
+    global auto_switch_enabled
+    auto_switch_enabled = not auto_switch_enabled
+    log.info("[AUTO SWITCH] Automatism %s", "ON" if auto_switch_enabled else "OFF")
+    scroll_message("CONF AUTO" if auto_switch_enabled else "CONF MANUAL")
 
 
 # Only two groups are recognised by the automatism:
 #
-#   _A-XX : CamillaDSP captures the loopback -> TOSLINK is free.
+#   _A-XX : CamillaDSP captures the loopback -> the external input is free.
 #           Probed directly through ALSA (0.5 s). A reading counts when
 #           rms >= SIGNAL_ON_DB AND crest (peak - rms) >= CREST_MIN_DB
 #           (a steady noise floor has peak ~= rms and is ignored).
 #           2 consecutive readings -> switch to _B-XX
 #
-#   _B-XX : CamillaDSP captures TOSLINK -> `silent_now` is the TV level,
+#   _B-XX : CamillaDSP captures the external input -> `silent_now` is its level,
 #           and the loopback is free: it is probed the same way as the
-#           TOSLINK in group A. LMS and the Bluetooth source both play
+#           the external input in group A. LMS and the Bluetooth source both play
 #           through it, so a signal there means one of them is playing.
-#             signal on the loopback + TOSLINK silent for SILENT_TICKS cycles
+#             signal on the loopback + external input silent for SILENT_TICKS cycles
 #                                                         -> back to _A-XX
-#             signal on the loopback while the TV plays
+#             signal on the loopback while the external input plays
 #                                    -> LMS is paused, Bluetooth is paused
 #
 # A manual group ("_C-", "_D-", ...) is only meaningful in manual mode. While
-# the automatism is ON and a manual group is active, the loop probes TOSLINK
+# the automatism is ON and a manual group is active, the loop probes the external input
 # once and immediately switches to the automatic group matching the state.
-# After a TV -> streamer return the automatism lands on A, not on the manual
+# After an external input -> streamer return the automatism lands on A, not on the manual
 # group.
 #
 # Automatism OFF: no probing, no switching, no pause. BACK cycles within
@@ -2641,7 +2643,7 @@ def _levels(data, channels):
 
 
 def _probe_input(device):
-    """Runs in a thread (blocks ~PROBE_WINDOW_S). Used for the TOSLINK (group A)
+    """Runs in a thread (blocks ~PROBE_WINDOW_S). Used for the external input (group A)
     and for the loopback (group B). Opens through plughw, so the rate asked
     below does not need to match what the device actually uses.
     Returns (peak_db, rms_db, None) if the input is free,
@@ -2679,52 +2681,52 @@ def signal_present(peak, rms):
             and rms >= SIGNAL_ON_DB)
 
 
-async def monitor_tv_toslink():
+async def monitor_auto_switch():
     """See the block comment 'Only two groups are recognised...' above
     _levels."""
-    global toslink_ready
+    global auto_switch_ready
     loop = asyncio.get_running_loop()
 
-    LOOP_S       = TOSLINK_LOOP_S   # base cycle period; both probes also spend ~PROBE_WINDOW_S probing
+    LOOP_S       = AUTO_SWITCH_LOOP_S   # base cycle period; both probes also spend ~PROBE_WINDOW_S probing
     SILENT_TICKS = 2        # consecutive silent cycles (source playing) -> back to _A-
     RETRY_BASE_S = 5.0      # first delay after a failed switch; doubled each failure
     RETRY_MAX_S  = 60.0     # backoff ceiling
 
-    # TOSLINK device: read from the _B-* config (the card name depends on the
+    # External input device: read from the _B-* config (the card name depends on the
     # hardware and cannot be hardcoded). The loopback is always plughw:Loopback,1,0.
-    toslink_files = config_files_matching(CONFIG_DIR + "_B-*")
-    if not toslink_files:
-        log.error("[TOSLINK] No '_B-*' config file found in %s", CONFIG_DIR)
+    ext_files = config_files_matching(CONFIG_DIR + "_B-*")
+    if not ext_files:
+        log.error("[AUTO SWITCH] No '_B-*' config file found in %s", CONFIG_DIR)
         return
     try:
-        data = cdsp.config.read_and_parse_file(toslink_files[0])
-        toslink_device = ((data.get("devices") or {}).get("capture") or {}).get("device")
+        data = cdsp.config.read_and_parse_file(ext_files[0])
+        ext_device = ((data.get("devices") or {}).get("capture") or {}).get("device")
     except Exception as e:
-        log.error("[TOSLINK] Cannot read %s: %s", toslink_files[0], e)
+        log.error("[AUTO SWITCH] Cannot read %s: %s", ext_files[0], e)
         return
-    if not isinstance(toslink_device, str) or not toslink_device:
-        log.error("[TOSLINK] No capture device in %s", toslink_files[0])
+    if not isinstance(ext_device, str) or not ext_device:
+        log.error("[AUTO SWITCH] No capture device in %s", ext_files[0])
         return
-    # Force plughw on the TOSLINK device too, so the probe does not depend
+    # Force plughw on the external input device too, so the probe does not depend
     # on the exact format/rate in the config.
-    if toslink_device.startswith("hw:"):
-        toslink_device = "plug" + toslink_device
-    log.info("[TOSLINK] Capture: %s", toslink_device)
+    if ext_device.startswith("hw:"):
+        ext_device = "plug" + ext_device
+    log.info("[AUTO SWITCH] Capture: %s", ext_device)
 
     if SIGNAL_ON_DB <= SILENCE_RMS_DB:
-        log.warning("[TOSLINK] SIGNAL_ON_DB (%g) is not above SILENCE_RMS_DB (%g): "
+        log.warning("[AUTO SWITCH] SIGNAL_ON_DB (%g) is not above SILENCE_RMS_DB (%g): "
                     "a signal may be detected, then counted as silence",
                     SIGNAL_ON_DB, SILENCE_RMS_DB)
 
     if not config_files_matching(CONFIG_DIR + "_A-*"):
-        log.error("[TOSLINK] No '_A-*' config file found in %s", CONFIG_DIR)
+        log.error("[AUTO SWITCH] No '_A-*' config file found in %s", CONFIG_DIR)
         return
     log.info("[LOOPBACK] Capture: %s", PROBE_DEVICE_LOOPBACK)
 
-    toslink_ready = True
+    auto_switch_ready = True
 
     last_config_path = cdsp.config.file_path() or ""
-    toslink_hits = 0
+    ext_hits = 0
     silent_ticks = 0
     switch_failures = 0
     last_err = None
@@ -2742,7 +2744,7 @@ async def monitor_tv_toslink():
             return
         switch_failures += 1
         delay = min(RETRY_MAX_S, RETRY_BASE_S * 2 ** (switch_failures - 1))
-        log.warning("[TOSLINK] Switch to '%s' failed (#%d), retry in %g s",
+        log.warning("[AUTO SWITCH] Switch to '%s' failed (#%d), retry in %g s",
                     target_prefix, switch_failures, delay)
         await asyncio.sleep(delay)
 
@@ -2754,74 +2756,74 @@ async def monitor_tv_toslink():
             old_prefix, new_prefix = _prefix_of(last_config_path), _prefix_of(cp)
             last_config_path = cp
             if new_prefix != old_prefix:
-                log.info("[TOSLINK] Config change: %s -> %s",
+                log.info("[AUTO SWITCH] Config change: %s -> %s",
                          old_prefix, new_prefix)
-            toslink_hits = silent_ticks = 0
+            ext_hits = silent_ticks = 0
             await asyncio.sleep(1.0)
             continue
 
-        if not toslink_auto_enabled:
-            toslink_hits = silent_ticks = 0
+        if not auto_switch_enabled:
+            ext_hits = silent_ticks = 0
             continue
 
         try:
             current_group = _prefix_of(vol_state.config_path)
 
             # Manual group + automatism ON: pick the right automatic group
-            # right away, based on a single TOSLINK probe.
+            # right away, based on a single external input probe.
             if current_group not in ('A', 'B'):
                 peak, rms, err = await loop.run_in_executor(
-                    None, _probe_input, toslink_device)
+                    None, _probe_input, ext_device)
 
                 if err is None and signal_present(peak, rms):
-                    log.info("[TOSLINK] Automatism ON, manual group %s + TV "
+                    log.info("[AUTO SWITCH] Automatism ON, manual group %s + EXT "
                              "playing -> _B-", current_group)
                     await try_switch(CONFIG_DIR + '_B-*', 'B')
                 else:
-                    log.info("[TOSLINK] Automatism ON, leaving manual group "
+                    log.info("[AUTO SWITCH] Automatism ON, leaving manual group "
                              "%s -> _A-", current_group)
                     await try_switch(CONFIG_DIR + '_A-*', 'A')
                 continue
 
             if current_group != 'B':
-                # Group A: TOSLINK is free -> probe it. LMS is not touched:
-                # the streamer group stays active until the TV really plays.
+                # Group A: the external input is free -> probe it. LMS is not touched:
+                # the streamer group stays active until the external input really plays.
                 silent_ticks = 0
                 peak, rms, err = await loop.run_in_executor(
-                    None, _probe_input, toslink_device)
+                    None, _probe_input, ext_device)
 
                 if err is not None:
                     if repr(err) != last_err:
-                        log.warning("[TOSLINK] Probe failed: %r", err)
+                        log.warning("[AUTO SWITCH] Probe failed: %r", err)
                         last_err = repr(err)
-                    toslink_hits = 0
+                    ext_hits = 0
                     await asyncio.sleep(2.0)
                     continue
                 last_err = None
 
                 if PROBE_DEBUG and peak is not None:
-                    log.info("[TOSLINK] probe: peak=%.1f rms=%.1f crest=%.1f",
+                    log.info("[AUTO SWITCH] probe: peak=%.1f rms=%.1f crest=%.1f",
                              peak, rms, peak - rms)
 
                 # Protections 1 and 2: no samples, steady noise floor (peak ~= rms)
                 # or RMS below the level threshold -> no audio
                 if not signal_present(peak, rms):
-                    toslink_hits = 0
+                    ext_hits = 0
                     continue
 
                 # Protection 3: 2 consecutive readings above threshold
-                toslink_hits += 1
-                if toslink_hits >= 2:
-                    log.info("[TOSLINK] TV confirmed (peak=%.1f rms=%.1f) "
+                ext_hits += 1
+                if ext_hits >= 2:
+                    log.info("[AUTO SWITCH] EXT confirmed (peak=%.1f rms=%.1f) "
                              "-> switch to _B-XX", peak, rms)
-                    toslink_hits = 0
+                    ext_hits = 0
                     await try_switch(CONFIG_DIR + '_B-*', 'B')
 
             else:
-                # _B-XX: TOSLINK captured by CamillaDSP, silent_now is the TV level.
+                # _B-XX: external input captured by CamillaDSP, silent_now is its level.
                 # The loopback is free: a signal there means LMS or the
                 # Bluetooth source is playing.
-                toslink_hits = 0
+                ext_hits = 0
                 peak, rms, err = await loop.run_in_executor(
                     None, _probe_input, PROBE_DEVICE_LOOPBACK)
 
@@ -2845,14 +2847,14 @@ async def monitor_tv_toslink():
                     # reading after a switch) must not send us back to _A-XX
                     silent_ticks += 1
                     if silent_ticks >= SILENT_TICKS:
-                        log.info("[LOOPBACK] Source playing + TOSLINK silent "
+                        log.info("[LOOPBACK] Source playing + external input silent "
                                  "-> switch to _A-XX")
                         silent_ticks = 0
                         await try_switch(CONFIG_DIR + '_A-*', 'A')
                         continue
                 elif source_playing:
                     silent_ticks = 0
-                    log.info("[TV] Source started while the TV plays -> pause LMS + BT")
+                    log.info("[EXT] Source started while the external input plays -> pause LMS + BT")
                     # "pause 1" forces the pause (a bare "pause" toggles, and
                     # would restart playback if LMS was already paused)
                     await asyncio.to_thread(send_lms_command, "pause 1")
@@ -2862,8 +2864,8 @@ async def monitor_tv_toslink():
                     silent_ticks = 0
 
         except Exception as e:
-            toslink_hits = silent_ticks = 0
-            log.warning("[TOSLINK] iteration failed: %s", e)
+            ext_hits = silent_ticks = 0
+            log.warning("[AUTO SWITCH] iteration failed: %s", e)
             await asyncio.sleep(2.0)
 
 
@@ -3125,14 +3127,14 @@ async def remote_events(device):
 
                     elif key == KEY_BINDINGS['BACK']:
                         # Always: cycle INSIDE the active group, whatever the
-                        # TOSLINK mode. Fresh read on purpose: change_config
+                        # auto switch mode. Fresh read on purpose: change_config
                         # re-reads file_path() itself, both must agree.
                         prefix = _prefix_of(cdsp.config.file_path())
                         await change_config(CONFIG_DIR + '_' + prefix + '-*')
 
                     elif key == KEY_BINDINGS['HOMEPAGE']:
                         home_toggled = False
-                        if toslink_active():
+                        if auto_switch_active():
                             home_press_time = time.monotonic()
 
                     elif ENABLE_DISPLAY and key == KEY_BINDINGS['ENTER']:
@@ -3177,12 +3179,12 @@ async def remote_events(device):
                         elif key_hold_counter == HOLD_SHUTDOWN:
                             shutdown_system()       # saves the settings itself
 
-                    elif key == KEY_BINDINGS['HOMEPAGE'] and toslink_active():
+                    elif key == KEY_BINDINGS['HOMEPAGE'] and auto_switch_active():
                         # Real-time measurement: independent of the repeat rate
                         if (not home_toggled
                                 and time.monotonic() - home_press_time >= HOLD_TOGGLE_AUTO_S):
                             home_toggled = True
-                            toggle_toslink_auto()
+                            toggle_auto_switch()
 
                     elif key == KEY_BINDINGS['ENTER']:
                         key_hold_counter += 1
@@ -3205,7 +3207,7 @@ async def remote_events(device):
                     # (the automatism is active, no manual action), otherwise
                     # cycle groups.
                     if key == KEY_BINDINGS['HOMEPAGE'] and not home_toggled:
-                        if not (toslink_active() and toslink_auto_enabled):
+                        if not (auto_switch_active() and auto_switch_enabled):
                             await cycle_group()
 
                     if ENABLE_DISPLAY and key == KEY_BINDINGS['ENTER'] and key_hold_counter < HOLD_SHOW_LOUDNESS:
@@ -3624,8 +3626,8 @@ config_active = cdsp.config.active() or {}
 h = None
 if USE_GPIO:
     h = lgpio.gpiochip_open(0)
-    if ENABLE_TV_RELAY:
-        lgpio.gpio_claim_input(h, TV_RELAY_GPIO)    # inactive from the start (tv_relay_on = False)
+    if ENABLE_EXT_RELAY:
+        lgpio.gpio_claim_input(h, EXT_RELAY_GPIO)    # inactive from the start (ext_relay_on = False)
     if ENABLE_AUTO_POWEROFF:
         lgpio.gpio_claim_output(h, POWER_GPIO, 0)   # LOW first: no LOW -> HIGH glitch
         time.sleep(1)                   # Keep the relay off so ampli can re-arm
@@ -3641,12 +3643,12 @@ tone_mode_idx = settings["tone_mode_idx"]       # and on the last keys mode used
 if TONE_ACTIVE:
     init_tone()
 
-if ENABLE_TV_RELAY:
+if ENABLE_EXT_RELAY:
     if current_config_key is None:          # init_tone did not run (TONE_ACTIVE False)
         _p = cdsp.config.file_path()
         if _p:
             current_config_key = config_key(_p)
-    update_tv_relay()
+    update_ext_relay()
 
 
 # =====================================================================
@@ -3659,7 +3661,7 @@ def exit_gracefully(signum, frame):
         if ENABLE_AUTO_POWEROFF:
             lgpio.gpio_write(h, POWER_GPIO, lgpio.LOW)
             time.sleep(0.5)
-        release_tv_relay()
+        release_ext_relay()
         if h is not None:
             lgpio.gpiochip_close(h)
         log.info("Gracefully shutting down the service...")
@@ -3683,7 +3685,7 @@ async def main():
         tasks.append(asyncio.create_task(supervised(name, factory)))
 
     spawn("cdsp-poller", cdsp_poller)
-    if ENABLE_AUTO_POWEROFF or ENABLE_DISPLAY or ENABLE_TOSLINK_SWITCH:
+    if ENABLE_AUTO_POWEROFF or ENABLE_DISPLAY or ENABLE_AUTO_SWITCH:
         spawn("silence", silence_monitor)
     if ENABLE_AUTO_POWEROFF:
         spawn("auto-poweroff", auto_poweroff)
@@ -3693,14 +3695,14 @@ async def main():
         spawn("blink", blink_loop)
         if ENABLE_CLOCK:
             spawn("clock", clock_loop)
-    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_TOSLINK_SWITCH or ENABLE_TV_RELAY or ENABLE_WEB:
+    if ENABLE_DISPLAY or ENABLE_REMOTE or ENABLE_AUTO_SWITCH or ENABLE_EXT_RELAY or ENABLE_WEB:
         # Redraws and resyncs config_active after an external change (also
-        # keeps the TV relay in step with an external config change)
+        # keeps the EXT relay in step with an external config change)
         spawn("volume-watcher", volume_watcher_loop)
     if ENABLE_LMS_SYNC:
         spawn("lms-bridge", lms_bridge_task)
-    if ENABLE_TOSLINK_SWITCH:
-        spawn("tv-toslink", monitor_tv_toslink)
+    if ENABLE_AUTO_SWITCH:
+        spawn("auto-switch", monitor_auto_switch)
     if ENABLE_WEB:
         spawn("web", web_server_task)
     if ENABLE_REMOTE:

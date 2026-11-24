@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # install_lybrica_pcp.sh - Installer for LyBriCa on piCorePlayer
 #
-# Installs LyBriCa (CamillaDSP remote / display / TOSLINK / LMS volume sync
+# Installs LyBriCa (CamillaDSP remote / display / auto source switching / LMS volume sync
 # daemon) as a pCP extension, together with:
 #   - the patched BLE HID bridge (pcp-bt.tcz),
 #   - the Material Skin web files (custom.js button + tone circle page),
@@ -158,7 +158,7 @@ install_lybrica() {
     cat > "$EXT/usr/local/bin/start_lybrica.sh" << 'EOF'
 #!/bin/sh
 #
-# start_lybrica.sh - Launch LyBriCa (TOSLINK/LMS/volume sync daemon)
+# start_lybrica.sh - Launch LyBriCa (auto source switching / LMS / volume sync daemon)
 #
 # Usage (also available as the "lybrica" symlink, see "lybrica help"):
 #   start_lybrica.sh                  start if not running (idempotent, used at boot)
@@ -697,13 +697,13 @@ configure_esp32c3() {
     echo '   enable_uart=1'
     echo '       (UART on GPIO 14/15, link with the ESP32)'
     echo '   gpio=12=ip,np'
-    echo '       (GPIO 12: TV relay input, left floating at boot so the relay'
+    echo '       (GPIO 12: EXT relay input, left floating at boot so the relay'
     echo '        board is not activated before lybrica.py takes over)'
     echo ''
     echo ' Nothing is removed. Meant for a fresh install: on a bare Raspberry Pi'
     echo ' these GPIOs are free (GPIO 14/15 = UART, GPIO 12, 16 and 26 = plain GPIOs).'
     echo ' If you use a HAT or another add-on board, check its pinout first.'
-    echo ' The GPIO 12 line is harmless if no TV relay is wired to it.'
+    echo ' The GPIO 12 line is harmless if no EXT relay is wired to it.'
     echo ''
     echo ' Expected setup (ESP32C3 + relay):'
     echo '   1. A physical button is wired to the ESP32.'
@@ -733,7 +733,7 @@ configure_esp32c3() {
     cat > "$ESP_SCRIPT" <<'GPIO_SCRIPT_EOF'
 #!/bin/sh
 # Add the gpio-poweroff (GPIO 26) and gpio-shutdown (GPIO 16) overlays,
-# enable the UART and leave GPIO 12 floating at boot (TV relay input),
+# enable the UART and leave GPIO 12 floating at boot (EXT relay input),
 # only for the lines that are not already in config.txt.
 
 set -e

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installer is adapted from https://github.com/JWahle/piCoreCDSP/blob/main/LICENSE 
+# Installer is adapted from https://github.com/JWahle/piCoreCDSP
 # Copyright (c) 2023 Johannes Wahle
 # MIT License
 # ---------------------------------------------------------------------------

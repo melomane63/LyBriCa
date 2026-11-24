@@ -1,4 +1,7 @@
 #!/bin/sh
+# Installer is adapted from https://github.com/JWahle/piCoreCDSP/blob/main/LICENSE 
+# Copyright (c) 2023 Johannes Wahle
+# MIT License
 # ---------------------------------------------------------------------------
 # install_lybrica_full_pcp.sh - Full installer for piCorePlayer:
 #                               CamillaDSP 5 + LyBriCa (+ optional ESP32C3)
